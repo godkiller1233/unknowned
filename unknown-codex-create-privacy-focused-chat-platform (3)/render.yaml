@@ -26,19 +26,10 @@ services:
       - key: CORS_ORIGIN
         value: https://unknown-chat-platform.onrender.com
       - key: DATABASE_URL
-        fromDatabase:
-          name: unknown-chat-db
-          property: connectionString
+        sync: false
       - key: UPLOAD_DIR
         value: /tmp/unknown-uploads
       - key: OFFICIAL_ACCOUNT_USERNAME
         value: Unknown
       - key: OFFICIAL_ACCOUNT_PASSWORD
         generateValue: true
-
-databases:
-  - name: unknown-chat-db
-    databaseName: unknown
-    user: unknown
-    plan: free
-    region: oregon
