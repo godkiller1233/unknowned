@@ -1,0 +1,39 @@
+{
+  "name": "unknown-chat-platform",
+  "version": "1.0.0",
+  "description": "Privacy-focused anonymous communication, gaming, and community platform for Render or local-network use.",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently \"npm run server:dev\" \"npm run client:dev\"",
+    "client:dev": "vite --host 0.0.0.0",
+    "server:dev": "nodemon server/index.js",
+    "build": "vite build",
+    "start": "node server/index.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "latest",
+    "bcryptjs": "latest",
+    "better-sqlite3": "^11.10.0",
+    "cors": "latest",
+    "express": "latest",
+    "helmet": "latest",
+    "jsonwebtoken": "latest",
+    "multer": "latest",
+    "nanoid": "^5.1.5",
+    "pg": "^8.23.0",
+    "react": "latest",
+    "react-dom": "latest",
+    "socket.io": "latest",
+    "socket.io-client": "latest",
+    "typescript": "latest",
+    "vite": "latest"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "nodemon": "latest"
+  }
+}

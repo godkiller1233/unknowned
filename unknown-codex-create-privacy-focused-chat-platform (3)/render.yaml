@@ -1,0 +1,44 @@
+# Free Render Blueprint: importing this repository creates both a free web
+# service and a free Render Postgres database for Unknown.
+# Free Render Postgres currently has a 1 GB limit and expires after 30 days;
+# upgrade the database when you need permanent production data.
+# Docs: https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: unknown-chat-platform
+    runtime: node
+    plan: free
+    region: oregon
+    numInstances: 1
+    autoDeployTrigger: commit
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      - key: NODE_ENV
+        value: production
+      - key: DATA_MODE
+        value: registered
+      - key: JWT_SECRET
+        generateValue: true
+      - key: CORS_ORIGIN
+        value: https://unknown-chat-platform.onrender.com
+      - key: DATABASE_URL
+        fromDatabase:
+          name: unknown-chat-db
+          property: connectionString
+      - key: UPLOAD_DIR
+        value: /tmp/unknown-uploads
+      - key: OFFICIAL_ACCOUNT_USERNAME
+        value: Unknown
+      - key: OFFICIAL_ACCOUNT_PASSWORD
+        generateValue: true
+
+databases:
+  - name: unknown-chat-db
+    databaseName: unknown
+    user: unknown
+    plan: free
+    region: oregon

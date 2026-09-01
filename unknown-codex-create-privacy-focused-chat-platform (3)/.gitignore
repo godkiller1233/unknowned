@@ -1,0 +1,8 @@
+node_modules/
+dist/
+data/*.sqlite*
+uploads/*
+!uploads/.gitkeep
+.env
+.env.*
+!.env.example
