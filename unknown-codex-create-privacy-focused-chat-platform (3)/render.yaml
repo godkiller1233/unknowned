@@ -1,7 +1,5 @@
-# Free Render Blueprint: importing this repository creates both a free web
-# service and a free Render Postgres database for Unknown.
-# Free Render Postgres currently has a 1 GB limit and expires after 30 days;
-# upgrade the database when you need permanent production data.
+# Render Blueprint for the root-level Unknown web service.
+# DATABASE_URL is supplied manually in the Render dashboard; no database is provisioned here.
 # Docs: https://render.com/docs/blueprint-spec
 services:
   - type: web
@@ -26,7 +24,7 @@ services:
       - key: CORS_ORIGIN
         value: https://unknown-chat-platform.onrender.com
       - key: DATABASE_URL
-        sync: false
+        value: postgresql://unknown:AbOP6qUt7Vfl1gfViPzqqS8DLN1MjfHw@dpg-da7pcqc9v7es73f8dsj0-a.oregon-postgres.render.com/unknown_114g
       - key: UPLOAD_DIR
         value: /tmp/unknown-uploads
       - key: OFFICIAL_ACCOUNT_USERNAME
