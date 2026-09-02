@@ -24,7 +24,7 @@ services:
       - key: CORS_ORIGIN
         value: https://unknown-chat-platform.onrender.com
       - key: DATABASE_URL
-        value: postgresql://unknown:AbOP6qUt7Vfl1gfViPzqqS8DLN1MjfHw@dpg-da7pcqc9v7es73f8dsj0-a.oregon-postgres.render.com/unknown_114g
+        sync: false
       - key: UPLOAD_DIR
         value: /tmp/unknown-uploads
       - key: OFFICIAL_ACCOUNT_USERNAME
