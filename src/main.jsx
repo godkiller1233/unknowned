@@ -5,6 +5,7 @@ import './styles.css';
 const Settings = lazy(() => import('./Settings.jsx'));
 const Game = lazy(() => import('./Game.jsx'));
 import { Logo, Mascot } from './Logo.jsx';
+import { mediaConstraints, applySpeakerSink, loadMediaPrefs } from './mediaPrefs.js';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 function storageValue(storage, key) {
@@ -373,7 +374,7 @@ function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClo
 
   async function startCall(isInitiator, offerData) {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      const stream = await navigator.mediaDevices.getUserMedia(mediaConstraints('mic'));
       streamRef.current = stream;
       if (localRef.current) localRef.current.srcObject = stream;
 
@@ -400,6 +401,11 @@ function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClo
       }
     } catch { setStatus('error'); }
   }
+
+  // Route the caller's audio to the speaker the user picked in Settings.
+  useEffect(() => {
+    if (remoteRef.current) applySpeakerSink(remoteRef.current, loadMediaPrefs().speaker);
+  }, [status]);
 
   function accept() {
     startCall(false, initialOffer);
@@ -3447,7 +3453,7 @@ function VoiceChannel({ channel, me, socket, boot }) {
 
   async function joinCall() {
     try {
-      streamRef.current = await navigator.mediaDevices.getUserMedia({audio:true});
+      streamRef.current = await navigator.mediaDevices.getUserMedia(mediaConstraints('mic'));
       setInCall(true);
       socket.emit('voice_join',{channelId:channel.id,userId:me.id});
     } catch { alert('Could not access microphone.'); }
@@ -3694,7 +3700,7 @@ function RoomView({ roomId, me, socket, notify, onLaunchGame }) {
   async function joinVoice() {
     try {
       const wantsVideo = room?.type==='video';
-      streamRef.current = await navigator.mediaDevices.getUserMedia({ audio:true, video:wantsVideo });
+      streamRef.current = await navigator.mediaDevices.getUserMedia(mediaConstraints(wantsVideo ? 'mic+camera' : 'mic'));
       setInCall(true);
       socket.emit('voice_join',{ channelId:roomId, userId:me.id });
     } catch { notify('Could not access ' + (room?.type==='video'?'camera':'microphone'), 'err'); }
