@@ -331,8 +331,17 @@ async function initializeDb() {
       aquired_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
     CREATE TABLE IF NOT EXISTS quest_logs (
-      user_id TEXT, quest TEXT, day TEXT,
+      user_id TEXT, quest TEXT, day TEXT, reward INTEGER DEFAULT 0,
       PRIMARY KEY (user_id, quest, day)
+    );
+    -- Admin-defined quests: pasted as a JSON spec (title/icon/metric/need/reward).
+    -- computeQuests() merges active rows into the daily quest list automatically.
+    CREATE TABLE IF NOT EXISTS custom_quests (
+      id TEXT PRIMARY KEY, title TEXT NOT NULL, icon TEXT DEFAULT '🎯',
+      description TEXT DEFAULT '', metric TEXT NOT NULL,
+      need INTEGER NOT NULL, reward INTEGER NOT NULL,
+      active INTEGER DEFAULT 1, spec TEXT DEFAULT '',
+      created_by TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
     CREATE TABLE IF NOT EXISTS announcements (
       id TEXT PRIMARY KEY, title TEXT, body TEXT, author_id TEXT,
@@ -467,6 +476,9 @@ async function runMigrations() {
     ['users','anon_name_color','TEXT DEFAULT \'\''],
     ['communities','pinned_mask','TEXT DEFAULT \'\''],
     ['communities','is_default','INTEGER DEFAULT 0'],
+    // quest_logs earnedToday/cap queries SUM(reward); the column was missing on
+    // PostgreSQL, which made /api/quests and claiming 500 on Postgres deployments.
+    ['quest_logs','reward','INTEGER DEFAULT 0'],
   ];
   // seed starter credits for existing users
   try {
@@ -849,10 +861,18 @@ async function computeQuests(userId) {
   const dmToday      = await count("SELECT COUNT(*) AS c FROM messages WHERE sender_id=$1 AND dm_id IS NOT NULL AND created_at::date=CURRENT_DATE");
   const groupToday   = await count("SELECT COUNT(*) AS c FROM messages WHERE sender_id=$1 AND group_id IS NOT NULL AND created_at::date=CURRENT_DATE");
   const serverToday  = await count("SELECT COUNT(*) AS c FROM messages WHERE sender_id=$1 AND channel_id IS NOT NULL AND created_at::date=CURRENT_DATE");
-  const gamesToday   = await count("SELECT COUNT(*) AS c FROM game_logs WHERE user_id=$1 AND day=$2");
+  // Pre-existing bug fix: count() passes only the user id, but this statement has
+  // two placeholders, so it crashed /api/quests on PostgreSQL. Pass both values.
+  const gamesToday   = Number((await store.get('SELECT COUNT(*) AS c FROM game_logs WHERE user_id=$1 AND day=$2', userId, day))?.c || 0);
+  const roomsToday   = await count("SELECT COUNT(*) AS c FROM room_messages WHERE sender_id=$1 AND created_at::date=CURRENT_DATE");
+  // NB: this server's placeholder adapter renumbers every occurrence, so each
+  // reused value needs its own positional placeholder (pass the user twice).
+  const friendsToday = Number((await store.get("SELECT COUNT(*) AS c FROM friends WHERE status='accepted' AND (requester_id=$1 OR addressee_id=$2) AND created_at::date=CURRENT_DATE", userId, userId))?.c || 0);
   const claimedRows  = await store.all('SELECT quest FROM quest_logs WHERE user_id=$1 AND day=$2', userId, day);
   const claimed = new Set(claimedRows.map(r => r.quest));
-  const metrics = { msgs: msgsToday, server: serverToday, dm: dmToday, group: groupToday, gamer: gamesToday, arcade: gamesToday };
+  // Every timestamped activity surface the app stores counts toward a quest
+  // metric, so admin-defined quests can target any of them ("full compatibility").
+  const metrics = { msgs: msgsToday, server: serverToday, dm: dmToday, group: groupToday, rooms: roomsToday, games: gamesToday, friends: friendsToday, gamer: gamesToday, arcade: gamesToday };
   const defs = [
     { id:'first',  title:'First Light',      desc:'Send your first message of the day',            need:1,   reward:10 },
     { id:'chatter',title:'Chatter',          desc:'Send 5 messages today',                          need:5,   reward:25 },
@@ -870,7 +890,26 @@ async function computeQuests(userId) {
     metrics[challenge.id] = metrics[challenge.metric] || 0;
   }
   const progressMap = { first: msgsToday, chatter: msgsToday, server: serverToday, dm: dmToday, group: groupToday, novel: msgsToday };
-  return defs.map(d => ({ ...d, progress: Math.min(d.need, progressMap[d.id] ?? metrics[d.id] ?? 0), done: (progressMap[d.id] ?? metrics[d.id] ?? 0) >= d.need, claimed: claimed.has(d.id) }));
+  // Admin-defined quests (created in the Admin → Quests panel) join the same list,
+  // share the same claim/limits/credits pipeline, and surface in every quest UI.
+  // They carry their own progress (progressMap/metrics are keyed by built-in ids),
+  // so the final map below must not recompute them.
+  try {
+    const customRows = await store.all('SELECT * FROM custom_quests WHERE active=1 ORDER BY created_at');
+    for (const c of customRows) {
+      const m = metrics[c.metric];
+      if (m === undefined) continue; // unknown metric (should not happen; validation blocks it)
+      const need = Number(c.need), reward = Number(c.reward);
+      const progress = Math.min(need, m);
+      defs.push({
+        id: c.id, title: c.title, desc: c.description || c.title, icon: c.icon || '🎯', metric: c.metric,
+        need, reward, progress, done: progress >= need, claimed: claimed.has(c.id), custom: true,
+      });
+    }
+  } catch { /* custom quests unavailable (e.g. very old db) — built-ins still work */ }
+  return defs.map(d => d.custom
+    ? { ...d, claimed: claimed.has(d.id) }
+    : { ...d, progress: Math.min(d.need, progressMap[d.id] ?? metrics[d.id] ?? 0), done: (progressMap[d.id] ?? metrics[d.id] ?? 0) >= d.need, claimed: claimed.has(d.id) });
 }
 
 async function getUserCredits(userId) {
@@ -3157,10 +3196,62 @@ app.post('/api/quests/claim', auth, route(async (req,res) => {
   if (q.claimed) return res.status(409).json({error:'Already claimed today'});
   const earnedToday = Number((await store.get('SELECT COALESCE(SUM(reward),0) AS t FROM quest_logs WHERE user_id=$1 AND day=$2', req.user.id, TODAY()))?.t || 0);
   if (earnedToday + q.reward > DAILY_REWARD_CAP) return res.status(400).json({error:`Daily reward cap reached (${DAILY_REWARD_CAP})`});
-  await store.run('INSERT INTO quest_logs VALUES (?,?,?) ON CONFLICT DO NOTHING', req.user.id, q.id, TODAY());
+  await store.run('INSERT INTO quest_logs (user_id,quest,day,reward) VALUES (?,?,?,?) ON CONFLICT DO NOTHING', req.user.id, q.id, TODAY(), q.reward);
   await addCredits(req.user.id, q.reward);
   const { credits } = await getUserCredits(req.user.id);
   res.json({ ok:true, questId:q.id, reward:q.reward, credits });
+}));
+
+// ── Admin quests (paste-to-add) ───────────────────────────────────────────────
+// The admin pastes a JSON spec for a quest — title, icon, metric, need, reward.
+// The metric is measured from real stored activity (see computeQuests), so a new
+// quest works with every surface the app already records and shares the normal
+// daily claim/credit pipeline. Scripts are validated specs, never executable code.
+const QUEST_METRICS = ['msgs','server','dm','group','rooms','games','friends'];
+function sanitizeQuestSpec(input) {
+  const spec = (input && typeof input === 'object' && !Array.isArray(input)) ? input : {};
+  const title = String(spec.title || '').trim().slice(0, 80);
+  const icon = String(spec.icon || '🎯').trim().slice(0, 8) || '🎯';
+  const description = String(spec.description || spec.desc || '').trim().slice(0, 200);
+  const metric = String(spec.metric || '').trim();
+  const need = Number(spec.need);
+  const reward = Number(spec.reward);
+  if (!title) return { error: 'title is required' };
+  if (!QUEST_METRICS.includes(metric)) return { error: `metric must be one of: ${QUEST_METRICS.join(', ')}` };
+  if (!Number.isInteger(need) || need < 1 || need > 100000) return { error: 'need must be an integer between 1 and 100000' };
+  if (!Number.isInteger(reward) || reward < 1 || reward > DAILY_REWARD_CAP) return { error: `reward must be an integer between 1 and ${DAILY_REWARD_CAP}` };
+  const slug = String(spec.id || title).toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60) || 'quest';
+  return { id: slug.startsWith('custom_') ? slug : `custom_${slug}`, title, icon, description, metric, need, reward };
+}
+
+app.get('/api/admin/quests', auth, adminOnly, route(async (_req,res) => {
+  res.json(await store.all('SELECT * FROM custom_quests ORDER BY created_at'));
+}));
+
+app.post('/api/admin/quests', auth, adminOnly, route(async (req,res) => {
+  const s = sanitizeQuestSpec(req.body?.spec ?? req.body);
+  if (s.error) return res.status(400).json({ error: s.error });
+  const existing = await store.get('SELECT 1 FROM custom_quests WHERE id=$1', s.id);
+  if (existing) {
+    await store.run('UPDATE custom_quests SET title=$1,icon=$2,description=$3,metric=$4,need=$5,reward=$6,spec=$7,active=1 WHERE id=$8',
+      s.title, s.icon, s.description, s.metric, s.need, s.reward, JSON.stringify(req.body?.spec ?? req.body), s.id);
+  } else {
+    await store.run('INSERT INTO custom_quests (id,title,icon,description,metric,need,reward,active,spec,created_by) VALUES (?,?,?,?,?,?,?,1,?,?)',
+      s.id, s.title, s.icon, s.description, s.metric, s.need, s.reward, JSON.stringify(req.body?.spec ?? req.body), req.user.id);
+  }
+  res.json({ ok:true, quest: await store.get('SELECT * FROM custom_quests WHERE id=$1', s.id) });
+}));
+
+app.patch('/api/admin/quests/:id', auth, adminOnly, route(async (req,res) => {
+  const exists = await store.get('SELECT 1 FROM custom_quests WHERE id=$1', req.params.id);
+  if (!exists) return res.status(404).json({ error: 'Quest not found' });
+  await store.run('UPDATE custom_quests SET active=$1 WHERE id=$2', req.body.active ? 1 : 0, req.params.id);
+  res.json({ ok:true });
+}));
+
+app.delete('/api/admin/quests/:id', auth, adminOnly, route(async (req,res) => {
+  await store.run('DELETE FROM custom_quests WHERE id=$1', req.params.id);
+  res.json({ ok:true });
 }));
 
 // ── Daily challenge (🎲 DO SOMETHING RANDOM) ─────────────────────────────────
@@ -4690,5 +4781,5 @@ if (fs.existsSync(path.join(root, 'dist'))) {
   app.use((req,res,next) => { if(req.path.startsWith('/api/')) return next(); res.sendFile(path.join(root,'dist','index.html')); });
 }
 
-server.listen(PORT, '0.0.0.0', () => console.log(`Unknown running on ${PORT}`));
+server.listen(PORT, process.env.HOST || '0.0.0.0', () => console.log(`Unknown running on ${PORT}`));
 export { app, store };

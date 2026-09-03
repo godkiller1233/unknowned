@@ -173,6 +173,12 @@ a:hover { text-decoration: underline; }
   margin-bottom: 1rem;
 }
 
+.hero-title-row {
+  display: flex;
+  align-items: center;
+  gap: 0.9rem;
+}
+
 .hero-title {
   font-size: clamp(3rem, 10vw, 6rem);
   margin: 0 0 0.5rem;
@@ -181,6 +187,20 @@ a:hover { text-decoration: underline; }
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
   background-clip: text;
+}
+
+.hero-version {
+  font-size: 1.05rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  color: var(--brand);
+  background: rgba(88, 101, 242, 0.14);
+  border: 1px solid rgba(88, 101, 242, 0.4);
+  border-radius: 999px;
+  padding: 0.28rem 0.8rem;
+  margin: 0 0 0.5rem;
+  white-space: nowrap;
+  user-select: none;
 }
 
 .hero-sub { font-size: 1.05rem; color: var(--muted); max-width: 540px; line-height: 1.6; margin: 0 0 1.5rem; }

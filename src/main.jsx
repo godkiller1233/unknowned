@@ -712,7 +712,10 @@ function Auth({ onAuth, initialError = '' }) {
     <main className="auth">
       <section className="hero">
         <Logo size={64} animate />
-        <h1 className="hero-title">Unknown</h1>
+        <div className="hero-title-row">
+          <h1 className="hero-title">Unknown</h1>
+          <span className="hero-version" title="Version">2.0</span>
+        </div>
         <p className="hero-sub">A privacy-focused place to talk, play, study, and connect — without revealing your real identity.</p>
         <div className="first-run-guide" aria-label="Getting started">
           <div className="first-run-heading"><span>Start here</span><small>three quick steps</small></div>
@@ -4071,6 +4074,91 @@ function BookmarksModal({ onClose, onJump, notify }) {
   );
 }
 
+// ── Admin → Quests: paste-to-add custom quests ────────────────────────────────
+// A quest spec is a small JSON object; the server validates it against real
+// metrics and merges it into the daily quest list (same claim/credit pipeline).
+const QUEST_SPEC_TEMPLATE = `{
+  "title": "Late Night Chat",
+  "icon": "🌙",
+  "description": "Send 3 messages in a server channel today",
+  "metric": "server",
+  "need": 3,
+  "reward": 15
+}`;
+const QUEST_METRIC_HELP = [
+  ['msgs', 'Any message (channels, DMs, groups)'],
+  ['server', 'Messages in server channels'],
+  ['dm', 'Direct messages'],
+  ['group', 'Group chat messages'],
+  ['rooms', 'Messages in temp voice/text rooms'],
+  ['games', 'Mini games played'],
+  ['friends', 'Friends added (accepted requests)'],
+];
+function AdminQuests() {
+  const [list, setList] = useState([]);
+  const [editor, setEditor] = useState(QUEST_SPEC_TEMPLATE);
+  const [msg, setMsg] = useState(null);
+
+  async function load() {
+    const d = await api('/api/admin/quests');
+    if (!d.error) setList(Array.isArray(d) ? d : []);
+  }
+  useEffect(() => { load(); }, []);
+
+  async function save(e) {
+    e.preventDefault();
+    let spec;
+    try { spec = JSON.parse(editor); } catch { setMsg({ type:'err', text:'That is not valid JSON — check quotes, commas and braces.' }); return; }
+    const d = await api('/api/admin/quests', { method:'POST', body: JSON.stringify(spec) });
+    if (d.error) setMsg({ type:'err', text:d.error });
+    else { setMsg({ type:'ok', text:`Quest “${d.quest?.title || spec.title}” saved — live for everyone from the next quests load.` }); load(); }
+  }
+  async function toggle(q) { await api(`/api/admin/quests/${q.id}`, { method:'PATCH', body: JSON.stringify({ active: !Number(q.active) }) }); load(); }
+  async function remove(q) {
+    if (!window.confirm(`Delete quest “${q.title}”? It disappears immediately.`)) return;
+    await api(`/api/admin/quests/${q.id}`, { method:'DELETE' });
+    load();
+  }
+  function edit(q) { setEditor(JSON.stringify(JSON.parse(q.spec || '{}'), null, 2) || QUEST_SPEC_TEMPLATE); setMsg(null); }
+
+  return (
+    <div className="admin-quests">
+      <p className="muted-text" style={{ fontSize:'0.75rem', marginBottom:'0.5rem' }}>
+        Paste a quest spec below to add it — no redeploy needed. The quest counts real
+        activity from today and joins the normal 🎯 Quests list with the daily claim/cap rules.
+      </p>
+      <div style={{ fontSize:'0.72rem', marginBottom:'0.5rem' }}>
+        <b>Metrics you can measure:</b>
+        <ul style={{ margin:'0.25rem 0 0 1rem', opacity:0.9 }}>
+          {QUEST_METRIC_HELP.map(([k,label]) => <li key={k}><code>{k}</code> — {label}</li>)}
+        </ul>
+      </div>
+      <form onSubmit={save} className="mini">
+        <textarea value={editor} onChange={e=>setEditor(e.target.value)} rows={9} spellCheck={false}
+          style={{ fontFamily:'monospace', fontSize:'0.78rem', minHeight:'150px' }} aria-label="Quest JSON spec" />
+        <button type="submit">＋ Add / Update quest</button>
+        {msg && <div className={`notice ${msg.type==='err'?'err':''}`}>{msg.text}</div>}
+      </form>
+      <div style={{ marginTop:'0.75rem' }}>
+        <b>Custom quests</b>
+        {!list.length && <p className="empty-text" style={{ marginTop:'0.4rem' }}>None yet — paste a spec above to add your first quest.</p>}
+        {list.map(q => (
+          <div key={q.id} className="admin-user" style={{ opacity: Number(q.active) ? 1 : 0.55 }}>
+            <div className="admin-user-info">
+              <b>{q.icon || '🎯'} {q.title} <small className="muted-text">· {q.metric} · {q.need}× · ✦{q.reward}</small></b>
+              <small>{q.description || '—'}</small>
+              <small className="muted-text">id: <code>{q.id}</code>{Number(q.active) ? ' · live' : ' · paused'}</small>
+            </div>
+            <button className="ghost" onClick={()=>edit(q)}>Edit</button>
+            <button className={Number(q.active)?'ghost':'ok'} onClick={()=>toggle(q)}>{Number(q.active)?'Pause':'Enable'}</button>
+            <button className="danger" onClick={()=>remove(q)}>Delete</button>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function RewardsModal({ me, onClose, notify, onCredits }) {
   const [tab, setTab]                 = useState('quests');
   const [credits, setCredits]         = useState(Number(me.credits||0));
@@ -4498,7 +4586,7 @@ function AdminPanel({ onNotice, boot, onBootRefresh, me }) {
   const [revealBans, setRevealBans] = useState([]);
   const [banForm, setBanForm]   = useState({userId:'', reason:''});
   const [revealMod, setRevealMod] = useState([]);
-  const TABS = ['stats','users','reports','events','bots','announce','reveal','logs','create'];
+  const TABS = ['stats','users','reports','events','bots','announce','reveal','logs','quests','create'];
 
   async function loadRevealMod() {
     const d = await api('/api/reveal/moderation?status=open').catch(() => null);
@@ -4784,6 +4872,8 @@ function AdminPanel({ onNotice, boot, onBootRefresh, me }) {
           ))}
         </>
       )}
+
+      {tab==='quests' && <AdminQuests />}
 
       {tab==='create' && (
         <form onSubmit={createAdmin} className="mini">
