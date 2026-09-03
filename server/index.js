@@ -1,6 +1,8 @@
 import express from 'express';
 import http from 'http';
 import { Server } from 'socket.io';
+import { createAdapter } from '@socket.io/postgres-adapter';
+import { createSessionManager } from './auth.js';
 import helmet from 'helmet';
 import cors from 'cors';
 import multer from 'multer';
@@ -26,9 +28,15 @@ if (IS_PRODUCTION && JWT_SECRET.length < 32) {
 // Dev/staging only — fake sample data and debug tools are gated behind this.
 const IS_DEV = String(process.env.NODE_ENV || 'development') !== 'production';
 const DATABASE_URL = process.env.DATABASE_URL;
+if (IS_PRODUCTION && !DATABASE_URL) {
+  throw new Error('DATABASE_URL must be set in production; connect this service to the existing PostgreSQL database');
+}
 // Bootstrap credentials are read only from environment variables. Never hard-code real passwords.
 const OFFICIAL_ACCOUNT_USERNAME = process.env.OFFICIAL_ACCOUNT_USERNAME || 'Unknown';
-const OFFICIAL_ACCOUNT_PASSWORD = process.env.OFFICIAL_ACCOUNT_PASSWORD || process.env.ADMIN_BOOTSTRAP_PASSWORD || 'change-me';
+const OFFICIAL_ACCOUNT_PASSWORD = process.env.OFFICIAL_ACCOUNT_PASSWORD || process.env.ADMIN_BOOTSTRAP_PASSWORD || (IS_PRODUCTION ? '' : 'change-me');
+if (IS_PRODUCTION && !OFFICIAL_ACCOUNT_PASSWORD) {
+  throw new Error('OFFICIAL_ACCOUNT_PASSWORD must be set in production');
+}
 const PRIVILEGED_ACCOUNT_CONFIG = Object.freeze([
   { rank: 'Administrator', username: process.env.ADMIN_USERNAME || OFFICIAL_ACCOUNT_USERNAME, password: process.env.ADMIN_PASSWORD || OFFICIAL_ACCOUNT_PASSWORD },
   { rank: 'Owner', username: process.env.OWNER_USERNAME || '', password: process.env.OWNER_PASSWORD || '' },
@@ -51,18 +59,39 @@ function toPostgres(sql) {
 // Use SSL for remote DBs (Render), disable for local connections
 const isLocalDb = !DATABASE_URL || DATABASE_URL.includes('localhost') || DATABASE_URL.includes('127.0.0.1');
 const sslConfig = isLocalDb ? false : { rejectUnauthorized: false };
-const pool = new Pool({ connectionString: DATABASE_URL, ssl: sslConfig });
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: sslConfig,
+  max: Number(process.env.PG_POOL_MAX) || 10,
+  connectionTimeoutMillis: 10000,
+  idleTimeoutMillis: 30000,
+});
+pool.on('error', error => console.error('PostgreSQL pool error:', error));
+let queryTarget = pool;
 const store = {
   type: 'postgres',
-  exec: sql => pool.query(sql),
-  run: (sql, ...p) => pool.query(toPostgres(sql), p),
-  get: async (sql, ...p) => (await pool.query(toPostgres(sql), p)).rows[0],
-  all: async (sql, ...p) => (await pool.query(toPostgres(sql), p)).rows,
+  exec: sql => queryTarget.query(sql),
+  run: (sql, ...p) => queryTarget.query(toPostgres(sql), p),
+  get: async (sql, ...p) => (await queryTarget.query(toPostgres(sql), p)).rows[0],
+  all: async (sql, ...p) => (await queryTarget.query(toPostgres(sql), p)).rows,
 };
 
 // ── Schema ────────────────────────────────────────────────────────────────────
-async function initDb() {
+async function initializeDb() {
   await store.exec(`
+    CREATE TABLE IF NOT EXISTS socket_io_attachments (
+      id BIGSERIAL UNIQUE,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      payload BYTEA
+    );
+    CREATE TABLE IF NOT EXISTS auth_sessions (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+      expires_at TIMESTAMPTZ NOT NULL,
+      revoked_at TIMESTAMPTZ
+    );
+    CREATE INDEX IF NOT EXISTS auth_sessions_user_idx ON auth_sessions(user_id);
     CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY, username TEXT UNIQUE, tag TEXT, password_hash TEXT,
       nickname TEXT, avatar TEXT, banner TEXT, bio TEXT DEFAULT '',
@@ -103,7 +132,7 @@ async function initDb() {
       owner_id TEXT, rules TEXT, icon TEXT, banner TEXT, invite_code TEXT UNIQUE,
       tags TEXT DEFAULT '', locked INTEGER DEFAULT 0,
       is_topic INTEGER DEFAULT 0, topic_description TEXT DEFAULT '',
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP, is_default INTEGER DEFAULT 0
     );
     CREATE TABLE IF NOT EXISTS community_ratings (
       community_id TEXT, user_id TEXT, rating TEXT,
@@ -374,6 +403,24 @@ async function initDb() {
   startCleanup();
 }
 
+// Prevent two app instances from racing during schema creation and first-run seeding.
+// The lock is held in PostgreSQL, so it works across separate Render services too.
+async function initDb() {
+  const client = await pool.connect();
+  const lockKey = 918273645;
+  try {
+    await client.query('SELECT pg_advisory_lock($1)', [lockKey]);
+    // Route the initialization store through the locked session so schema and
+    // first-run seeding cannot race when several instances start together.
+    queryTarget = client;
+    await initializeDb();
+  } finally {
+    queryTarget = pool;
+    try { await client.query('SELECT pg_advisory_unlock($1)', [lockKey]); } catch {}
+    client.release();
+  }
+}
+
 async function runMigrations() {
   const cols = [
     ['users','karma','INTEGER DEFAULT 0'],
@@ -419,6 +466,7 @@ async function runMigrations() {
     ['users','server_fav_masks','TEXT DEFAULT \'{}\''],
     ['users','anon_name_color','TEXT DEFAULT \'\''],
     ['communities','pinned_mask','TEXT DEFAULT \'\''],
+    ['communities','is_default','INTEGER DEFAULT 0'],
   ];
   // seed starter credits for existing users
   try {
@@ -463,6 +511,8 @@ function startCleanup() {
       }
     } catch {}
   }, 60 * 1000);
+  // Expired sessions are never accepted and can be pruned without affecting live users.
+  setInterval(() => store.run('DELETE FROM auth_sessions WHERE expires_at <= CURRENT_TIMESTAMP OR revoked_at IS NOT NULL').catch(() => {}), 60 * 60 * 1000);
 }
 
 async function ensureOfficialAccount() {
@@ -487,7 +537,9 @@ async function seed() {
     await store.run('UPDATE users SET rank=$1 WHERE id=$2', account.rank, created.id);
   }
   const comm = nanoid(); const invCode = nanoid(8);
-  await store.run('INSERT INTO communities VALUES (?,?,?,?,?,?,?,?,?,?,0,0,?,CURRENT_TIMESTAMP)',
+  await store.run(`INSERT INTO communities
+    (id,name,description,visibility,owner_id,rules,icon,banner,invite_code,tags,locked,is_topic,topic_description,is_default,created_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,0,0,?,1,CURRENT_TIMESTAMP)`,
     comm,'Unknown Lounge','Official privacy-first community.','public',admin.id,
     'Avoid personal information. Respect consent. Report abuse.',null,null,invCode,'gaming,general','');
   await store.run('INSERT INTO memberships VALUES (?,?,?,?,0)', comm, admin.id, 'owner', null);
@@ -523,8 +575,11 @@ const app = express();
 app.use(helmet());
 const allowedOrigins = String(process.env.CORS_ORIGIN || '')
   .split(',').map(value => value.trim()).filter(Boolean);
+// Same-origin deployments do not need CORS. An explicit allowlist is only
+// enabled when a separately hosted client is configured.
+const corsOrigin = allowedOrigins.length ? allowedOrigins : false;
 app.use(cors({
-  origin: allowedOrigins.length ? allowedOrigins : (IS_PRODUCTION ? false : true),
+  origin: corsOrigin,
   credentials: false,
 }));
 app.use(express.json({ limit: '8mb' }));
@@ -546,20 +601,6 @@ const upload = multer({
   },
 });
 
-function auth(req, res, next) {
-  try {
-    req.user = jwt.verify((req.headers.authorization||'').replace('Bearer ',''), JWT_SECRET);
-    next();
-  } catch {
-    const bt = req.headers['x-bot-token'];
-    if (bt) {
-      store.get('SELECT * FROM users WHERE bot_token=$1 AND is_bot=1', bt)
-        .then(u => { if (!u) return res.status(401).json({error:'Invalid bot token'}); req.user = publicUser(u); next(); })
-        .catch(() => res.status(401).json({error:'Auth required'}));
-    } else res.status(401).json({error:'Authentication required'});
-  }
-}
-function token(u) { return jwt.sign(u, JWT_SECRET, {expiresIn:'7d'}); }
 const publicUser = u => u && ({
   id:u.id, username:u.username, tag:u.tag, nickname:u.nickname||u.username,
   avatar:u.avatar, banner:u.banner, bio:u.bio||'', status:u.status||'Online',
@@ -570,8 +611,29 @@ const publicUser = u => u && ({
   bot_color:u.bot_color||'', bot_emoji:u.bot_emoji||'',
   fav_mask:u.fav_mask||'', fav_color:u.fav_color||'', fav_emoji:u.fav_emoji||'',
   fav_masks:u.fav_masks||'[]', server_fav_masks:u.server_fav_masks||'{}', rank:u.rank||'Member',
-  privacy_mode:u.privacy_mode||'standard', credits:Number(u.credits||0), active_pet:u.active_pet||null,
+  privacy_mode:u.privacy_mode||'standard',  credits:Number(u.credits||0), active_pet:u.active_pet||null,
 });
+const sessions = createSessionManager({ store, jwt, secret: JWT_SECRET, publicUser });
+
+async function resolveRequestUser(req) {
+  const authorization = String(req.headers.authorization || '');
+  const rawToken = authorization.startsWith('Bearer ') ? authorization.slice(7).trim() : '';
+  try {
+    return await sessions.resolve(rawToken);
+  } catch {
+    const botToken = req.headers['x-bot-token'];
+    if (!botToken) throw new Error('Authentication required');
+    const bot = await store.get('SELECT * FROM users WHERE bot_token=$1 AND is_bot=1', botToken);
+    if (!bot || Number(bot.banned)) throw new Error('Invalid bot token');
+    return publicUser(bot);
+  }
+}
+
+function auth(req, res, next) {
+  resolveRequestUser(req)
+    .then(user => { req.user = user; next(); })
+    .catch(error => res.status(401).json({ error: error.message === 'Invalid bot token' ? error.message : 'Authentication required' }));
+}
 function adminOnly(req,res,next){ if(req.user?.is_admin) return next(); res.status(403).json({error:'Admin only'}); }
 
 const ROLE_PERMISSIONS = ['view_channel','read_messages','send_messages','attach_files','add_reactions','connect_voice','speak_voice','share_screen','manage_messages','timeout_members','kick_members','ban_members','manage_channels','manage_roles','manage_server'];
@@ -618,6 +680,33 @@ function requirePermission(permission) { return route(async (req,res,next) => {
   req.access = access; next();
 }); }
 const route = fn => (req,res,next) => Promise.resolve(fn(req,res,next)).catch(next);
+
+async function canAccessResource(user, { channelId, dmId, groupId }) {
+  const targets = [channelId, dmId, groupId].filter(Boolean);
+  if (targets.length !== 1) return false;
+  // Platform admin status does not override private DM/group membership. It may
+  // still inspect server channels for moderation purposes.
+  if (user?.is_admin && channelId) return true;
+  if (channelId) {
+    const channel = await store.get('SELECT community_id FROM channels WHERE id=$1', channelId);
+    if (!channel) return false;
+    return Boolean(await store.get('SELECT 1 FROM memberships WHERE community_id=$1 AND user_id=$2', channel.community_id, user.id));
+  }
+  if (dmId) return Boolean(await store.get('SELECT 1 FROM dms WHERE id=$1 AND (user_a=$2 OR user_b=$2)', dmId, user.id));
+  if (groupId) return Boolean(await store.get('SELECT 1 FROM group_members WHERE group_id=$1 AND user_id=$2', groupId, user.id));
+  return false;
+}
+
+async function canAccessRoom(user, roomId, requireMember = false) {
+  const room = await store.get('SELECT * FROM temp_rooms WHERE id=$1', roomId);
+  if (!room) return { room:null, allowed:false };
+  if (user?.is_admin) return { room, allowed:true };
+  const communityMember = await store.get('SELECT 1 FROM memberships WHERE community_id=$1 AND user_id=$2', room.community_id, user.id);
+  if (!communityMember) return { room, allowed:false };
+  if (!requireMember) return { room, allowed:true };
+  const member = await store.get('SELECT 1 FROM room_members WHERE room_id=$1 AND user_id=$2 AND waiting=0', room.id, user.id);
+  return { room, allowed:Boolean(member) };
+}
 
 // slowmode tracking
 const lastMsg = new Map(); // `${userId}:${channelId}` -> timestamp
@@ -793,7 +882,10 @@ async function addCredits(userId, amount) {
   await store.run('UPDATE users SET credits=LEAST(GREATEST(credits+$1,0), 100000) WHERE id=$2', Math.round(amount), userId);
 }
 // ── Health ────────────────────────────────────────────────────────────────────
-app.get('/api/health', (_,res) => res.json({ok:true,database:'postgres',service:'unknown-chat-platform'}));
+app.get('/api/health', route(async (_,res) => {
+  await store.exec('SELECT 1');
+  res.json({ok:true,database:'postgres',service:'unknown-chat-platform'});
+}));
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
 app.post('/api/register', route(async (req,res) => {
@@ -802,8 +894,16 @@ app.post('/api/register', route(async (req,res) => {
   if (!username || password.length<6) return res.status(400).json({error:'Username and password (min 6 chars) required'});
   try {
     const user = await createUser(username, undefined, password);
+    // Auto-join the default public community so first-run users land inside a real
+    // space instead of an empty home. Admins can mark one with is_default; otherwise
+    // fall back to the oldest public community. Public-only: never force a new
+    // account into a private community.
+    const defaultComm = await store.get("SELECT id FROM communities WHERE visibility='public' ORDER BY is_default DESC, created_at, id LIMIT 1");
+    if (defaultComm) {
+      await store.run('INSERT INTO memberships VALUES (?,?,?,?,0) ON CONFLICT DO NOTHING', defaultComm.id, user.id, 'member', null);
+    }
     const full = publicUser(await store.get('SELECT * FROM users WHERE id=$1', user.id));
-    res.json({token:token({id:full.id,username:full.username,tag:full.tag,is_admin:full.is_admin}), user:full});
+    res.json({token:await sessions.issue(full), user:full});
   } catch { res.status(409).json({error:'Username unavailable'}); }
 }));
 
@@ -814,7 +914,12 @@ app.post('/api/login', route(async (req,res) => {
   if (!u || !bcrypt.compareSync(password, u.password_hash)) return res.status(401).json({error:'Invalid login'});
   if (Number(u.banned)) return res.status(403).json({error:'Account banned'});
   const pu = publicUser(u);
-  res.json({token:token({id:pu.id,username:pu.username,tag:pu.tag,is_admin:pu.is_admin}), user:pu});
+  res.json({token:await sessions.issue(pu), user:pu});
+}));
+
+app.post('/api/logout', auth, route(async (req,res) => {
+  await sessions.revoke(req.user.sessionId);
+  res.json({ok:true});
 }));
 
 app.get('/api/bootstrap', auth, route(async (req,res) => {
@@ -911,6 +1016,7 @@ app.post('/api/me/change-password', auth, route(async (req,res) => {
   const u = await store.get('SELECT * FROM users WHERE id=$1', req.user.id);
   if (!bcrypt.compareSync(current, u.password_hash)) return res.status(401).json({error:'Current password incorrect'});
   await store.run('UPDATE users SET password_hash=$1 WHERE id=$2', bcrypt.hashSync(newPassword,10), req.user.id);
+  await sessions.revokeUserExcept(req.user.id, req.user.sessionId);
   res.json({ok:true});
 }));
 
@@ -1150,7 +1256,9 @@ app.delete('/api/friends/:id', auth, route(async (req,res) => {
 // ── Communities ───────────────────────────────────────────────────────────────
 app.post('/api/communities', auth, route(async (req,res) => {
   const id = nanoid(); const invCode = nanoid(8);
-  await store.run('INSERT INTO communities VALUES (?,?,?,?,?,?,?,?,?,?,0,0,?,CURRENT_TIMESTAMP)',
+  await store.run(`INSERT INTO communities
+    (id,name,description,visibility,owner_id,rules,icon,banner,invite_code,tags,locked,is_topic,topic_description,is_default,created_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,0,0,?,0,CURRENT_TIMESTAMP)`,
     id,req.body.name,req.body.description||'',req.body.visibility||'public',req.user.id,
     req.body.rules||'Do not share personal information.',req.body.icon||null,null,invCode,req.body.tags||'','');
   await store.run('INSERT INTO memberships VALUES (?,?,?,?,0)', id, req.user.id, 'owner', null);
@@ -1239,6 +1347,23 @@ app.get('/api/communities/:id/invite', auth, route(async (req,res) => {
 app.post('/api/communities/:id/leave', auth, route(async (req,res) => {
   await store.run('DELETE FROM memberships WHERE community_id=$1 AND user_id=$2', req.params.id, req.user.id);
   res.json({ok:true});
+}));
+
+// Mark (or unmark) the community that new registrations auto-join. Only one public
+// community can be the default; setting one clears the others, and unset falls back
+// to the oldest public community at registration time.
+app.patch('/api/communities/:id/default', auth, route(async (req,res) => {
+  const c = await store.get('SELECT * FROM communities WHERE id=$1', req.params.id);
+  if (!c) return res.status(404).json({error:'Community not found'});
+  if (!req.user.is_admin) {
+    const mem = await store.get('SELECT role FROM memberships WHERE community_id=$1 AND user_id=$2', c.id, req.user.id);
+    if (!mem || !['owner','admin'].includes(mem.role)) return res.status(403).json({error:'Only the server owner, a server admin, or a platform admin can set the default'});
+  }
+  const isDefault = Boolean(req.body?.isDefault);
+  if (isDefault && c.visibility !== 'public') return res.status(400).json({error:'Only public communities can be the default'});
+  if (isDefault) await store.run('UPDATE communities SET is_default=0 WHERE is_default=1');
+  await store.run('UPDATE communities SET is_default=$1 WHERE id=$2', isDefault ? 1 : 0, c.id);
+  res.json({ ok:true, is_default: isDefault ? 1 : 0 });
 }));
 
 app.post('/api/communities/:id/rate', auth, route(async (req,res) => {
@@ -1333,7 +1458,7 @@ app.delete('/api/communities/:communityId/messages/:messageId', auth, route(asyn
 // ── Discovery ─────────────────────────────────────────────────────────────────
 app.get('/api/discover', auth, route(async (req,res) => {
   const {category,tag,q} = req.query;
-  let communities = await store.all("SELECT c.*,(SELECT COUNT(*) FROM memberships WHERE community_id=c.id) AS member_count FROM communities WHERE visibility='public' ORDER BY member_count DESC LIMIT 50");
+  let communities = await store.all("SELECT c.*,(SELECT COUNT(*) FROM memberships WHERE community_id=c.id) AS member_count FROM communities c WHERE visibility='public' ORDER BY member_count DESC LIMIT 50");
   if (tag) communities = communities.filter(c => (c.tags||'').includes(tag));
   if (q) communities = communities.filter(c => c.name.toLowerCase().includes(q.toLowerCase()));
   const u = await store.get('SELECT interests FROM users WHERE id=$1', req.user.id);
@@ -1502,8 +1627,10 @@ app.post('/api/rooms', auth, route(async (req,res) => {
 }));
 
 app.get('/api/rooms/:id', auth, route(async (req,res) => {
-  const r = await store.get('SELECT * FROM temp_rooms WHERE id=$1', req.params.id);
+  const access = await canAccessRoom(req.user, req.params.id);
+  const r = access.room;
   if (!r) return res.status(404).json({error:'Room not found'});
+  if (!access.allowed) return res.status(403).json({error:'Forbidden'});
   const members = await store.all('SELECT rm.user_id,rm.waiting,u.username,u.nickname,u.avatar,u.badge FROM room_members rm JOIN users u ON u.id=rm.user_id WHERE rm.room_id=$1 ORDER BY rm.joined_at', r.id);
   res.json({ ...r, waiting_room:Number(r.waiting_room), ptt:Number(r.ptt),
     members: members.map(m=>({ user_id:m.user_id, username:m.username, nickname:m.nickname, avatar:m.avatar, badge:m.badge, waiting:Number(m.waiting) })),
@@ -1512,8 +1639,10 @@ app.get('/api/rooms/:id', auth, route(async (req,res) => {
 
 // Join a room. Waiting-room rooms admit the owner immediately and queue everyone else.
 app.post('/api/rooms/:id/join', auth, route(async (req,res) => {
-  const r = await store.get('SELECT * FROM temp_rooms WHERE id=$1', req.params.id);
+  const access = await canAccessRoom(req.user, req.params.id);
+  const r = access.room;
   if (!r) return res.status(404).json({error:'Room not found'});
+  if (!access.allowed) return res.status(403).json({error:'Forbidden'});
   const existing = await store.get('SELECT * FROM room_members WHERE room_id=$1 AND user_id=$2', r.id, req.user.id);
   const isOwner = r.owner_id === req.user.id || req.user.is_admin;
   if (existing) {
@@ -1534,8 +1663,10 @@ app.post('/api/rooms/:id/join', auth, route(async (req,res) => {
 
 // Owner admits a waiting user
 app.post('/api/rooms/:id/admit', auth, route(async (req,res) => {
-  const r = await store.get('SELECT * FROM temp_rooms WHERE id=$1', req.params.id);
+  const access = await canAccessRoom(req.user, req.params.id);
+  const r = access.room;
   if (!r) return res.status(404).json({error:'Room not found'});
+  if (!access.allowed) return res.status(403).json({error:'Forbidden'});
   if (r.owner_id !== req.user.id && !req.user.is_admin) return res.status(403).json({error:'Only the owner can admit'});
   await store.run('UPDATE room_members SET waiting=0 WHERE room_id=$1 AND user_id=$2', r.id, req.body.userId);
   io.to(`room:${r.id}`).emit('room_presence', { action:'admitted', userId:req.body.userId });
@@ -1544,14 +1675,19 @@ app.post('/api/rooms/:id/admit', auth, route(async (req,res) => {
 }));
 
 app.post('/api/rooms/:id/leave', auth, route(async (req,res) => {
+  const access = await canAccessRoom(req.user, req.params.id);
+  if (!access.room) return res.status(404).json({error:'Room not found'});
+  if (!access.allowed) return res.status(403).json({error:'Forbidden'});
   await store.run('DELETE FROM room_members WHERE room_id=$1 AND user_id=$2', req.params.id, req.user.id);
   io.to(`room:${req.params.id}`).emit('room_presence', { action:'left', userId:req.user.id });
   res.json({ok:true});
 }));
 
 app.delete('/api/rooms/:id', auth, route(async (req,res) => {
-  const r = await store.get('SELECT * FROM temp_rooms WHERE id=$1', req.params.id);
+  const access = await canAccessRoom(req.user, req.params.id);
+  const r = access.room;
   if (!r) return res.status(404).json({error:'Room not found'});
+  if (!access.allowed) return res.status(403).json({error:'Forbidden'});
   if (r.owner_id !== req.user.id && !req.user.is_admin) return res.status(403).json({error:'Only the owner can delete'});
   await store.run('DELETE FROM room_members WHERE room_id=$1', r.id);
   await store.run('DELETE FROM room_messages WHERE room_id=$1', r.id);
@@ -1563,14 +1699,19 @@ app.delete('/api/rooms/:id', auth, route(async (req,res) => {
 
 // Room chat messages
 app.get('/api/rooms/:id/messages', auth, route(async (req,res) => {
+  const access = await canAccessRoom(req.user, req.params.id, true);
+  if (!access.room) return res.status(404).json({error:'Room not found'});
+  if (!access.allowed) return res.status(403).json({error:'Join the room first'});
   const rows = await store.all(`SELECT rm.*,u.username,u.nickname,u.avatar,u.badge FROM room_messages rm JOIN users u ON u.id=rm.sender_id WHERE rm.room_id=$1 ORDER BY rm.created_at DESC LIMIT 100`, req.params.id);
   rows.reverse();
   res.json(rows);
 }));
 
 app.post('/api/rooms/:id/messages', auth, route(async (req,res) => {
-  const r = await store.get('SELECT * FROM temp_rooms WHERE id=$1', req.params.id);
+  const access = await canAccessRoom(req.user, req.params.id, true);
+  const r = access.room;
   if (!r) return res.status(404).json({error:'Room not found'});
+  if (!access.allowed) return res.status(403).json({error:'Join the room first'});
   const mem = await store.get('SELECT * FROM room_members WHERE room_id=$1 AND user_id=$2 AND waiting=0', r.id, req.user.id);
   if (!mem && !req.user.is_admin) return res.status(403).json({error:'Join the room first'});
   const id = nanoid();
@@ -1582,8 +1723,10 @@ app.post('/api/rooms/:id/messages', auth, route(async (req,res) => {
 
 // Room polls
 app.post('/api/rooms/:id/polls', auth, route(async (req,res) => {
-  const r = await store.get('SELECT * FROM temp_rooms WHERE id=$1', req.params.id);
+  const access = await canAccessRoom(req.user, req.params.id, true);
+  const r = access.room;
   if (!r) return res.status(404).json({error:'Room not found'});
+  if (!access.allowed) return res.status(403).json({error:'Join the room first'});
   const { question, options } = req.body;
   if (!question || !Array.isArray(options) || options.length < 2) return res.status(400).json({error:'Question and at least 2 options required'});
   const id = nanoid();
@@ -1594,6 +1737,9 @@ app.post('/api/rooms/:id/polls', auth, route(async (req,res) => {
 }));
 
 app.get('/api/rooms/:id/polls', auth, route(async (req,res) => {
+  const access = await canAccessRoom(req.user, req.params.id, true);
+  if (!access.room) return res.status(404).json({error:'Room not found'});
+  if (!access.allowed) return res.status(403).json({error:'Join the room first'});
   const polls = await store.all('SELECT * FROM room_polls WHERE room_id=$1 ORDER BY created_at DESC', req.params.id);
   const out = [];
   for (const p of polls) {
@@ -1605,6 +1751,11 @@ app.get('/api/rooms/:id/polls', auth, route(async (req,res) => {
 }));
 
 app.post('/api/rooms/:id/polls/:pollId/vote', auth, route(async (req,res) => {
+  const access = await canAccessRoom(req.user, req.params.id, true);
+  if (!access.room) return res.status(404).json({error:'Room not found'});
+  if (!access.allowed) return res.status(403).json({error:'Join the room first'});
+  const poll = await store.get('SELECT id FROM room_polls WHERE id=$1 AND room_id=$2', req.params.pollId, req.params.id);
+  if (!poll) return res.status(404).json({error:'Poll not found'});
   await store.run('INSERT INTO room_poll_votes VALUES (?,?,?) ON CONFLICT (poll_id,user_id) DO UPDATE SET option_index=$3', req.params.pollId, req.user.id, req.body.optionIndex);
   const votes = await store.all('SELECT option_index,COUNT(*) AS count FROM room_poll_votes WHERE poll_id=$1 GROUP BY option_index', req.params.pollId);
   io.to(`room:${req.params.id}`).emit('room_poll_votes', { pollId:req.params.pollId, votes });
@@ -1613,6 +1764,9 @@ app.post('/api/rooms/:id/polls/:pollId/vote', auth, route(async (req,res) => {
 
 // Collab text persistence
 app.put('/api/rooms/:id/collab', auth, route(async (req,res) => {
+  const access = await canAccessRoom(req.user, req.params.id, true);
+  if (!access.room) return res.status(404).json({error:'Room not found'});
+  if (!access.allowed) return res.status(403).json({error:'Join the room first'});
   const text = String(req.body.text||'').slice(0, 50000);
   await store.run('UPDATE temp_rooms SET collab_text=$1 WHERE id=$2', text, req.params.id);
   res.json({ok:true});
@@ -2002,6 +2156,7 @@ function trackRate(channelId) {
 }
 
 app.get('/api/channels/:id/messages', auth, route(async (req,res) => {
+  if (!(await canAccessResource(req.user, { channelId:req.params.id }))) return res.status(403).json({error:'Forbidden'});
   const before = req.query.before;
   const around = req.query.around;
   const limit = Math.min(Number(req.query.limit)||100,200);
@@ -2075,10 +2230,11 @@ app.get('/api/groups/:id/messages', auth, route(async (req,res) => {
 
 app.post('/api/messages', auth, route(async (req,res) => {
   const id = nanoid();
-  const body = req.body.body || '';
+  const body = String(req.body.body || '').slice(0, 10000);
   const channelId = req.body.channelId || null;
   const dmId = req.body.dmId || null;
   const groupId = req.body.groupId || null;
+  if (!(await canAccessResource(req.user, { channelId, dmId, groupId }))) return res.status(403).json({error:'You do not have access to this conversation'});
 
   // Check community lock
   if (channelId) {
@@ -2170,6 +2326,7 @@ app.post('/api/messages', auth, route(async (req,res) => {
 app.patch('/api/messages/:id', auth, route(async (req,res) => {
   const msg = await store.get('SELECT * FROM messages WHERE id=$1 AND sender_id=$2', req.params.id, req.user.id);
   if (!msg) return res.status(403).json({error:'Forbidden'});
+  if (!(await canAccessResource(req.user, { channelId:msg.channel_id, dmId:msg.dm_id, groupId:msg.group_id }))) return res.status(403).json({error:'Forbidden'});
   await store.run('INSERT INTO message_edits VALUES (?,?,?,CURRENT_TIMESTAMP)', nanoid(), req.params.id, msg.body);
   await store.run('UPDATE messages SET body=$1,edited_at=CURRENT_TIMESTAMP WHERE id=$2', req.body.body, req.params.id);
   const updated = await store.get(`SELECT m.*,u.username,u.tag,u.avatar,u.nickname FROM messages m JOIN users u ON u.id=m.sender_id WHERE m.id=$1`, req.params.id);
@@ -2186,6 +2343,7 @@ app.get('/api/messages/:id/history', auth, adminOnly, route(async (req,res) => {
 app.delete('/api/messages/:id', auth, route(async (req,res) => {
   const msg = await store.get('SELECT * FROM messages WHERE id=$1 AND sender_id=$2', req.params.id, req.user.id);
   if (!msg) return res.status(403).json({error:'Forbidden'});
+  if (!(await canAccessResource(req.user, { channelId:msg.channel_id, dmId:msg.dm_id, groupId:msg.group_id }))) return res.status(403).json({error:'Forbidden'});
   await store.run("UPDATE messages SET deleted_at=CURRENT_TIMESTAMP,body='[deleted]' WHERE id=$1", req.params.id);
   if (msg.channel_id) io.to(msg.channel_id).emit('message_delete',{id:req.params.id,channelId:msg.channel_id});
   if (msg.dm_id) io.to(`dm:${msg.dm_id}`).emit('message_delete',{id:req.params.id,dmId:msg.dm_id});
@@ -2193,7 +2351,9 @@ app.delete('/api/messages/:id', auth, route(async (req,res) => {
 }));
 
 app.post('/api/messages/:id/reactions', auth, route(async (req,res) => {
-  const emoji = req.body.emoji || '👍';
+  const target = await store.get('SELECT channel_id,dm_id,group_id FROM messages WHERE id=$1', req.params.id);
+  if (!target || !(await canAccessResource(req.user, target))) return res.status(403).json({error:'Forbidden'});
+  const emoji = String(req.body.emoji || '👍').slice(0,32);
   const existing = await store.get('SELECT * FROM reactions WHERE message_id=$1 AND user_id=$2 AND emoji=$3', req.params.id, req.user.id, emoji);
   if (existing) {
     await store.run('DELETE FROM reactions WHERE message_id=$1 AND user_id=$2 AND emoji=$3', req.params.id, req.user.id, emoji);
@@ -2211,6 +2371,8 @@ app.post('/api/messages/:id/reactions', auth, route(async (req,res) => {
 }));
 
 app.post('/api/messages/:id/pin', auth, route(async (req,res) => {
+  const target = await store.get('SELECT channel_id,dm_id,group_id FROM messages WHERE id=$1', req.params.id);
+  if (!target || !(await canAccessResource(req.user, target))) return res.status(403).json({error:'Forbidden'});
   await store.run('UPDATE messages SET pinned=$1 WHERE id=$2', req.body.pinned?1:0, req.params.id);
   res.json({ok:true});
 }));
@@ -2218,7 +2380,8 @@ app.post('/api/messages/:id/pin', auth, route(async (req,res) => {
 // ── Polls ─────────────────────────────────────────────────────────────────────
 app.post('/api/polls', auth, route(async (req,res) => {
   const {question, options, channelId, dmId, groupId} = req.body;
-  if (!question || !options || options.length < 2) return res.status(400).json({error:'Question and at least 2 options required'});
+  if (!(await canAccessResource(req.user, { channelId, dmId, groupId }))) return res.status(403).json({error:'You do not have access to this conversation'});
+  if (!question || !Array.isArray(options) || options.length < 2) return res.status(400).json({error:'Question and at least 2 options required'});
   // Post a message first
   const msgId = nanoid();
   await store.run('INSERT INTO messages (id,channel_id,dm_id,group_id,sender_id,body) VALUES (?,?,?,?,?,?)',
@@ -2235,9 +2398,10 @@ app.post('/api/polls', auth, route(async (req,res) => {
 }));
 
 app.post('/api/polls/:id/vote', auth, route(async (req,res) => {
+  const poll = await store.get('SELECT * FROM polls WHERE id=$1', req.params.id);
+  if (!poll || !(await canAccessResource(req.user, { channelId:poll.channel_id, dmId:poll.dm_id, groupId:poll.group_id }))) return res.status(403).json({error:'Forbidden'});
   await store.run('INSERT INTO poll_votes VALUES (?,?,?) ON CONFLICT (poll_id,user_id) DO UPDATE SET option_index=$3', req.params.id, req.user.id, req.body.optionIndex);
   const votes = await store.all('SELECT option_index,COUNT(*) AS count FROM poll_votes WHERE poll_id=$1 GROUP BY option_index', req.params.id);
-  const poll = await store.get('SELECT * FROM polls WHERE id=$1', req.params.id);
   const result = {pollId:req.params.id, votes};
   if (poll?.channel_id) io.to(poll.channel_id).emit('poll_update', result);
   if (poll?.dm_id) io.to(`dm:${poll.dm_id}`).emit('poll_update', result);
@@ -2247,6 +2411,7 @@ app.post('/api/polls/:id/vote', auth, route(async (req,res) => {
 app.get('/api/polls/:id', auth, route(async (req,res) => {
   const poll = await store.get('SELECT * FROM polls WHERE id=$1', req.params.id);
   if (!poll) return res.status(404).json({error:'Not found'});
+  if (!(await canAccessResource(req.user, { channelId:poll.channel_id, dmId:poll.dm_id, groupId:poll.group_id }))) return res.status(403).json({error:'Forbidden'});
   const votes = await store.all('SELECT option_index,COUNT(*) AS count FROM poll_votes WHERE poll_id=$1 GROUP BY option_index', req.params.id);
   const myVote = await store.get('SELECT option_index FROM poll_votes WHERE poll_id=$1 AND user_id=$2', req.params.id, req.user.id);
   res.json({...poll, options:JSON.parse(poll.options||'[]'), votes, myVote:myVote?.option_index??null});
@@ -2260,6 +2425,7 @@ async function threadMsg(id) {
 app.post('/api/messages/:id/thread', auth, route(async (req,res) => {
   const root = await store.get('SELECT * FROM messages WHERE id=$1', req.params.id);
   if (!root) return res.status(404).json({error:'Message not found'});
+  if (!(await canAccessResource(req.user, { channelId:root.channel_id, dmId:root.dm_id, groupId:root.group_id }))) return res.status(403).json({error:'Forbidden'});
   if (!root.channel_id && !root.dm_id && !root.group_id) return res.status(400).json({error:'This message cannot host a thread'});
   let thread = await store.get('SELECT * FROM threads WHERE root_message_id=$1', root.id);
   if (!thread) {
@@ -2274,6 +2440,7 @@ app.post('/api/messages/:id/thread', auth, route(async (req,res) => {
 app.get('/api/threads/:id', auth, route(async (req,res) => {
   const thread = await store.get('SELECT * FROM threads WHERE id=$1', req.params.id);
   if (!thread) return res.status(404).json({error:'Thread not found'});
+  if (!(await canAccessResource(req.user, { channelId:thread.channel_id, dmId:thread.dm_id, groupId:thread.group_id }))) return res.status(403).json({error:'Forbidden'});
   const root = await threadMsg(thread.root_message_id);
   const messages = await store.all(`SELECT m.*,u.username,u.tag,u.avatar,u.nickname,u.badge,u.is_bot,u.anon_active,u.anon_mask,u.anon_color,u.bot_emoji,u.bot_color FROM messages m JOIN users u ON u.id=m.sender_id WHERE m.thread_id=$1 AND m.deleted_at IS NULL ORDER BY m.created_at ASC LIMIT 100`, thread.id);
   res.json({ thread, root, messages });
@@ -2283,6 +2450,7 @@ app.get('/api/threads/:id', auth, route(async (req,res) => {
 app.get('/api/channels/:id/threads', auth, route(async (req,res) => {
   const ch = await store.get('SELECT * FROM channels WHERE id=$1', req.params.id);
   if (!ch) return res.status(404).json({error:'Channel not found'});
+  if (!(await canAccessResource(req.user, { channelId:ch.id }))) return res.status(403).json({error:'Forbidden'});
   const rows = await store.all(`
     SELECT t.id, t.root_message_id, t.created_at,
       COUNT(m.id) AS reply_count,
@@ -2309,6 +2477,7 @@ app.get('/api/channels/:id/threads', auth, route(async (req,res) => {
 app.post('/api/threads/:id/messages', auth, route(async (req,res) => {
   const thread = await store.get('SELECT * FROM threads WHERE id=$1', req.params.id);
   if (!thread) return res.status(404).json({error:'Thread not found'});
+  if (!(await canAccessResource(req.user, { channelId:thread.channel_id, dmId:thread.dm_id, groupId:thread.group_id }))) return res.status(403).json({error:'Forbidden'});
   const body = String(req.body.body || '').slice(0, 2000);
   if (!body.trim()) return res.status(400).json({error:'Message body required'});
   const id = nanoid();
@@ -2325,7 +2494,7 @@ app.post('/api/threads/:id/messages', auth, route(async (req,res) => {
 app.post('/api/bookmarks', auth, route(async (req,res) => {
   const messageId = req.body.messageId;
   if (!messageId) return res.status(400).json({error:'messageId required'});
-  const msg = await store.get('SELECT id FROM messages WHERE id=$1', messageId);
+  const msg = await store.get('SELECT id,channel_id,dm_id,group_id FROM messages WHERE id=$1', messageId);
   if (!msg) return res.status(404).json({error:'Message not found'});
   const f = String(req.body.folder || 'Important').slice(0, 24);
   await store.run('INSERT INTO bookmarks VALUES (?,?,?,CURRENT_TIMESTAMP) ON CONFLICT (user_id,message_id) DO UPDATE SET folder=$3', req.user.id, messageId, f);
@@ -2733,6 +2902,8 @@ app.get('/api/reveal/moderation', auth, adminOnly, route(async (req,res) => {
 app.post('/api/dms', auth, route(async (req,res) => {
   const targetId = req.body.userId;
   if (!targetId || targetId === req.user.id) return res.status(400).json({error:'Invalid user'});
+  const target = await store.get('SELECT id FROM users WHERE id=$1 AND banned=0', targetId);
+  if (!target) return res.status(404).json({error:'User not found'});
   const existing = await store.get('SELECT * FROM dms WHERE (user_a=$1 AND user_b=$2) OR (user_a=$2 AND user_b=$1)', req.user.id, targetId);
   if (existing) return res.json({dm:existing});
   const id = nanoid();
@@ -2869,6 +3040,7 @@ app.get('/api/reminders', auth, route(async (req,res) => {
 app.post('/api/reminders', auth, route(async (req,res) => {
   const msg = await store.get('SELECT * FROM messages WHERE id=$1', req.body.messageId);
   if (!msg) return res.status(404).json({error:'Message not found'});
+  if (!(await canAccessResource(req.user, msg))) return res.status(403).json({error:'Forbidden'});
   const remindAt = resolveRemindAt(req.body.when);
   if (!remindAt) return res.status(400).json({error:'Invalid reminder time'});
   const id = nanoid();
@@ -2887,9 +3059,12 @@ app.delete('/api/reminders/:id', auth, route(async (req,res) => {
 // Fire due reminders: create a notification + push it over the socket
 async function fireDueReminders() {
   try {
-    const due = await store.all('SELECT * FROM reminders WHERE fired=0 AND remind_at <= CURRENT_TIMESTAMP LIMIT 50');
-    for (const r of due) {
-      await store.run('UPDATE reminders SET fired=1 WHERE id=$1', r.id);
+    const due = await store.all('SELECT id FROM reminders WHERE fired=0 AND remind_at <= CURRENT_TIMESTAMP LIMIT 50');
+    for (const reminder of due) {
+      // Claim atomically so two app instances cannot deliver the same reminder.
+      const claimed = await store.all('UPDATE reminders SET fired=1 WHERE id=$1 AND fired=0 RETURNING *', reminder.id);
+      const r = claimed[0];
+      if (!r) continue;
       await createNotification(r.user_id, 'reminder', r.id, 'reminder', `⏰ Reminder: "${r.preview}"`);
       io.to(`user:${r.user_id}`).emit('notification', { type:'reminder', reminder:r });
     }
@@ -3372,6 +3547,7 @@ app.post('/api/data-requests/:id/deny', auth, route(async (req,res) => {
 app.post('/api/admin/users/:id/reset-password', auth, adminOnly, route(async (req,res) => {
   const newPass = req.body.newPassword || nanoid(12);
   await store.run('UPDATE users SET password_hash=$1 WHERE id=$2', bcrypt.hashSync(newPass,10), req.params.id);
+  await sessions.revokeUser(req.params.id);
   await store.run('INSERT INTO moderation_logs VALUES (?,?,?,?,?,CURRENT_TIMESTAMP)', nanoid(),req.user.id,'reset_password',req.params.id,'');
   res.json({ok:true, temporaryPassword:newPass});
 }));
@@ -4286,26 +4462,92 @@ app.use((err,_req,res,_next) => { console.error(err); res.status(500).json({erro
 
 // ── Socket.IO ─────────────────────────────────────────────────────────────────
 const server = http.createServer(app);
-const socketOrigins = allowedOrigins.length ? allowedOrigins : (IS_PRODUCTION ? [] : '*');
-const io = new Server(server, { cors: { origin: socketOrigins } });
+const socketOrigins = corsOrigin;
+const io = new Server(server, {
+  cors: { origin: socketOrigins },
+  // WebSocket-only transport avoids requiring sticky sessions when several
+  // instances sit behind Render's load balancer.
+  transports: ['websocket'],
+});
+io.adapter(createAdapter(pool, {
+  errorHandler: error => console.error('Socket.IO PostgreSQL adapter error:', error),
+}));
+io.use(async (socket, next) => {
+  try {
+    const rawToken = socket.handshake.auth?.token;
+    if (!rawToken) throw new Error('Authentication required');
+    const user = await sessions.resolve(rawToken);
+    socket.data.user = user;
+    next();
+  } catch {
+    next(new Error('Authentication required'));
+  }
+});
+
+// DB-backed presence snapshot: id + status for every visible user. Reading the
+// users table (not local memory) means a snapshot reflects the truth even when
+// a `user_update` broadcast was missed or the change happened on another app
+// instance — each instance serves its own sockets but shares one database.
+async function presenceSnapshot() {
+  return store.all('SELECT id,status,custom_status FROM users WHERE banned=0');
+}
+
+function sendPresence(socket) {
+  presenceSnapshot().then(list => socket.emit('presence_sync', list)).catch(() => {});
+}
 
 io.on('connection', socket => {
-  socket.on('join', id => { if (typeof id === 'string' && id.length <= 128) socket.join(id); });
-  socket.on('join_dm', id => { if (typeof id === 'string' && id.length <= 128) socket.join(`dm:${id}`); });
-  socket.on('join_user', id => { if (typeof id === 'string' && id.length <= 128) socket.join(`user:${id}`); });
-  socket.on('join_group', id => { if (typeof id === 'string' && id.length <= 128) socket.join(`group:${id}`); });
-  socket.on('join_community', id => { if (typeof id === 'string' && id.length <= 128) socket.join(id); });
+  const userId = socket.data.user.id;
+  socket.on('join', async id => {
+    if (typeof id !== 'string' || id.length > 128) return;
+    try {
+      const channel = await store.get('SELECT community_id FROM channels WHERE id=$1', id);
+      if (!channel) return;
+      const member = await store.get('SELECT 1 FROM memberships WHERE community_id=$1 AND user_id=$2', channel.community_id, userId);
+      if (member || socket.data.user.is_admin) socket.join(id);
+    } catch {}
+  });
+  socket.on('join_dm', async id => {
+    if (typeof id !== 'string' || id.length > 128) return;
+    try {
+      const dm = await store.get('SELECT 1 FROM dms WHERE id=$1 AND (user_a=$2 OR user_b=$2)', id, userId);
+      if (dm) socket.join(`dm:${id}`);
+    } catch {}
+  });
+  socket.on('join_user', id => {
+    if (!id || String(id) === String(userId)) socket.join(`user:${userId}`);
+  });
+  socket.on('join_group', async id => {
+    if (typeof id !== 'string' || id.length > 128) return;
+    try {
+      const member = await store.get('SELECT 1 FROM group_members WHERE group_id=$1 AND user_id=$2', id, userId);
+      if (member) socket.join(`group:${id}`);
+    } catch {}
+  });
+  socket.on('join_community', async id => {
+    if (typeof id !== 'string' || id.length > 128) return;
+    try {
+      const member = await store.get('SELECT 1 FROM memberships WHERE community_id=$1 AND user_id=$2', id, userId);
+      if (member || socket.data.user.is_admin) socket.join(id);
+    } catch {}
+  });
 
   socket.on('typing', data => {
     if (!data || typeof data !== 'object') return;
-    if (typeof data.channelId === 'string' && data.channelId.length <= 128) socket.to(data.channelId).emit('typing', data);
-    if (typeof data.dmId === 'string' && data.dmId.length <= 128) socket.to(`dm:${data.dmId}`).emit('typing', data);
-    if (typeof data.groupId === 'string' && data.groupId.length <= 128) socket.to(`group:${data.groupId}`).emit('typing', data);
+    if (typeof data.channelId === 'string' && data.channelId.length <= 128 && socket.rooms.has(data.channelId)) socket.to(data.channelId).emit('typing', data);
+    if (typeof data.dmId === 'string' && data.dmId.length <= 128 && socket.rooms.has(`dm:${data.dmId}`)) socket.to(`dm:${data.dmId}`).emit('typing', data);
+    if (typeof data.groupId === 'string' && data.groupId.length <= 128 && socket.rooms.has(`group:${data.groupId}`)) socket.to(`group:${data.groupId}`).emit('typing', data);
   });
 
   // Voice
   socket.on('voice_join', async data => {
-    const {channelId, userId} = data;
+    const channelId = data?.channelId;
+    if (typeof channelId !== 'string' || channelId.length > 128) return;
+    let member = await store.get('SELECT 1 FROM memberships m JOIN channels c ON c.community_id=m.community_id WHERE c.id=$1 AND m.user_id=$2', channelId, userId).catch(() => null);
+    if (!member) {
+      member = await store.get('SELECT 1 FROM room_members WHERE room_id=$1 AND user_id=$2 AND waiting=0', channelId, userId).catch(() => null);
+    }
+    if (!member && !socket.data.user.is_admin) return;
     socket.join(`voice:${channelId}`);
     try {
       await store.run('DELETE FROM voice_sessions WHERE channel_id=$1 AND user_id=$2', channelId, userId);
@@ -4316,63 +4558,107 @@ io.on('connection', socket => {
   });
 
   socket.on('voice_leave', async data => {
-    const {channelId, userId} = data;
+    const channelId = data?.channelId;
+    if (typeof channelId !== 'string' || channelId.length > 128 || !socket.rooms.has(`voice:${channelId}`)) return;
     socket.leave(`voice:${channelId}`);
     try { await store.run('DELETE FROM voice_sessions WHERE channel_id=$1 AND user_id=$2', channelId, userId); } catch {}
     io.to(`voice:${channelId}`).emit('voice_state',{channelId, userId, joined:false});
   });
 
   // Temporary rooms
-  socket.on('room_join', d => {
+  socket.on('room_join', async d => {
     const roomId = typeof d === 'string' ? d : d?.roomId;
-    if (roomId) socket.join(`room:${roomId}`);
+    if (typeof roomId !== 'string' || roomId.length > 128) return;
+    try {
+      const member = await store.get('SELECT 1 FROM room_members WHERE room_id=$1 AND user_id=$2', roomId, userId);
+      if (member || socket.data.user.is_admin) socket.join(`room:${roomId}`);
+    } catch {}
   });
   socket.on('room_leave', d => {
     const roomId = typeof d === 'string' ? d : d?.roomId;
-    const userId = d?.userId;
-    if (roomId) socket.leave(`room:${roomId}`);
-    if (roomId && userId) {
-      store.run('DELETE FROM room_members WHERE room_id=$1 AND user_id=$2', roomId, userId).catch(()=>{});
-      io.to(`room:${roomId}`).emit('room_presence', { action:'left', userId });
-    }
+    if (typeof roomId !== 'string' || roomId.length > 128) return;
+    const roomName = `room:${roomId}`;
+    if (!socket.rooms.has(roomName)) return;
+    socket.leave(roomName);
+    store.run('DELETE FROM room_members WHERE room_id=$1 AND user_id=$2', roomId, userId).catch(()=>{});
+    io.to(roomName).emit('room_presence', { action:'left', userId });
   });
   // Drawing strokes (fire-and-forget broadcast to the room)
   socket.on('room_draw', d => {
-    if (!d?.roomId) return;
+    if (typeof d?.roomId !== 'string' || !socket.rooms.has(`room:${d.roomId}`)) return;
     socket.to(`room:${d.roomId}`).emit('room_draw', d);
   });
   // Watch-together sync (URL, playing state, current time)
   socket.on('room_watch', d => {
-    if (!d?.roomId) return;
+    if (typeof d?.roomId !== 'string' || !socket.rooms.has(`room:${d.roomId}`)) return;
     socket.to(`room:${d.roomId}`).emit('room_watch', d);
   });
   // Collab text sync (debounced on the client)
   socket.on('room_collab', d => {
-    if (!d?.roomId) return;
+    if (typeof d?.roomId !== 'string' || !socket.rooms.has(`room:${d.roomId}`)) return;
     socket.to(`room:${d.roomId}`).emit('room_collab', d);
   });
   // Raise hand / speaker queue
   socket.on('room_raise', d => {
-    if (!d?.roomId) return;
-    socket.to(`room:${d.roomId}`).emit('room_raise', { roomId:d.roomId, userId:d.userId });
+    if (typeof d?.roomId !== 'string' || !socket.rooms.has(`room:${d.roomId}`)) return;
+    socket.to(`room:${d.roomId}`).emit('room_raise', { roomId:d.roomId, userId });
   });
 
-  // WebRTC pass-through
-  socket.on('rtc_offer',  d => socket.to(d.to).emit('rtc_offer',  {...d, from:socket.id}));
-  socket.on('rtc_answer', d => socket.to(d.to).emit('rtc_answer', {...d, from:socket.id}));
-  socket.on('rtc_ice',    d => socket.to(d.to).emit('rtc_ice',    {...d, from:socket.id}));
+  async function callPeerIsAuthorized(data) {
+    if (!data || typeof data.toUserId !== 'string' || data.toUserId.length > 128) return false;
+    if (!data.dmId || typeof data.dmId !== 'string' || data.dmId.length > 128) return false;
+    if (data.toUserId === userId) return false;
+    const dm = await store.get(
+      'SELECT 1 FROM dms WHERE id=$1 AND ((user_a=$2 AND user_b=$3) OR (user_a=$3 AND user_b=$2))',
+      data.dmId,
+      userId,
+      data.toUserId,
+    ).catch(() => null);
+    return Boolean(dm);
+  }
 
-  // Screen share
-  socket.on('screen_share_start',    d => socket.to(d.to||d.channelId).emit('screen_share_start',    {...d, from:socket.id}));
-  socket.on('screen_share_stop',     d => socket.to(d.to||d.channelId).emit('screen_share_stop',     {...d, from:socket.id}));
-  socket.on('screen_control_request',d => socket.to(d.to).emit('screen_control_request', {...d, from:socket.id}));
-  socket.on('screen_control_granted',d => socket.to(d.to).emit('screen_control_granted', {...d, from:socket.id}));
+  // Route WebRTC signaling through authenticated user rooms. User IDs work across
+  // instances; raw socket IDs are local to one server and are not trusted targets.
+  const relayToUser = async (event, data) => {
+    if (!(await callPeerIsAuthorized(data))) return;
+    socket.to(`user:${data.toUserId}`).emit(event, { ...data, from:userId });
+  };
+  socket.on('rtc_offer',  d => relayToUser('rtc_offer', d));
+  socket.on('rtc_answer', d => relayToUser('rtc_answer', d));
+  socket.on('rtc_ice',    d => relayToUser('rtc_ice', d));
 
-  // Personal/group calls
-  socket.on('call_invite',  d => socket.to(`user:${d.to}`).emit('call_invite',  {...d, from:socket.id}));
-  socket.on('call_accept',  d => socket.to(d.to).emit('call_accept',  {...d, from:socket.id}));
-  socket.on('call_decline', d => socket.to(d.to).emit('call_decline', {...d, from:socket.id}));
-  socket.on('call_end',     d => socket.to(d.to).emit('call_end',     {...d, from:socket.id}));
+  // Screen share is restricted to an authenticated voice room membership.
+  const relayScreenShare = (event, data) => {
+    const channelId = data?.channelId;
+    if (typeof channelId !== 'string' || channelId.length > 128 || !socket.rooms.has(`voice:${channelId}`)) return;
+    socket.to(`voice:${channelId}`).emit(event, { ...data, from:userId });
+  };
+  socket.on('screen_share_start', d => relayScreenShare('screen_share_start', d));
+  socket.on('screen_share_stop', d => relayScreenShare('screen_share_stop', d));
+  socket.on('screen_control_request', d => relayToUser('screen_control_request', d));
+  socket.on('screen_control_granted', d => relayToUser('screen_control_granted', d));
+
+  // Personal calls require a DM relationship and are routed through the other
+  // participant's private room, including when that participant is on another instance.
+  socket.on('call_invite', async d => {
+    if (!(await callPeerIsAuthorized(d))) return;
+    socket.to(`user:${d.toUserId}`).emit('call_invite', { ...d, from:userId, fromUsername:socket.data.user.username });
+  });
+  socket.on('call_accept',  d => relayToUser('call_accept', d));
+  socket.on('call_decline', d => relayToUser('call_decline', d));
+  socket.on('call_end',     d => relayToUser('call_end', d));
+  // Presence heartbeat: the client asks for the current DB-backed snapshot so
+  // statuses converge even when individual `user_update` events were missed (or
+  // happened on another instance). The same snapshot is pushed on connect below.
+  socket.on('presence_heartbeat', () => sendPresence(socket));
+
+  socket.on('disconnect', () => {
+    store.run('DELETE FROM voice_sessions WHERE user_id=$1', userId).catch(() => {});
+  });
+
+  // Send the current presence right after connecting (and after every reconnect),
+  // so a client never has to wait for the next event or heartbeat to converge.
+  sendPresence(socket);
 });
 
 // ── FTD ARG ───────────────────────────────────────────────────────────────────

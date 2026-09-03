@@ -7,9 +7,10 @@ services:
     runtime: node
     plan: free
     region: oregon
+    # Set this to 2+ on a paid Render plan when horizontal scaling is enabled.
     numInstances: 1
     autoDeployTrigger: commit
-    buildCommand: npm install --no-audit --no-fund && npm run build
+    buildCommand: npm ci --no-audit --no-fund && npm run build
     startCommand: npm start
     healthCheckPath: /api/health
     envVars:

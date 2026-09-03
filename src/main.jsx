@@ -1,18 +1,48 @@
-import React, { useCallback, useEffect, useRef, useState, useMemo } from 'react';
+import React, { lazy, Suspense, useCallback, useEffect, useRef, useState, useMemo } from 'react';
 import { createRoot } from 'react-dom/client';
 import { io } from 'socket.io-client';
 import './styles.css';
-import Settings from './Settings.jsx';
-import Game from './Game.jsx';
+const Settings = lazy(() => import('./Settings.jsx'));
+const Game = lazy(() => import('./Game.jsx'));
 import { Logo, Mascot } from './Logo.jsx';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
-const getToken = () => sessionStorage.token || localStorage.rememberToken || '';
-const setToken = (t, remember) => { sessionStorage.token = t; if (remember) localStorage.rememberToken = t; };
-const clearToken = () => { delete sessionStorage.token; delete localStorage.rememberToken; };
-const api = (path, opts = {}) =>
-  fetch(path, { ...opts, headers: { 'Content-Type': 'application/json', ...(opts.headers || {}), Authorization: `Bearer ${getToken()}` } })
-    .then(r => r.json());
+function storageValue(storage, key) {
+  try { return storage.getItem(key) || ''; } catch { return ''; }
+}
+function setStorageValue(storage, key, value) {
+  try { storage.setItem(key, value); } catch {}
+}
+function removeStorageValue(storage, key) {
+  try { storage.removeItem(key); } catch {}
+}
+const getToken = () => storageValue(sessionStorage, 'token') || storageValue(localStorage, 'rememberToken');
+const setToken = (t, remember) => { setStorageValue(sessionStorage, 'token', t); if (remember) setStorageValue(localStorage, 'rememberToken', t); };
+const clearToken = () => { removeStorageValue(sessionStorage, 'token'); removeStorageValue(localStorage, 'rememberToken'); };
+function readLocalObject(key) {
+  try {
+    const value = JSON.parse(storageValue(localStorage, key) || '{}');
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  } catch {
+    return {};
+  }
+}
+const api = async (path, opts = {}) => {
+  const response = await fetch(path, {
+    ...opts,
+    headers: { 'Content-Type': 'application/json', ...(opts.headers || {}), Authorization: `Bearer ${getToken()}` },
+  });
+  let data;
+  try {
+    data = await response.json();
+  } catch {
+    data = {};
+  }
+  if (!data || typeof data !== 'object') data = {};
+  if (!response.ok && !data.error) data.error = `Request failed (${response.status})`;
+  data.status = response.status;
+  return data;
+};
 
 const NAME_COLORS = ['#f23f42','#f0b232','#23a559','#00a8fc','#5865f2','#eb459e','#57f287','#e67e22'];
 function nameColor(name) { let h = 0; for (let i = 0; i < (name||'').length; i++) h = (name.charCodeAt(i) + h * 31) % NAME_COLORS.length; return NAME_COLORS[h]; }
@@ -296,7 +326,7 @@ function PiiWarning({ warning, onSend, onRewrite }) {
 }
 
 // ── Call Modal ────────────────────────────────────────────────────────────────
-function CallModal({ socket, me, targetUser, dmId, incoming, onClose }) {
+function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClose }) {
   const [status, setStatus] = useState(incoming ? 'incoming' : 'calling');
   const [muted, setMuted]   = useState(false);
   const localRef  = useRef(null);
@@ -305,18 +335,21 @@ function CallModal({ socket, me, targetUser, dmId, incoming, onClose }) {
   const pcRef     = useRef(null);
 
   useEffect(() => {
+    const isThisCall = d => !d?.dmId || d.dmId === dmId;
     const onAccept  = async d => {
+      if (!isThisCall(d) || (d.from && d.from !== targetUser?.id)) return;
       setStatus('connected');
       if (pcRef.current && d.sdp) await pcRef.current.setRemoteDescription(new RTCSessionDescription(d.sdp)).catch(()=>{});
     };
-    const onDecline = () => { setStatus('declined'); setTimeout(onClose, 1500); };
-    const onEnd     = () => { cleanup(); onClose(); };
+    const onDecline = d => { if (!isThisCall(d)) return; setStatus('declined'); setTimeout(onClose, 1500); };
+    const onEnd     = d => { if (!isThisCall(d)) return; cleanup(); onClose(); };
     const onOffer   = async d => {
+      if (!isThisCall(d) || (d.from && d.from !== targetUser?.id)) return;
       setStatus('connecting');
       await startCall(false, d);
     };
-    const onAnswer  = async d => { if (pcRef.current) await pcRef.current.setRemoteDescription(new RTCSessionDescription(d.sdp)).catch(()=>{}); };
-    const onIce     = d => { if (pcRef.current && d.candidate) pcRef.current.addIceCandidate(new RTCIceCandidate(d.candidate)).catch(()=>{}); };
+    const onAnswer  = async d => { if (isThisCall(d) && pcRef.current) await pcRef.current.setRemoteDescription(new RTCSessionDescription(d.sdp)).catch(()=>{}); };
+    const onIce     = d => { if (isThisCall(d) && pcRef.current && d.candidate) pcRef.current.addIceCandidate(new RTCIceCandidate(d.candidate)).catch(()=>{}); };
 
     socket.on('call_accept',  onAccept);
     socket.on('call_decline', onDecline);
@@ -349,36 +382,37 @@ function CallModal({ socket, me, targetUser, dmId, incoming, onClose }) {
       stream.getTracks().forEach(t => pc.addTrack(t, stream));
 
       pc.ontrack = e => { if (remoteRef.current) remoteRef.current.srcObject = e.streams[0]; };
-      pc.onicecandidate = e => { if (e.candidate) socket.emit('rtc_ice', { to: targetUser?.socketId, candidate: e.candidate }); };
+      pc.onicecandidate = e => {
+        if (e.candidate) socket.emit('rtc_ice', { toUserId: targetUser?.id, dmId, candidate: e.candidate });
+      };
 
       if (isInitiator) {
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
-        socket.emit('call_invite', { to: targetUser?.id, dmId, sdp: offer });
+        socket.emit('call_invite', { toUserId: targetUser?.id, dmId, sdp: offer });
         setStatus('calling');
       } else if (offerData) {
         await pc.setRemoteDescription(new RTCSessionDescription(offerData.sdp));
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
-        socket.emit('call_accept', { to: offerData.from, sdp: answer });
+        socket.emit('call_accept', { toUserId: targetUser?.id, dmId, sdp: answer });
         setStatus('connected');
       }
     } catch { setStatus('error'); }
   }
 
   function accept() {
-    socket.emit('call_accept', { to: targetUser?.id });
-    startCall(false);
+    startCall(false, initialOffer);
     setStatus('connecting');
   }
 
   function decline() {
-    socket.emit('call_decline', { to: targetUser?.id });
+    socket.emit('call_decline', { toUserId: targetUser?.id, dmId });
     onClose();
   }
 
   function endCall() {
-    socket.emit('call_end', { to: targetUser?.id });
+    socket.emit('call_end', { toUserId: targetUser?.id, dmId });
     cleanup();
     onClose();
   }
@@ -634,7 +668,7 @@ function ArgModal({ onClose, notify }) {
   );
 }
 
-function Auth({ onAuth }) {
+function Auth({ onAuth, initialError = '' }) {
   useEffect(() => {
     if (!('Notification' in window) || Notification.permission !== 'default') return;
     const timer = setTimeout(() => Notification.requestPermission().catch(() => {}), 1200);
@@ -643,16 +677,35 @@ function Auth({ onAuth }) {
   const [mode, setMode]   = useState('login');
   const [form, setForm]   = useState({ username:'', password:'' });
   const [remember, setRemember] = useState(false);
-  const [err, setErr]     = useState('');
+  const [err, setErr]     = useState(initialError);
   const [loading, setLoading] = useState(false);
 
   async function submit(e) {
     e.preventDefault();
+    const username = form.username.trim();
+    if (!username) {
+      setErr('Enter a username to continue.');
+      return;
+    }
+    if (mode === 'register' && form.password.length < 6) {
+      setErr('Choose a password with at least 6 characters.');
+      return;
+    }
     setLoading(true); setErr('');
-    const d = await api(`/api/${mode}`, { method:'POST', body:JSON.stringify(form), headers:{ Authorization:'' } });
-    setLoading(false);
-    if (d.error) setErr(d.error);
-    else { setToken(d.token, remember); onAuth(d.user); }
+    try {
+      const d = await api(`/api/${mode}`, { method:'POST', body:JSON.stringify({ ...form, username }), headers:{ Authorization:'' } });
+      if (d.error) {
+        setErr([502, 503, 504].includes(d.status)
+          ? 'The chat server is temporarily unavailable. Check that the server is running, then try again.'
+          : d.error);
+      }
+      else if (!d.token || !d.user) setErr('The server returned an incomplete login response. Check the server logs.');
+      else { setToken(d.token, remember); onAuth(d.user); }
+    } catch (error) {
+      setErr(`Unable to reach the server: ${error.message || 'network error'}`);
+    } finally {
+      setLoading(false);
+    }
   }
 
   return (
@@ -661,6 +714,14 @@ function Auth({ onAuth }) {
         <Logo size={64} animate />
         <h1 className="hero-title">Unknown</h1>
         <p className="hero-sub">A privacy-focused place to talk, play, study, and connect — without revealing your real identity.</p>
+        <div className="first-run-guide" aria-label="Getting started">
+          <div className="first-run-heading"><span>Start here</span><small>three quick steps</small></div>
+          <ol>
+            <li><b>Choose a handle</b><span>Use a name that does not identify you.</span></li>
+            <li><b>Find your space</b><span>Join a server or make one for your group.</span></li>
+            <li><b>Say hello</b><span>Pick a channel and send your first message.</span></li>
+          </ol>
+        </div>
         <div className="privacy-card">
           <b>⚠ Personal info warning</b>
           <span>Do not share addresses, real names, phone numbers, emails, passwords, or financial info.</span>
@@ -669,13 +730,19 @@ function Auth({ onAuth }) {
       </section>
       <form onSubmit={submit} className="panel auth-form">
         <div className="auth-logo"><Logo size={40} /></div>
-        <h2>{mode === 'login' ? 'Welcome back' : 'Create an account'}</h2>
-        <input aria-label="Username" placeholder="Username" value={form.username} onChange={e => setForm({...form,username:e.target.value})} autoComplete="username" />
-        <input aria-label="Password" placeholder="Password" type="password" value={form.password} onChange={e => setForm({...form,password:e.target.value})} autoComplete="current-password" />
-        {err && <p className="error">{err}</p>}
+        <div className="auth-form-heading">
+          <div>
+            <h2>{mode === 'login' ? 'Welcome back' : 'Create an account'}</h2>
+            <p>{mode === 'login' ? 'Pick up where you left off.' : 'Use a handle that keeps your real identity private.'}</p>
+          </div>
+          <span className="auth-step" aria-label={mode === 'login' ? 'Sign in' : 'Registration'}>{mode === 'login' ? '1 / 1' : '1 / 1'}</span>
+        </div>
+        <label className="auth-field">Username<input aria-label="Username" placeholder="Choose a handle" value={form.username} onChange={e => setForm({...form,username:e.target.value})} autoComplete="username" required /></label>
+        <label className="auth-field">Password<input aria-label="Password" placeholder="Your password" type="password" value={form.password} onChange={e => setForm({...form,password:e.target.value})} autoComplete={mode === 'login' ? 'current-password' : 'new-password'} required /></label>
+        {err && <p className="error" role="alert" aria-live="polite">{err}</p>}
         <label className="remember"><input type="checkbox" checked={remember} onChange={e => setRemember(e.target.checked)} /> Keep me signed in</label>
-        <button disabled={loading}>{loading ? 'Loading…' : mode === 'login' ? 'Log in' : 'Register'}</button>
-        <button type="button" className="ghost" onClick={() => { setMode(mode==='login'?'register':'login'); setErr(''); }}>
+        <button disabled={loading} aria-busy={loading}>{loading ? <><span className="button-spinner" aria-hidden="true" /> {mode === 'login' ? 'Checking…' : 'Creating…'}</> : mode === 'login' ? 'Log in' : 'Register'}</button>
+        <button type="button" className="ghost auth-switch" onClick={() => { setMode(mode==='login'?'register':'login'); setForm({ username: form.username, password: '' }); setErr(''); }}>
           {mode === 'login' ? 'Need an account? Register' : 'Have an account? Log in'}
         </button>
       </form>
@@ -4910,6 +4977,7 @@ function App() {
   const [checking, setChecking] = useState(Boolean(getToken()));
   const [me, setMe]   = useState(null);
   const [boot, setBoot] = useState(null);
+  const [bootError, setBootError] = useState('');
   const [view, setView] = useState('server'); // server|dm|friends|discover|group
   const [communityId, setCommunityId] = useState(null);
   const [cosmeticEffects, setCosmeticEffects] = useState([]);
@@ -4939,7 +5007,7 @@ function App() {
   const [globalEvent, setGlobalEvent] = useState(null);
   const [announcement, setAnnouncement] = useState(null);
   const [challenge, setChallenge] = useState(null);
-  const [challengeGone, setChallengeGone] = useState(() => JSON.parse(localStorage.challengeGone||'{}'));
+  const [challengeGone, setChallengeGone] = useState(() => readLocalObject('challengeGone'));
   const [showRewards, setShowRewards] = useState(false);
   const [showBookmarks, setShowBookmarks] = useState(false);
   const [jumpToMessageId, setJumpToMessageId] = useState(null);
@@ -4949,11 +5017,11 @@ function App() {
   const [ftdGlitch, setFtdGlitch] = useState(false);
   const [showArg, setShowArg] = useState(false);
   const [screenshotWarn, setScreenshotWarn] = useState(false);
-  const [dismissed, setDismissed] = useState(() => JSON.parse(localStorage.screenshotDismissed||'{}'));
+  const [dismissed, setDismissed] = useState(() => readLocalObject('screenshotDismissed'));
   const [newGroupModal, setNewGroupModal] = useState(false);
   const [createGroupName, setCreateGroupName] = useState('');
   const [createGroupMembers, setCreateGroupMembers] = useState([]);
-  const socket = useMemo(() => io(), []);
+  const socket = useMemo(() => io({ autoConnect: false, transports: ['websocket'] }), []);
 
   useEffect(() => { applyTheme(theme); localStorage.theme = theme; }, [theme]);
 
@@ -4972,25 +5040,37 @@ function App() {
   useEffect(() => {
     if (!getToken()) { setChecking(false); return; }
     api('/api/bootstrap').then(d => {
-      if (d.error) { clearToken(); setChecking(false); return; }
+      if (d.error) {
+        if (d.status === 401 || d.status === 403) clearToken();
+        setBootError(d.error);
+        setChecking(false);
+        return;
+      }
       setMe(d.me);
       setBoot(d);
-      const firstComm = d.communities?.[0];
+      // Only auto-open a community the user actually belongs to; otherwise land on
+      // the guided start state (Discover / create / friends) instead of a denied server.
+      const joinedIds = new Set((d.memberships || []).map(m => m.community_id));
+      const firstComm = (d.communities || []).find(c => joinedIds.has(c.id)) || null;
       if (firstComm) {
         setCommunityId(firstComm.id);
         const firstCh = d.channels?.find(c => c.community_id===firstComm.id && c.type!=='voice');
         if (firstCh) setChannelId(firstCh.id);
+      } else {
+        setCommunityId(null);
+        setChannelId(null);
       }
       if (d.events?.length) setGlobalEvent(d.events[0]);
       setChallenge(d.challenge || null);
+      setBootError('');
       api('/api/announcement').then(r => { if (r && !r.error) setAnnouncement(r.announcement || null); }).catch(()=>{});
       api('/api/challenges').then(r => { if (r && !r.error && r.challenge) setChallenge(r.challenge); }).catch(()=>{});
       refreshBookmarks();
       setChecking(false);
-      socket.emit('join_user', d.me.id);
-      d.dms?.forEach(dm => socket.emit('join_dm', dm.id));
-      d.groups?.forEach(g => socket.emit('join_group', g.id));
-    }).catch(() => { clearToken(); setChecking(false); });
+    }).catch(error => {
+      setBootError(`Unable to load your account: ${error.message || 'network error'}`);
+      setChecking(false);
+    });
   }, []);
 
   // FTD easter egg: 0.0001% chance the feed rots after login. One shot per session.
@@ -5010,41 +5090,97 @@ function App() {
       if (getToken()) api('/api/bootstrap').then(d => { if (!d.error) setBoot(b => ({...b, ...d})); }).catch(()=>{});
     }, 30000);
     return () => clearInterval(t);
-  }, []);
-
-  useEffect(() => {
+  }, []);  useEffect(() => {
     if (!socket || !me) return;
-    socket.on('user_update', u => { setBoot(b=>b?{...b,users:b.users.map(x=>x.id===u.id?{...x,...u}:x)}:b); if(u.id===me.id) setMe(m=>({...m,...u})); });
-    socket.on('new_dm',      dm => { setBoot(b=>b?{...b,dms:[...(b.dms||[]),dm]}:b); socket.emit('join_dm',dm.id); });
-    socket.on('new_group',   g  => { setBoot(b=>b?{...b,groups:[...(b.groups||[]),g]}:b); socket.emit('join_group',g.id); });
-    socket.on('dm_notification', ({dmId:id}) => setUnread(u=>({...u,[`dm:${id}`]:(u[`dm:${id}`]||0)+1})));
-    socket.on('channel_activity', ({channelId:cid}) => { if(cid!==channelId) setUnread(u=>({...u,[cid]:(u[cid]||0)+1})); });
-    socket.on('notification', ({type,message,reminder}) => {
-      if(type==='ping'&&message?.channel_id) setPings(p=>({...p,[message.channel_id]:(p[message.channel_id]||0)+1}));
-      if(type==='reminder') { setReminderPings(c=>c+1); notify(`⏰ ${reminder?.preview||'Reminder!'}`,'ok'); }
-    });
-    socket.on('global_event', ev  => setGlobalEvent(ev));
-    socket.on('global_event_end', ({id}) => setGlobalEvent(ge=>ge?.id===id?null:ge));
-    socket.on('global_announcement', a => setAnnouncement(a));
-    socket.on('challenge_roll', ch => {
-      if (ch) {
-        notify(`🎯 New daily challenge: ${ch.title} — ${ch.desc} (+${ch.reward}✦)`,'ok');
-        setChallenge(ch);
-        setChallengeGone(g => { const n={...g}; delete n[ch.id]; localStorage.challengeGone = JSON.stringify(n); return n; });
-      }
-    });
-    socket.on('call_invite',  d   => setIncomingCall(d));
-    socket.on('community_locked', () => setBoot(b => b ? {...b} : b));
-    return () => {
-      socket.off('user_update'); socket.off('new_dm'); socket.off('new_group');
-      socket.off('dm_notification'); socket.off('channel_activity'); socket.off('notification');
-      socket.off('global_event'); socket.off('global_event_end'); socket.off('global_announcement');
-      socket.off('challenge_roll'); socket.off('call_invite'); socket.off('community_locked');
+    socket.auth = { token: getToken() };
+    const joinRooms = () => {
+      socket.emit('join_user', me.id);
+      (boot?.dms || []).forEach(dm => socket.emit('join_dm', dm.id));
+      (boot?.groups || []).forEach(g => socket.emit('join_group', g.id));
     };
-  }, [socket, me, channelId]);
+    const onSocketError = error => notify(`Live updates unavailable: ${error.message || 'connection failed'}`, 'err');
+    const onUserUpdate = u => {
+      setBoot(b => b ? { ...b, users: b.users.map(x => x.id === u.id ? { ...x, ...u } : x) } : b);
+      if (u.id === me.id) setMe(m => ({ ...m, ...u }));
+    };
+    const onNewDm = dm => { setBoot(b => b ? { ...b, dms: [...(b.dms || []), dm] } : b); socket.emit('join_dm', dm.id); };
+    const onNewGroup = g => { setBoot(b => b ? { ...b, groups: [...(b.groups || []), g] } : b); socket.emit('join_group', g.id); };
+    const onDmNotification = ({dmId:id}) => setUnread(u => ({...u, [`dm:${id}`]:(u[`dm:${id}`]||0)+1}));
+    const onChannelActivity = ({channelId:cid}) => { if (cid !== channelId) setUnread(u => ({...u, [cid]:(u[cid]||0)+1})); };
+    const onLiveNotification = ({type,message,reminder}) => {
+      if (type === 'ping' && message?.channel_id) setPings(p => ({...p, [message.channel_id]:(p[message.channel_id]||0)+1}));
+      if (type === 'reminder') { setReminderPings(c => c + 1); notify(`⏰ ${reminder?.preview||'Reminder!'}`, 'ok'); }
+    };
+    const onGlobalEvent = ev => setGlobalEvent(ev);
+    const onGlobalEventEnd = ({id}) => setGlobalEvent(ge => ge?.id === id ? null : ge);
+    const onGlobalAnnouncement = a => setAnnouncement(a);
+    const onChallengeRoll = ch => {
+      if (!ch) return;
+      notify(`🎯 New daily challenge: ${ch.title} — ${ch.desc} (+${ch.reward}✦)`, 'ok');
+      setChallenge(ch);
+      setChallengeGone(g => { const n = {...g}; delete n[ch.id]; localStorage.challengeGone = JSON.stringify(n); return n; });
+    };
+    const onCallInvite = d => setIncomingCall(d);
+    const onCommunityLocked = () => setBoot(b => b ? {...b} : b);
+    // Presence snapshot from the server (pushed on connect/reconnect and after
+    // each heartbeat). DB-backed, so it converges statuses even when a
+    // user_update event was missed or fired on another app instance.
+    const onPresenceSync = list => {
+      if (!Array.isArray(list)) return;
+      const byId = new Map(list.map(u => [u.id, u]));
+      setBoot(b => {
+        if (!b) return b;
+        let changed = false;
+        const users = (b.users || []).map(u => {
+          const p = byId.get(u.id);
+          if (!p || (u.status || '') === (p.status || '') && (u.custom_status || '') === (p.custom_status || '')) return u;
+          changed = true;
+          return { ...u, status: p.status, custom_status: p.custom_status };
+        });
+        return changed ? { ...b, users } : b;
+      });
+      const self = me && byId.get(me.id);
+      if (self) setMe(m => (m.status || '') === (self.status || '') && (m.custom_status || '') === (self.custom_status || '') ? m : { ...m, status: self.status, custom_status: self.custom_status });
+    };
+    socket.on('connect', joinRooms);
+    socket.on('connect_error', onSocketError);
+    if (!socket.connected) socket.connect();
+    else joinRooms();
+    socket.on('user_update', onUserUpdate);
+    socket.on('new_dm', onNewDm);
+    socket.on('new_group', onNewGroup);
+    socket.on('dm_notification', onDmNotification);
+    socket.on('channel_activity', onChannelActivity);
+    socket.on('notification', onLiveNotification);
+    socket.on('global_event', onGlobalEvent);
+    socket.on('global_event_end', onGlobalEventEnd);
+    socket.on('global_announcement', onGlobalAnnouncement);
+    socket.on('challenge_roll', onChallengeRoll);
+    socket.on('call_invite', onCallInvite);
+    socket.on('community_locked', onCommunityLocked);
+    socket.on('presence_sync', onPresenceSync);
+    // Presence heartbeat: periodically pull the DB-backed snapshot so statuses
+    // apply even if a user_update event was missed or happened on another
+    // instance. The server also pushes a snapshot on every (re)connect.
+    const heartbeat = setInterval(() => { if (socket.connected) socket.emit('presence_heartbeat'); }, 30000);
+    return () => {
+      clearInterval(heartbeat);
+      socket.off('connect', joinRooms); socket.off('connect_error', onSocketError);
+      socket.off('user_update', onUserUpdate); socket.off('new_dm', onNewDm); socket.off('new_group', onNewGroup);
+      socket.off('dm_notification', onDmNotification); socket.off('channel_activity', onChannelActivity); socket.off('notification', onLiveNotification);
+      socket.off('global_event', onGlobalEvent); socket.off('global_event_end', onGlobalEventEnd); socket.off('global_announcement', onGlobalAnnouncement);
+      socket.off('challenge_roll', onChallengeRoll); socket.off('call_invite', onCallInvite); socket.off('community_locked', onCommunityLocked);
+      socket.off('presence_sync', onPresenceSync);
+    };
+  }, [socket, me, channelId, boot?.dms, boot?.groups]);
 
   function notify(msg, type='warn') { setNotice(msg); setNoticeType(type); setTimeout(()=>setNotice(''),4000); }
-  function logout() { clearToken(); socket.disconnect(); location.reload(); }
+  async function logout() {
+    await api('/api/logout', { method:'POST' }).catch(() => {});
+    clearToken();
+    socket.disconnect();
+    location.reload();
+  }
 
   // One-click quick-swap: cycles through the current server's starred masks (or global, or back to real).
   async function quickSwapMask() {
@@ -5088,11 +5224,18 @@ function App() {
   }
 
   function chooseCommunity(id) {
+    const isMember = (boot?.memberships || []).some(m => m.community_id === id);
+    if (!isMember && !me?.is_admin) {
+      notify('Join this community from Discover first','warn');
+      setView('discover');
+      setShowMobileChannels(false);
+      return;
+    }
     setCommunityId(id); setActiveRoomId(null); setShowMobileChannels(false);
     const firstCh = boot?.channels?.find(c=>c.community_id===id&&c.type!=='voice');
     if (firstCh) chooseChannel(firstCh.id); else setChannelId(null);
     setView('server');
-    // Admin gets access to all servers
+    // Platform admins may open any server for moderation.
   }
 
   // Load temporary rooms for the current community
@@ -5198,6 +5341,10 @@ function App() {
     }
   }
 
+  // Subscribed before any early return so the hook order never changes across auth states.
+  const { items: bookmarkItems } = useBookmarks();
+  const bmCount = bookmarkItems.length;
+
   if (checking) return (
     <main className="auth splash">
       <div className="splash-inner">
@@ -5207,7 +5354,7 @@ function App() {
       </div>
     </main>
   );
-  if (!me) return <Auth onAuth={() => location.reload()} />;
+  if (!me) return <Auth initialError={bootError} onAuth={() => location.reload()} />;
 
   const comm        = boot?.communities?.find(c=>c.id===communityId);
   const activeCh    = boot?.channels?.find(c=>c.id===channelId);
@@ -5218,8 +5365,6 @@ function App() {
   const currentServer = view === 'server' ? boot?.communities?.find(c => c.id === communityId) : null;
   const currentServerPinnedMask = currentServer?.pinned_mask ? ((boot?.masks || []).find(m => m.name === currentServer.pinned_mask) || { name: currentServer.pinned_mask }) : null;
   const swapHint = nextSwapLabel(me, view === 'server' ? serverFavMasks(me, communityId) : null, currentServerPinnedMask);
-  const { items: bookmarkItems } = useBookmarks();
-  const bmCount = bookmarkItems.length;
 
   return (
     <div className={`app device-${device.formFactor} orientation-${device.orientation}${device.compact ? ' compact-ui' : ''} input-${device.input}`} data-device={JSON.stringify(device)}>
@@ -5274,8 +5419,8 @@ function App() {
 
       {/* Incoming call */}
       {incomingCall && !activeCall && (
-        <CallModal socket={socket} me={me} targetUser={{id:incomingCall.from}} dmId={incomingCall.dmId}
-          incoming onClose={()=>setIncomingCall(null)} />
+        <CallModal socket={socket} me={me} targetUser={{id:incomingCall.from, username:incomingCall.fromUsername}} dmId={incomingCall.dmId}
+          incoming initialOffer={incomingCall} onClose={()=>setIncomingCall(null)} />
       )}
 
       {/* Active call */}
@@ -5285,7 +5430,11 @@ function App() {
       )}
 
       {/* Settings */}
-      {showSettings && <Settings me={me} boot={boot} onClose={()=>setShowSettings(false)} onSave={u=>setMe(m=>({...m,...u}))} onOpenDataRequests={()=>{setShowSettings(false);setDataReq({open:true,mode:'review',target:null});}} currentTheme={theme} onThemeChange={t=>{setTheme(t);applyTheme(t);}} />}
+      {showSettings && (
+        <Suspense fallback={<div className="lazy-loading" role="status"><span className="spinner sm" /> Loading settings…</div>}>
+          <Settings me={me} boot={boot} onClose={()=>setShowSettings(false)} onSave={u=>setMe(m=>({...m,...u}))} onOpenDataRequests={()=>{setShowSettings(false);setDataReq({open:true,mode:'review',target:null});}} currentTheme={theme} onThemeChange={t=>{setTheme(t);applyTheme(t);}} />
+        </Suspense>
+      )}
 
       {/* Rewards / Credits modal */}
       {showRewards && <RewardsModal me={me} onClose={()=>setShowRewards(false)} notify={notify}
@@ -5308,16 +5457,20 @@ function App() {
         onCreated={r=>{ setRooms(x=>[...x.filter(y=>y.id!==r.id), r]); setActiveRoomId(r.id); }} />}
 
       {/* Game */}
-      {showGame && <Game onClose={()=>{setShowGame(false); setGamePick(null);}} me={me}
-        shareTarget={view==='server'&&channelId?{channelId}:view==='dm'&&dmId?{dmId}:view==='group'&&groupId?{groupId}:null}
-        initial={gamePick}
-        onLog={(game,result)=>api('/api/games/log',{method:'POST',body:JSON.stringify({game,result})}).catch(()=>{})}
-        onShare={async text => {
-          if (view==='server' && channelId) return api(`/api/channels/${channelId}/messages`,{method:'POST',body:JSON.stringify({body:text})});
-          if (view==='dm' && dmId) return api(`/api/dms/${dmId}/messages`,{method:'POST',body:JSON.stringify({body:text})});
-          if (view==='group' && groupId) return api(`/api/groups/${groupId}/messages`,{method:'POST',body:JSON.stringify({body:text})});
-          return {error:'no chat'};
-        }} /> }
+      {showGame && (
+        <Suspense fallback={<div className="lazy-loading" role="status"><span className="spinner sm" /> Loading games…</div>}>
+          <Game onClose={()=>{setShowGame(false); setGamePick(null);}} me={me}
+            shareTarget={view==='server'&&channelId?{channelId}:view==='dm'&&dmId?{dmId}:view==='group'&&groupId?{groupId}:null}
+            initial={gamePick}
+            onLog={(game,result)=>api('/api/games/log',{method:'POST',body:JSON.stringify({game,result})}).catch(()=>{})}
+            onShare={async text => {
+              if (view==='server' && channelId) return api(`/api/channels/${channelId}/messages`,{method:'POST',body:JSON.stringify({body:text})});
+              if (view==='dm' && dmId) return api(`/api/dms/${dmId}/messages`,{method:'POST',body:JSON.stringify({body:text})});
+              if (view==='group' && groupId) return api(`/api/groups/${groupId}/messages`,{method:'POST',body:JSON.stringify({body:text})});
+              return {error:'no chat'};
+            }} />
+        </Suspense>
+      )}
 
       {/* New group modal */}
       {newGroupModal && (
@@ -5415,8 +5568,21 @@ function App() {
         ) : view==='discover' ? (
           <DiscoveryView me={me} boot={boot} notify={notify} currentChannelId={channelId} onBootRefresh={()=>api('/api/bootstrap').then(d=>{if(!d.error)setBoot(d);})} onJoin={async c => {
             const d = await api('/api/communities/join',{method:'POST',body:JSON.stringify({inviteCode:c.invite_code})});
-            if (d.communityId) { api('/api/bootstrap').then(b=>{if(!b.error)setBoot(b);}); chooseCommunity(d.communityId); setView('server'); }
-            else notify(d.error,'err');
+            if (!d.communityId) return notify(d.error||'Could not join that community','err');
+            const b = await api('/api/bootstrap');
+            if (b && !b.error) setBoot(b);
+            // Navigate straight into the joined server using the fresh membership list.
+            const joined = b && !b.error ? b : boot;
+            const freshMember = (joined.memberships||[]).some(m => m.community_id === d.communityId);
+            if (freshMember || me?.is_admin) {
+              setCommunityId(d.communityId); setActiveRoomId(null); setShowMobileChannels(false); setView('server');
+              const firstCh = (joined.channels||[]).find(c=>c.community_id===d.communityId&&c.type!=='voice');
+              if (firstCh) { setChannelId(firstCh.id); setUnread(u=>{const n={...u};delete n[firstCh.id];return n;}); setPings(p=>{const n={...p};delete n[firstCh.id];return n;}); }
+              else setChannelId(null);
+            } else {
+              notify('Joined — reopen the server from your rail','ok');
+              setView('server');
+            }
           }} />
         ) : view==='friends' ? (
           <FriendsView me={me} boot={boot} onBootRefresh={()=>api('/api/bootstrap').then(d=>{if(!d.error)setBoot(d);})} onOpenDm={openDm} onViewProfile={setViewingProfile} notify={notify} />
@@ -5435,8 +5601,14 @@ function App() {
         ) : (
           <div className="empty-state">
             <Mascot size={90} mood="thinking" />
-            <h2>Welcome to Unknown</h2>
-            <p>Pick a channel, DM, or discover a server to start.</p>
+            <span className="empty-kicker">Your workspace is ready</span>
+            <h2>Choose where to begin</h2>
+            <p>Join a community, create your own, or open your friends list.</p>
+            <div className="empty-actions">
+              <button className="empty-primary" onClick={() => setView('discover')}>🌐 Discover servers</button>
+              <button onClick={() => { setCommunityId(null); setView('create-server'); }}>＋ Create a server</button>
+              <button className="ghost" onClick={() => setView('friends')}>👥 Open friends</button>
+            </div>
           </div>
         )}
 
@@ -5971,6 +6143,7 @@ class ErrorBoundary extends React.Component {
       <main className="auth"><section className="panel auth-form">
         <Mascot size={80} mood="thinking" />
         <h2>Something went wrong</h2>
+        <p className="error">{this.state.error?.message || 'The page could not be loaded.'}</p>
         <button onClick={()=>{ clearToken(); location.reload(); }}>Reset and log in</button>
       </section></main>
     );

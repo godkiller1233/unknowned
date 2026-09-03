@@ -26,7 +26,7 @@ Open the Vite URL for the client. The API listens on port `3000` by default.
 
 ## Local network / registered server data modes
 
-Unknown stores data in a real database. Locally it uses SQLite. On Render, the Blueprint provisions a free Render Postgres database and passes it to the app as `DATABASE_URL`. Choose the visibility/data mode with `DATA_MODE`:
+Unknown stores data in a real database. Locally it uses SQLite. On Render, the Blueprint uses an existing PostgreSQL database supplied as the private `DATABASE_URL` environment variable; it does not provision a database. Choose the visibility/data mode with `DATA_MODE`:
 
 - `DATA_MODE=registered` stores data for a hosted registered server. With `DATABASE_URL`, this uses Postgres; without it, SQLite defaults to `data/unknown.sqlite` unless `DB_PATH` is set.
 - `DATA_MODE=local` stores data in a local SQLite file at `data/unknown-local.sqlite` unless you set `DATABASE_URL`, intended for LAN/private-server use where users only see data on that local network or registered private server.
@@ -42,7 +42,11 @@ Share `http://YOUR-LAN-IP:3000` with people on the same network.
 
 ## One-click Render Blueprint setup
 
-This repo includes a root-level `render.yaml` Blueprint that lets Render automatically create the Unknown web service and a free Render Postgres database. The Blueprint defines the Node runtime, build/start commands, production environment variables, generated JWT secret, generated official account password secret, managed database connection, health check, single-instance web scaling, and commit-based auto-deploys.
+This repo includes a root-level `render.yaml` Blueprint for the Unknown web service. It defines the Node runtime, build/start commands, production environment variables, a generated JWT secret, a generated official account password secret, a private existing-database variable, a PostgreSQL health check, and commit-based auto-deploys.
+
+For multiple web servers, deploy each instance with the same `DATABASE_URL` and the same `JWT_SECRET`. Accounts and application records are shared through PostgreSQL, and Socket.IO broadcasts are synchronized through PostgreSQL pub/sub. The client uses WebSocket-only transport, so sticky sessions are not required. Set `numInstances` to 2 or more only on a Render plan that supports horizontal scaling.
+
+Before the first deploy, open the Render service Environment settings and set `DATABASE_URL` to your existing PostgreSQL connection string. Never commit that URL or its password. If the URL or JWT secret differs between instances, logins and realtime connections will fail intermittently.
 
 To deploy it for free:
 
@@ -52,13 +56,13 @@ To deploy it for free:
 4. Click **Apply / Deploy Blueprint**.
 5. When the first deploy finishes, open the generated `onrender.com` URL.
 
-Important free-tier behavior: chat history and accounts are stored in the free Render Postgres database, which Render currently limits to 1 GB and expires after 30 days unless upgraded. Uploads still use `/tmp/unknown-uploads` on free Render because free web services do not include durable disks, so uploaded files can reset on restart. Render's free web services can also spin down after idle periods, so the next visitor might see a cold start.
+Important storage behavior: chat history and accounts are stored in PostgreSQL. Uploads still use `/tmp/unknown-uploads` on free Render because free web services do not include durable disks, so uploaded files can reset on restart. For multiple instances or durable media, use shared object storage (such as S3-compatible storage) or a persistent disk; local instance files are not shared between servers. Render's free web services can also spin down after idle periods, so the next visitor might see a cold start.
 
 For durable production data, upgrade the Render Postgres database before it expires. For durable uploads, upgrade the web service plan, add a persistent disk mounted at `/var/data`, and set `UPLOAD_DIR=/var/data/uploads`.
 
 ## Deploying to Render
 
-This repository includes `render.yaml` for free Render Blueprint deployment. Render runs `npm ci && npm run build`, starts `npm start`, creates a free Render Postgres database, injects its connection string as `DATABASE_URL`, sets `OFFICIAL_ACCOUNT_USERNAME=Unknown`, and generates `OFFICIAL_ACCOUNT_PASSWORD` as a secret. Set `DATA_MODE=local` if you are running a private registered server; keep `registered` for a public hosted server.
+This repository includes `render.yaml` for Render deployment. Render runs `npm ci && npm run build` and starts `npm start`. Set the existing database URL in the service environment as `DATABASE_URL`; the Blueprint does not create a database. It sets `OFFICIAL_ACCOUNT_USERNAME=Unknown` and generates `OFFICIAL_ACCOUNT_PASSWORD` and `JWT_SECRET` as secrets. Set `DATA_MODE=local` only for a private local deployment; keep `registered` for a public hosted server.
 
 ## Safety notice
 
