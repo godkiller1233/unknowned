@@ -4630,7 +4630,34 @@ io.on('connection', socket => {
     if (typeof data.groupId === 'string' && data.groupId.length <= 128 && socket.rooms.has(`group:${data.groupId}`)) socket.to(`group:${data.groupId}`).emit('typing', data);
   });
 
-  // Voice
+  // ── Voice: real WebRTC mesh (members hear/see each other). Presence events
+  // ride the same rooms; signaling (offer/answer/ice) is relayed point-to-point
+  // to a specific socket. Because Socket.IO runs on a shared PostgreSQL adapter,
+  // the `voice:` rooms and socket ids are global across app instances, so two
+  // users connected to different servers still negotiate a direct peer link.
+  function voicePeerPayload(u) {
+    if (!u) return null;
+    return {
+      userId:   u.id ?? u.userId,
+      username: u.username ?? '',
+      nickname: u.nickname ?? '',
+      avatar:   u.avatar ?? '',
+      badge:    u.badge ?? '',
+    };
+  }
+
+  // Live roster for a voice room: every connected socket (any instance) with the
+  // profile + socket id a new joiner needs to start the peer connections.
+  async function voiceRoomUsers(roomName, exceptSocketId) {
+    try {
+      const socks = await io.in(roomName).fetchSockets();
+      return socks
+        .filter(s => s.id !== exceptSocketId && s.data?.user)
+        .map(s => ({ ...voicePeerPayload(s.data.user), socketId: s.id }))
+        .filter(u => u.userId);
+    } catch { return []; }
+  }
+
   socket.on('voice_join', async data => {
     const channelId = data?.channelId;
     if (typeof channelId !== 'string' || channelId.length > 128) return;
@@ -4639,22 +4666,60 @@ io.on('connection', socket => {
       member = await store.get('SELECT 1 FROM room_members WHERE room_id=$1 AND user_id=$2 AND waiting=0', channelId, userId).catch(() => null);
     }
     if (!member && !socket.data.user.is_admin) return;
-    socket.join(`voice:${channelId}`);
+    const roomName = `voice:${channelId}`;
+    socket.join(roomName);
     try {
       await store.run('DELETE FROM voice_sessions WHERE channel_id=$1 AND user_id=$2', channelId, userId);
       await store.run('INSERT INTO voice_sessions VALUES (?,?,?,CURRENT_TIMESTAMP)', nanoid(), channelId, userId);
     } catch {}
-    socket.to(`voice:${channelId}`).emit('voice_user_joined',{channelId, userId, socketId:socket.id});
-    io.to(`voice:${channelId}`).emit('voice_state',{channelId, userId, joined:true});
+    const profile = voicePeerPayload(socket.data.user) || { userId };
+    // Existing members: a new socket joined (id + profile) so they can connect to it.
+    socket.to(roomName).emit('voice_user_joined', { channelId, ...profile, socketId: socket.id });
+    // The joiner: the full current roster (cross-instance via the shared adapter).
+    const users = await voiceRoomUsers(roomName, socket.id);
+    socket.emit('voice_roster', { channelId, users });
+    io.to(roomName).emit('voice_state', { channelId, userId, joined: true });
   });
 
   socket.on('voice_leave', async data => {
     const channelId = data?.channelId;
     if (typeof channelId !== 'string' || channelId.length > 128 || !socket.rooms.has(`voice:${channelId}`)) return;
-    socket.leave(`voice:${channelId}`);
+    const roomName = `voice:${channelId}`;
+    socket.leave(roomName);
     try { await store.run('DELETE FROM voice_sessions WHERE channel_id=$1 AND user_id=$2', channelId, userId); } catch {}
-    io.to(`voice:${channelId}`).emit('voice_state',{channelId, userId, joined:false});
+    socket.to(roomName).emit('voice_user_left', { channelId, userId, socketId: socket.id });
+    io.to(roomName).emit('voice_state', { channelId, userId, joined: false });
   });
+
+  // Camera on/off state for video rooms. Members just broadcast their own
+  // state; peers hide the frozen video and show a placeholder instead.
+  socket.on('voice_camera', data => {
+    const channelId = data?.channelId;
+    if (typeof channelId !== 'string' || channelId.length > 128 || !socket.rooms.has(`voice:${channelId}`)) return;
+    socket.to(`voice:${channelId}`).emit('voice_camera', { channelId, userId, on: data.on === true });
+  });
+
+  // Mesh signaling. The sender must currently be a member of that voice room;
+  // the target socket id comes from the roster this server handed out, so a
+  // client can only ever talk to sockets it was told are in the same room.
+  const relayVoiceSignal = (event, data) => {
+    const channelId = data?.channelId;
+    const toSocketId = data?.toSocketId;
+    if (typeof channelId !== 'string' || channelId.length > 128 || !socket.rooms.has(`voice:${channelId}`)) return;
+    if (typeof toSocketId !== 'string' || toSocketId.length > 64) return;
+    const payload = { channelId, fromUserId: userId, fromSocketId: socket.id };
+    if (event === 'voice_rtc_ice') {
+      if (!data.candidate || typeof data.candidate !== 'object') return;
+      payload.candidate = data.candidate;
+    } else {
+      if (!data.sdp || typeof data.sdp !== 'object') return;
+      payload.sdp = data.sdp;
+    }
+    io.to(toSocketId).emit(event, payload);
+  };
+  socket.on('voice_rtc_offer',  d => relayVoiceSignal('voice_rtc_offer', d));
+  socket.on('voice_rtc_answer', d => relayVoiceSignal('voice_rtc_answer', d));
+  socket.on('voice_rtc_ice',    d => relayVoiceSignal('voice_rtc_ice', d));
 
   // Temporary rooms
   socket.on('room_join', async d => {
@@ -4717,6 +4782,10 @@ io.on('connection', socket => {
   socket.on('rtc_offer',  d => relayToUser('rtc_offer', d));
   socket.on('rtc_answer', d => relayToUser('rtc_answer', d));
   socket.on('rtc_ice',    d => relayToUser('rtc_ice', d));
+  // Mic mute state for DM calls — the receiver shows a true “muted” chip instead
+  // of guessing from silence. Same DM-auth + user-room routing as the other
+  // call signals, so it works across app instances.
+  socket.on('call_mute',  d => relayToUser('call_mute', d));
 
   // Screen share is restricted to an authenticated voice room membership.
   const relayScreenShare = (event, data) => {
@@ -4743,6 +4812,18 @@ io.on('connection', socket => {
   // happened on another instance). The same snapshot is pushed on connect below.
   socket.on('presence_heartbeat', () => sendPresence(socket));
 
+  // "disconnecting" fires BEFORE socket.io cleans up socket.rooms (unlike
+  // "disconnect", where rooms are already empty) — so this is the only place
+  // we can still tell which voice rooms the socket was in and tell peers to
+  // tear down their peer connection instead of showing a ghost tile.
+  socket.on('disconnecting', () => {
+    for (const roomName of socket.rooms) {
+      if (!roomName.startsWith('voice:')) continue;
+      const channelId = roomName.slice('voice:'.length);
+      socket.to(roomName).emit('voice_user_left', { channelId, userId, socketId: socket.id });
+      io.to(roomName).emit('voice_state', { channelId, userId, joined: false });
+    }
+  });
   socket.on('disconnect', () => {
     store.run('DELETE FROM voice_sessions WHERE user_id=$1', userId).catch(() => {});
   });

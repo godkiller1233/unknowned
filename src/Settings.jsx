@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { loadMediaPrefs, saveMediaPrefs } from './mediaPrefs.js';
 
 const getToken = () => sessionStorage.token || localStorage.rememberToken || '';
 const api = (path, opts = {}) =>
@@ -59,6 +60,7 @@ export default function Settings({ me, boot, onClose, onSave, currentTheme, onTh
   const [profile, setProfile] = useState({ nickname: me?.nickname||'', bio: me?.bio||'', custom_status: me?.custom_status||'', interests: me?.interests||'' });
   const [passwords, setPasswords] = useState({ current: '', newPassword: '', confirm: '' });
   const [masks, setMasks] = useState([]);
+  const [activeAnon, setActiveAnon] = useState(null);
   const [anonHistory, setAnonHistory] = useState([]);
   const [favMasks, setFavMasks] = useState(() => {
     try { const p = JSON.parse(me?.fav_masks || '[]'); if (Array.isArray(p) && p.length) return p; } catch {}
@@ -81,6 +83,181 @@ export default function Settings({ me, boot, onClose, onSave, currentTheme, onTh
   const [saved, setSaved] = useState('');
   const [err, setErr] = useState('');
   const [selectedInterests, setSelectedInterests] = useState([]);
+
+  // ── Voice & Video devices (per machine, kept in localStorage) ──────────────
+  const [mediaPrefs, setMediaPrefs] = useState(loadMediaPrefs);
+  const [mediaDevices, setMediaDevices] = useState({ audioinput: [], audiooutput: [], videoinput: [] });
+  const [mediaStatus, setMediaStatus] = useState('');
+  const micStreamRef = useRef(null);
+  const camStreamRef = useRef(null);
+  const micLevelRef = useRef(null);
+  const camPreviewRef = useRef(null);
+  const micRafRef = useRef(null);
+  const micCtxRef = useRef(null);
+  const [micTesting, setMicTesting] = useState(false);
+  const [camOn, setCamOn] = useState(false);
+
+  function stopMicTestStream() {
+    micStreamRef.current?.getTracks().forEach(t => t.stop());
+    micStreamRef.current = null;
+    setMicTesting(false);
+    if (micRafRef.current) { cancelAnimationFrame(micRafRef.current); micRafRef.current = null; }
+    if (micLevelRef.current) micLevelRef.current.style.width = '0%';
+    try { micCtxRef.current?.close(); } catch {}
+    micCtxRef.current = null;
+  }
+
+  function stopCamPreview() {
+    camStreamRef.current?.getTracks().forEach(t => t.stop());
+    camStreamRef.current = null;
+    setCamOn(false);
+    if (camPreviewRef.current) camPreviewRef.current.srcObject = null;
+  }
+
+  function refreshDevices() {
+    if (!navigator.mediaDevices?.enumerateDevices) return;
+    navigator.mediaDevices.enumerateDevices().then(list => {
+      const next = { audioinput: [], audiooutput: [], videoinput: [] };
+      list.forEach(d => {
+        if (next[d.kind]) next[d.kind].push({ id: d.deviceId, label: d.label || d.kind });
+      });
+      setMediaDevices(next);
+    }).catch(() => {});
+  }
+
+  // Scan once when the tab opens (permission prompt reveals real device labels),
+  // then keep the lists fresh when hardware is plugged/unplugged.
+  useEffect(() => {
+    if (tab !== 'voice') return;
+    (async () => {
+      try {
+        // Unlock labels by requesting access once; the streams are stopped immediately.
+        const probe = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+        probe.getTracks().forEach(t => t.stop());
+        setMediaStatus('Found your devices — pick your favourites below.');
+      } catch (err) {
+        if (String(err?.name || '').includes('NotAllowed')) setMediaStatus('Permission was blocked. Allow microphone & camera access in your browser, then scan again.');
+        else if (String(err?.name || '').includes('NotFound')) setMediaStatus('No microphone or camera was found on this device.');
+        else setMediaStatus('Could not list devices: ' + (err?.message || 'unknown error'));
+      }
+      refreshDevices();
+    })();
+    navigator.mediaDevices?.addEventListener?.('devicechange', refreshDevices);
+    return () => {
+      navigator.mediaDevices?.removeEventListener?.('devicechange', refreshDevices);
+      stopMicTestStream();
+      stopCamPreview();
+    };
+  }, [tab]);
+
+  function saveMediaPref(kind, id) {
+    const next = { ...mediaPrefs, [kind]: id };
+    setMediaPrefs(next);
+    saveMediaPrefs(next);
+    notify('Saved on this device');
+  }
+
+  // Show a live input-level bar through the chosen microphone for ~4s.
+  async function testMic() {
+    if (micStreamRef.current) { stopMicTestStream(); return; }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: mediaPrefs.mic ? { deviceId: { exact: mediaPrefs.mic } } : true,
+      });
+      micStreamRef.current = stream;
+      setMicTesting(true);
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      const ctx = new Ctx();
+      micCtxRef.current = ctx;
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 512;
+      ctx.createMediaStreamSource(stream).connect(analyser);
+      const data = new Uint8Array(analyser.fftSize);
+      const tick = () => {
+        if (!micStreamRef.current) return;
+        analyser.getByteTimeDomainData(data);
+        let peak = 0;
+        for (let i = 0; i < data.length; i++) {
+          const v = Math.abs(data[i] - 128) / 128;
+          if (v > peak) peak = v;
+        }
+        if (micLevelRef.current) micLevelRef.current.style.width = Math.min(100, Math.round(peak * 320)) + '%';
+        micRafRef.current = requestAnimationFrame(tick);
+      };
+      micRafRef.current = requestAnimationFrame(tick);
+      setTimeout(stopMicTestStream, 4000);
+      notify('Speak now — watch the meter', false);
+    } catch {
+      notify('Could not start that microphone', true);
+    }
+  }
+
+  // Play a short tone out of the chosen speaker (uses setSinkId when available).
+  function testSpeaker() {
+    try {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      const ctx = new Ctx();
+      const dest = ctx.createMediaStreamDestination();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      gain.gain.value = 0.15;
+      osc.frequency.setValueAtTime(440, ctx.currentTime);
+      osc.frequency.setValueAtTime(660, ctx.currentTime + 0.4);
+      osc.connect(gain);
+      gain.connect(dest);
+      const el = document.createElement('audio');
+      el.srcObject = dest.stream;
+      el.autoplay = true;
+      if (mediaPrefs.speaker && typeof el.setSinkId === 'function') {
+        el.setSinkId(mediaPrefs.speaker).catch(() => {});
+      }
+      document.body.appendChild(el);
+      osc.start();
+      osc.stop(ctx.currentTime + 0.9);
+      setTimeout(() => {
+        try { osc.disconnect(); gain.disconnect(); dest.disconnect(); ctx.close(); } catch {}
+        el.remove();
+      }, 1100);
+      notify('Playing a test tone…');
+    } catch {
+      notify('Could not play a test tone', true);
+    }
+  }
+
+  async function toggleCameraPreview() {
+    if (camStreamRef.current) { stopCamPreview(); return; }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: mediaPrefs.camera ? { deviceId: { exact: mediaPrefs.camera } } : { width: { ideal: 1280 }, height: { ideal: 720 } },
+      });
+      camStreamRef.current = stream;
+      setCamOn(true);
+      requestAnimationFrame(() => {
+        if (camPreviewRef.current) camPreviewRef.current.srcObject = stream;
+      });
+    } catch {
+      notify('Could not start that camera', true);
+    }
+  }
+
+  function deviceSelect(label, kind, list, icon) {
+    const realDevices = list.filter(d => d.id && d.id !== 'default' && d.id !== 'communications');
+    return (
+      <div className="device-row">
+        <span className="device-row-label">{icon} {label}</span>
+        <select
+          value={mediaPrefs[kind] || ''}
+          onChange={e => saveMediaPref(kind, e.target.value)}
+        >
+          <option value="">System default</option>
+          {realDevices.map(d => (
+            <option key={d.id} value={d.id}>{d.label || 'Unnamed device'}</option>
+          ))}
+        </select>
+      </div>
+    );
+  }
 
   useEffect(() => {
     api('/api/settings').then(s => setSettings(s));
@@ -235,6 +412,7 @@ export default function Settings({ me, boot, onClose, onSave, currentTheme, onTh
     { id: 'ranks',        emoji: '🏆', label: 'Ranks & perks' },
     { id: 'privacy',      emoji: '🔒', label: 'Privacy' },
     { id: 'notifications',emoji: '🔔', label: 'Notifications' },
+    { id: 'voice',        emoji: '🎙️', label: 'Voice & Video' },
     { id: 'appearance',   emoji: '🎨', label: 'Appearance' },
     { id: 'interests',    emoji: '⭐', label: 'Interests' },
     { id: 'anonymous',    emoji: '🎭', label: 'Anonymous' },
@@ -453,6 +631,39 @@ export default function Settings({ me, boot, onClose, onSave, currentTheme, onTh
             </div>
           )}
 
+          {/* ── Voice & Video ── */}
+          {tab === 'voice' && (
+            <div className="settings-section">
+              <h2>Voice & Video</h2>
+              <p className="muted-text">Choose the microphone, speaker, and camera this device uses for calls, voice channels, and video rooms. Choices are stored on this device only.</p>
+
+              <div className="settings-toggle-row" style={{ alignItems: 'center' }}>
+                <button onClick={() => { setMediaStatus('Scanning…'); (async () => { try { const p = await navigator.mediaDevices.getUserMedia({ audio: true, video: true }); p.getTracks().forEach(t => t.stop()); setMediaStatus(''); } catch {} refreshDevices(); setMediaStatus('Devices refreshed.'); })(); }}>🔄 Scan for devices</button>
+                <span className="muted-text" style={{ fontSize: '.82rem' }}>{mediaStatus}</span>
+              </div>
+
+              {deviceSelect('Microphone', 'mic', mediaDevices.audioinput, '🎤')}
+              {deviceSelect('Speaker / Output', 'speaker', mediaDevices.audiooutput, '🔈')}
+              {deviceSelect('Camera', 'camera', mediaDevices.videoinput, '📷')}
+
+              <hr className="settings-hr" />
+              <h3>Test your setup</h3>
+              <div className="settings-toggle-row" style={{ flexWrap: 'wrap', gap: '.5rem' }}>
+                <button onClick={testMic}>{micTesting ? '⏹ Stop test' : '🎤 Test microphone'}</button>
+                <button onClick={testSpeaker}>🔊 Test speaker</button>
+                <button onClick={toggleCameraPreview}>{camOn ? '⏹ Stop camera' : '📷 Preview camera'}</button>
+              </div>
+              <div className="mic-level-track" style={{ height: 10, borderRadius: 5, background: 'var(--bg)', border: '1px solid var(--border)', overflow: 'hidden', marginTop: '.6rem' }}>
+                <div ref={micLevelRef} className="mic-level-fill" style={{ width: '0%', height: '100%', background: micTesting ? 'var(--brand, #5865f2)' : 'var(--border)', transition: 'width 60ms linear' }} />
+              </div>
+              <video ref={camPreviewRef} autoPlay muted playsInline style={{ width: '100%', maxHeight: 220, borderRadius: 8, background: '#000', marginTop: '.6rem', display: camOn ? 'block' : 'none' }} />
+
+              <hr className="settings-hr" />
+              <h3>Need help?</h3>
+              <p className="muted-text" style={{ fontSize: '.82rem' }}>If a device doesn't appear, make sure it is connected and that this site has permission to use it (the 🔄 Scan button asks for access). Video calls currently route your chosen camera for self-preview; direct calls carry audio through the speaker you pick here.</p>
+            </div>
+          )}
+
           {/* ── Interests ── */}
           {tab === 'interests' && (
             <div className="settings-section">
@@ -539,7 +750,7 @@ export default function Settings({ me, boot, onClose, onSave, currentTheme, onTh
                 <p className="muted-text" style={{ margin:'0.15rem 0 0.5rem', fontSize:'0.74rem' }}>Choose the color of your anonymous persona's name instead of the automatic username tint.</p>
                 <div style={{ display:'flex', alignItems:'center', gap:'0.55rem', flexWrap:'wrap' }}>
                   <input type="color" value={anonNameColor || '#5865f2'} onChange={e => setAnonNameColor(e.target.value)} style={{ width:42, height:30, padding:2, cursor:'pointer' }} />
-                  <span className="masked-name-preview" style={{ color: anonNameColor || 'var(--muted)', fontWeight:700 }}>{p ? p.name.replace(/^\S+\s+/,'') : 'Anonymous'}</span>
+                  <span className="masked-name-preview" style={{ color: anonNameColor || 'var(--muted)', fontWeight:700 }}>{String(previewMask?.name ?? (me?.anon_active ? me.anon_mask : '')).replace(/^\S+\s+/,'') || 'Anonymous'}</span>
                   <button onClick={saveAnonNameColor} disabled={!activeAnon && !me?.anon_active}>Save color</button>
                   <button className="ghost" onClick={() => { setAnonNameColor(''); api('/api/me/anonymous/name-color', { method:'PATCH', body:JSON.stringify({color:''}) }); onSave({ ...me, anon_name_color:'' }); }} disabled={!me?.anon_name_color}>Reset</button>
                 </div>

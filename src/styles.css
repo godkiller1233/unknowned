@@ -149,6 +149,21 @@ a:hover { text-decoration: underline; }
 .rank-card small { color: var(--muted); font-size: .75rem; }
 .appearance-control { display: flex; align-items: center; gap: .75rem; flex-direction: row; text-transform: none; }
 .appearance-control input { width: 48px; }
+/* Device pickers in Voice & Video settings — rows stack on narrow screens. */
+.device-row { display: flex; flex-direction: column; gap: .3rem; margin: .75rem 0; }
+.device-row-label { font-size: .82rem; color: var(--muted); font-weight: 700; letter-spacing: .02em; }
+.device-row select {
+  width: 100%;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: .45rem .5rem;
+  font-size: .88rem;
+}
+.device-row select:focus { border-color: var(--brand); outline: none; }
+.mic-level-track { margin: .6rem 0 .25rem; }
+.mic-level-fill { display: block; }
 
 /* ── Auth ── */
 .auth {
@@ -437,6 +452,20 @@ a:hover { text-decoration: underline; }
 .room-voice { flex: 1; display: flex; flex-direction: column; min-height: 0; }
 .room-voice-body { flex: 1; display: flex; flex-wrap: wrap; gap: 1rem; padding: 1.2rem; align-content: flex-start; overflow-y: auto; }
 .room-self-tile, .room-peer-tile { display: flex; flex-direction: column; align-items: center; gap: 6px; font-size: .8rem; min-width: 120px; }
+.room-peer-tile { position: relative; flex: 0 1 250px; }
+.room-peer-tile .voice-live-dot { position: static; }
+.room-peer-name { display: inline-flex; align-items: center; gap: 5px; }
+.room-peer-name .voice-connecting { font-size: .7rem; }
+/* Camera-off state: the peer's video element is hidden but still plays audio;
+   an avatar + label tile takes its place visually. */
+.room-cam-off-video { display: none; }
+.room-cam-placeholder {
+  width: 100%; aspect-ratio: 16 / 9;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px;
+  background: #000; border-radius: 10px; margin-top: -10px;
+}
+.room-peer-tile.cam-off { border: 1px dashed var(--border); border-radius: 12px; padding: 4px; }
+.cam-off-label { font-size: .72rem; color: var(--muted); font-weight: 600; }
 .room-voice-ctrls { display: flex; gap: 8px; justify-content: center; padding: .8rem; border-top: 1px solid var(--border, rgba(255,255,255,.08)); }
 .room-ptt-btn { padding: .6rem 1.4rem; border-radius: 20px; border: 1px solid var(--brand, #5865f2); background: transparent; color: var(--text); cursor: pointer; font-weight: 600; touch-action: none; user-select: none; }
 .room-ptt-btn.active { background: var(--brand, #5865f2); color: #fff; }
@@ -1363,8 +1392,18 @@ a:hover { text-decoration: underline; }
   border: 2px solid var(--ok);
 }
 .voice-tile.muted { border-color: var(--danger); }
+.voice-tile.connecting { border-color: var(--border); opacity: .8; }
 .voice-tile span { font-size: 0.9rem; font-weight: 600; }
 .mute-badge { position: absolute; top: 8px; right: 8px; font-size: 1rem; }
+.voice-tile .voice-live-dot { position: absolute; top: 10px; left: 10px; }
+.voice-live-dot {
+  width: 10px; height: 10px; border-radius: 50%; flex: none;
+  background: var(--ok); box-shadow: 0 0 8px var(--ok);
+  display: inline-block; animation: voicePulse 1.6s ease-in-out infinite;
+}
+@keyframes voicePulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+.voice-connecting { font-size: .72rem; color: var(--muted); }
+.voice-empty-note { width: 100%; text-align: center; color: var(--muted); font-size: .9rem; padding: 1rem 0; }
 .voice-idle { display: flex; flex-direction: column; align-items: center; gap: 0.5rem; color: var(--muted); padding: 2rem; text-align: center; }
 .voice-idle p { margin: 0; font-size: 1.2rem; }
 .voice-controls { padding: 1rem; border-top: 1px solid var(--border); display: flex; gap: 0.5rem; justify-content: center; }
@@ -1775,6 +1814,25 @@ html[data-theme=ocean]  { --bg:#0a1628;--panel:#0d1f3c;--sidebar:#071323;--soft:
 .call-modal { background: var(--panel); border-radius: 16px; padding: 2rem; min-width: 240px; text-align: center; box-shadow: var(--shadow); display: flex; flex-direction: column; align-items: center; gap: 0.75rem; animation: popIn 0.2s ease; }
 .call-modal h3 { margin: 0; }
 .call-status  { color: var(--muted); font-size: 0.9rem; margin: 0; }
+.call-mic-chip {
+  display: inline-block; font-size: 0.8rem; font-weight: 600; color: var(--muted);
+  background: var(--soft); border-radius: 999px; padding: 0.3rem 0.8rem; margin: 0;
+  border: 1px solid var(--border);
+}
+.call-mic-chip.live { color: #fff; background: rgba(var(--ok-rgb, 76, 175, 80), 0.25); border-color: var(--ok); animation: voicePulse 1.6s ease-in-out infinite; }
+.call-mic-chip.muted { color: var(--danger); border-color: var(--danger); }
+.call-mic-chip.warn { color: var(--warn, #ffb74d); border-color: var(--warn, #ffb74d); }
+.call-mic-warn {
+  display: flex; flex-direction: column; gap: 0.6rem; align-items: center;
+  background: rgba(255, 183, 77, 0.08); border: 1px solid rgba(255, 183, 77, 0.4);
+  border-radius: 10px; padding: 0.7rem 0.9rem; max-width: 300px;
+}
+.call-mic-warn p { margin: 0; font-size: 0.85rem; color: var(--text); }
+.call-warn-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; justify-content: center; }
+.call-btn.pill { width: auto; height: auto; padding: 0.55rem 1rem; border-radius: 999px; font-size: 0.9rem; min-height: 38px; }
+.call-btn.pill.ok { background: var(--ok); color: #fff; }
+.call-btn.pill.danger { background: var(--danger); color: #fff; }
+.call-btn.pill:disabled { opacity: 0.6; cursor: wait; }
 .call-controls { display: flex; gap: 0.75rem; }
 .call-btn { width: 52px; height: 52px; border-radius: 50%; display: grid; place-items: center; font-size: 1.2rem; }
 .call-btn.accept  { background: var(--ok); color: #fff; }

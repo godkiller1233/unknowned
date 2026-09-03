@@ -5,6 +5,8 @@ import './styles.css';
 const Settings = lazy(() => import('./Settings.jsx'));
 const Game = lazy(() => import('./Game.jsx'));
 import { Logo, Mascot } from './Logo.jsx';
+import { mediaConstraints, applySpeakerSink, loadMediaPrefs } from './mediaPrefs.js';
+import { createVoiceMesh } from './mesh.js';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 function storageValue(storage, key) {
@@ -326,13 +328,39 @@ function PiiWarning({ warning, onSend, onRewrite }) {
 }
 
 // ── Call Modal ────────────────────────────────────────────────────────────────
+// Live-voice indicator for the DM call. Mute is SIGNALED explicitly between
+// the two participants (call_mute events), so a muted peer reads as truly
+// muted no matter what their mic does. When they're unmuted we watch the
+// energy of their audio track: real speech pushes the average frequency level
+// well above the near-zero silence floor, so "speaking" still lights up live.
+const CALL_SPEAK_THRESHOLD = 4;
+function callMicStateText(s) {
+  return s === 'muted'    ? '🔇 Muted — mic off'
+    : s === 'speaking'    ? '🔊 Mic live — speaking'
+    : s === 'no-audio'    ? '🎙️ Not receiving audio from them'
+    : '🎙️ Mic connected';
+}
+
 function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClose }) {
   const [status, setStatus] = useState(incoming ? 'incoming' : 'calling');
   const [muted, setMuted]   = useState(false);
+  // null | 'denied' | 'nodevice' | 'unexpected' — blocks starting the call until
+  // the user fixes their microphone, with a Retry that re-requests capture.
+  const [micIssue, setMicIssue] = useState(null);
+  const [retrying, setRetrying] = useState(false);
+  // 'idle' | 'speaking' | 'no-audio' — live state of the remote user's mic.
+  const [peerMic, setPeerMic] = useState('idle');
+  // True when the other participant signaled they muted their mic (call_mute).
+  const [remoteMuted, setRemoteMuted] = useState(false);
   const localRef  = useRef(null);
   const remoteRef = useRef(null);
   const streamRef = useRef(null);
   const pcRef     = useRef(null);
+  const pendingStart = useRef(null);
+  const peerTimer = useRef(0);
+  const peerCtx = useRef(null);
+  const peerAnalyser = useRef(null);
+  const peerStream = useRef(null);
 
   useEffect(() => {
     const isThisCall = d => !d?.dmId || d.dmId === dmId;
@@ -350,6 +378,7 @@ function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClo
     };
     const onAnswer  = async d => { if (isThisCall(d) && pcRef.current) await pcRef.current.setRemoteDescription(new RTCSessionDescription(d.sdp)).catch(()=>{}); };
     const onIce     = d => { if (isThisCall(d) && pcRef.current && d.candidate) pcRef.current.addIceCandidate(new RTCIceCandidate(d.candidate)).catch(()=>{}); };
+    const onMute    = d => { if (!isThisCall(d) || (d.from && d.from !== targetUser?.id)) return; setRemoteMuted(d.muted === true); };
 
     socket.on('call_accept',  onAccept);
     socket.on('call_decline', onDecline);
@@ -357,6 +386,7 @@ function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClo
     socket.on('rtc_offer',    onOffer);
     socket.on('rtc_answer',   onAnswer);
     socket.on('rtc_ice',      onIce);
+    socket.on('call_mute',    onMute);
 
     if (!incoming) startCall(true);
 
@@ -367,13 +397,31 @@ function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClo
       socket.off('rtc_offer', onOffer);
       socket.off('rtc_answer', onAnswer);
       socket.off('rtc_ice', onIce);
+      socket.off('call_mute', onMute);
       cleanup();
     };
   }, []);
 
   async function startCall(isInitiator, offerData) {
+    pendingStart.current = { isInitiator, offerData };
+    let stream;
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      stream = await navigator.mediaDevices.getUserMedia(mediaConstraints('mic'));
+    } catch (err) {
+      // Microphone unavailable — tell the user exactly why and let them retry
+      // instead of showing a dead "could not connect".
+      const name = err?.name || '';
+      setMicIssue(
+        name === 'NotAllowedError' || name === 'PermissionDeniedError' || name === 'SecurityError' ? 'denied'
+        : (name === 'NotFoundError' || name === 'OverconstrainedError' || name === 'DevicesNotFoundError') ? 'nodevice'
+        : 'unexpected');
+      setRetrying(false);
+      setStatus(isInitiator ? 'micblocked' : 'incoming');
+      return;
+    }
+    setMicIssue(null);
+    setRetrying(false);
+    try {
       streamRef.current = stream;
       if (localRef.current) localRef.current.srcObject = stream;
 
@@ -381,7 +429,10 @@ function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClo
       pcRef.current = pc;
       stream.getTracks().forEach(t => pc.addTrack(t, stream));
 
-      pc.ontrack = e => { if (remoteRef.current) remoteRef.current.srcObject = e.streams[0]; };
+      pc.ontrack = e => {
+        if (remoteRef.current) remoteRef.current.srcObject = e.streams[0];
+        startPeerMonitor(e.streams[0]);
+      };
       pc.onicecandidate = e => {
         if (e.candidate) socket.emit('rtc_ice', { toUserId: targetUser?.id, dmId, candidate: e.candidate });
       };
@@ -398,12 +449,67 @@ function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClo
         socket.emit('call_accept', { toUserId: targetUser?.id, dmId, sdp: answer });
         setStatus('connected');
       }
-    } catch { setStatus('error'); }
+    } catch { cleanup(); setStatus('error'); }
+  }
+
+  // Route the caller's audio to the speaker the user picked in Settings, and
+  // start watching their mic if a stream is already attached when we connect.
+  useEffect(() => {
+    if (status === 'connected') {
+      const s = remoteRef.current?.srcObject;
+      if (s) startPeerMonitor(s);
+    } else if (status === 'micblocked') {
+      stopPeerMonitor();
+    }
+    if (remoteRef.current) applySpeakerSink(remoteRef.current, loadMediaPrefs().speaker);
+  }, [status]);
+
+  // Watch the remote audio track and flip the indicator when they actually speak.
+  function startPeerMonitor(stream) {
+    if (!stream || peerStream.current === stream) return;
+    peerStream.current = stream;
+    stopPeerMonitor();
+    const track = stream.getAudioTracks()[0];
+    if (!track) { setPeerMic('no-audio'); return; }
+    setPeerMic('idle');
+    let ctx;
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      ctx = new AC();
+      const src = ctx.createMediaStreamSource(stream);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 512;
+      src.connect(analyser);
+      peerCtx.current = ctx;
+      peerAnalyser.current = analyser;
+      if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+    } catch { return; }
+    const levels = new Uint8Array(peerAnalyser.current.frequencyBinCount);
+    peerTimer.current = setInterval(() => {
+      const an = peerAnalyser.current;
+      if (!an) return;
+      if (peerCtx.current?.state === 'suspended') peerCtx.current.resume().catch(() => {});
+      an.getByteFrequencyData(levels);
+      let sum = 0;
+      for (let i = 0; i < levels.length; i++) sum += levels[i];
+      const speaking = sum / levels.length > CALL_SPEAK_THRESHOLD;
+      setPeerMic(p => (p === 'speaking') === speaking ? p : (speaking ? 'speaking' : 'idle'));
+    }, 140);
+  }
+
+  function stopPeerMonitor() {
+    clearInterval(peerTimer.current);
+    peerTimer.current = 0;
+    peerCtx.current?.close().catch(() => {});
+    peerCtx.current = null;
+    peerAnalyser.current = null;
+    peerStream.current = null;
   }
 
   function accept() {
-    startCall(false, initialOffer);
     setStatus('connecting');
+    startCall(false, initialOffer);
   }
 
   function decline() {
@@ -417,15 +523,44 @@ function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClo
     onClose();
   }
 
+  async function retryMic() {
+    if (retrying) return;
+    setRetrying(true);
+    setMicIssue(null);
+    const p = pendingStart.current;
+    // The browser only re-prompts after a new user gesture — this click is it.
+    await startCall(p ? p.isInitiator : true, p ? p.offerData : null);
+    setRetrying(false);
+  }
+
   function cleanup() {
+    stopPeerMonitor();
     streamRef.current?.getTracks().forEach(t => t.stop());
     pcRef.current?.close();
   }
 
   function toggleMute() {
-    streamRef.current?.getAudioTracks().forEach(t => { t.enabled = muted; });
-    setMuted(m => !m);
+    const next = !muted;
+    streamRef.current?.getAudioTracks().forEach(t => { t.enabled = !next; });
+    setMuted(next);
+    // Tell the other participant — their chip flips to a true “muted” state.
+    if (socket.connected) socket.emit('call_mute', { toUserId: targetUser?.id, dmId, muted: next });
   }
+
+  // After a (re)connect the other side may have missed our mute state, so
+  // re-announce it — they should never have to guess from silence.
+  useEffect(() => {
+    if (!muted) return undefined;
+    const resend = () => { if (socket.connected) socket.emit('call_mute', { toUserId: targetUser?.id, dmId, muted: true }); };
+    socket.on('connect', resend);
+    return () => socket.off('connect', resend);
+  }, [socket, muted, targetUser?.id, dmId]);
+
+  const micWarn = micIssue
+    ? micIssue === 'denied' ? 'Microphone permission is blocked, so the call can’t start. Allow mic access for this site (address-bar icon or OS privacy settings), then retry.'
+      : micIssue === 'nodevice' ? 'No microphone was found. Connect one, or pick your mic in Settings → Voice & Video, then retry.'
+      : 'Could not start your microphone. Retry to try again.'
+    : null;
 
   return (
     <div className="call-modal-overlay">
@@ -436,21 +571,47 @@ function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClo
         <h3>{targetUser?.nickname || targetUser?.username}</h3>
         <p className="call-status">
           {status === 'calling'    ? '📞 Calling…'
+          : status === 'micblocked' ? '🎙️ Microphone needed'
           : status === 'incoming'  ? '📲 Incoming call…'
           : status === 'connected' ? '🟢 Connected'
           : status === 'declined'  ? '❌ Call declined'
           : status === 'error'     ? '⚠ Could not connect'
           : '⏳ Connecting…'}
         </p>
+        {status === 'connected' && (() => {
+          const micState = remoteMuted ? 'muted' : peerMic;
+          const cls = 'call-mic-chip'
+            + (micState === 'speaking' ? ' live' : '')
+            + (micState === 'muted' ? ' muted' : '')
+            + (micState === 'no-audio' ? ' warn' : '');
+          return (
+            <p className={cls} role="status" aria-live="polite">
+              {callMicStateText(micState)}
+            </p>
+          );
+        })()}
+        {micWarn && (
+          <div className="call-mic-warn" role="alert">
+            <p>{micWarn}</p>
+            <div className="call-warn-actions">
+              <button className="call-btn pill ok" onClick={retryMic} disabled={retrying}>
+                {retrying ? '⏳ Requesting…' : '↻ Retry microphone'}
+              </button>
+              {incoming
+                ? <button className="call-btn pill danger" onClick={decline}>✕ Decline</button>
+                : <button className="call-btn pill danger" onClick={onClose}>Close</button>}
+            </div>
+          </div>
+        )}
         <audio ref={localRef}  autoPlay muted style={{display:'none'}} />
         <audio ref={remoteRef} autoPlay       style={{display:'none'}} />
         <div className="call-controls">
-          {status === 'incoming' ? (
+          {status === 'incoming' && !micWarn ? (
             <>
               <button className="call-btn accept" onClick={accept}>✓ Accept</button>
               <button className="call-btn decline" onClick={decline}>✕ Decline</button>
             </>
-          ) : (
+          ) : status === 'connected' || status === 'calling' || status === 'connecting' ? (
             <>
               {status === 'connected' && (
                 <button className={`call-btn mute${muted?' active':''}`} onClick={toggleMute}>
@@ -459,7 +620,7 @@ function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClo
               )}
               <button className="call-btn end" onClick={endCall}>End</button>
             </>
-          )}
+          ) : null}
         </div>
       </div>
     </div>
@@ -3431,33 +3592,61 @@ function GroupChat({ me, group, socket, notify, onViewProfile, jumpToMessageId, 
 }
 
 // ── Voice Channel ─────────────────────────────────────────────────────────────
-function VoiceChannel({ channel, me, socket, boot }) {
+function VoiceChannel({ channel, me, socket }) {
   const [inCall, setInCall] = useState(false);
-  const [peers, setPeers]   = useState([]);
   const [muted, setMuted]   = useState(false);
   const [sharing, setSharing] = useState(false);
+  // Roster rows carry profile + a `live` flag (real audio flowing) per peer.
+  const [roster, setRoster] = useState([]);
+  const [streamTick, setStreamTick] = useState(0);
+  const meshRef = useRef(null);
   const streamRef = useRef(null);
   const screenRef = useRef(null);
+  const audioRefs = useRef({});
 
+  // One mesh per channel mount; it stays silent until join() is called.
   useEffect(() => {
-    const onState = ({userId,joined}) => setPeers(p => joined ? [...new Set([...p,userId])] : p.filter(id=>id!==userId));
-    socket.on('voice_state', onState);
-    return () => socket.off('voice_state', onState);
-  }, [socket]);
+    const mesh = createVoiceMesh({
+      socket, channelId: channel.id, me,
+      onRoster: setRoster,
+      onRemoteStream: () => setStreamTick(t => t + 1),
+      onRemoteEnd: () => setStreamTick(t => t + 1),
+    });
+    meshRef.current = mesh;
+    return () => { mesh.destroy(); meshRef.current = null; };
+  }, [socket, channel.id, me?.id]);
+
+  // Attach remote audio when a stream arrives and route it to the chosen
+  // speaker from Settings → Voice & Video.
+  useEffect(() => {
+    const mesh = meshRef.current;
+    if (!mesh) return;
+    const speaker = loadMediaPrefs().speaker;
+    roster.forEach(u => {
+      const el = audioRefs.current[u.userId];
+      const s = mesh.streamFor(u.userId);
+      if (el) {
+        if (s && el.srcObject !== s) el.srcObject = s;
+        applySpeakerSink(el, speaker);
+      }
+    });
+  }, [roster, streamTick, inCall]);
 
   async function joinCall() {
     try {
-      streamRef.current = await navigator.mediaDevices.getUserMedia({audio:true});
+      const stream = await navigator.mediaDevices.getUserMedia(mediaConstraints('mic'));
+      streamRef.current = stream;
+      meshRef.current?.join(stream);
       setInCall(true);
-      socket.emit('voice_join',{channelId:channel.id,userId:me.id});
     } catch { alert('Could not access microphone.'); }
   }
 
   function leaveCall() {
     streamRef.current?.getTracks().forEach(t=>t.stop());
     screenRef.current?.getTracks().forEach(t=>t.stop());
-    socket.emit('voice_leave',{channelId:channel.id,userId:me.id});
-    setInCall(false); setMuted(false); setSharing(false); setPeers([]);
+    meshRef.current?.leave();
+    audioRefs.current = {};
+    setInCall(false); setMuted(false); setSharing(false);
   }
 
   async function toggleScreen() {
@@ -3480,8 +3669,7 @@ function VoiceChannel({ channel, me, socket, boot }) {
     setMuted(m=>!m);
   }
 
-  const voiceUsers = peers.map(id=>boot?.users?.find(u=>u.id===id)).filter(Boolean);
-  if (inCall) voiceUsers.unshift(me);
+  const displayName = u => u?.nickname || u?.username || 'Unknown';
 
   return (
     <div className="voice-channel">
@@ -3489,13 +3677,30 @@ function VoiceChannel({ channel, me, socket, boot }) {
         <div className="channel-title"><span>🔊</span><h2>{channel.name}</h2></div>
       </div>
       <div className="voice-grid">
-        {inCall ? voiceUsers.map(u => (
-          <div key={u.id} className={`voice-tile${u.id===me.id&&muted?' muted':''}`}>
-            <Avatar src={u.avatar} name={u.nickname||u.username} size="lg" badge={u.badge} />
-            <span>{u.nickname||u.username}</span>
-            {u.id===me.id&&muted&&<span className="mute-badge">🔇</span>}
-          </div>
-        )) : <div className="voice-idle"><p>🔊 {channel.name}</p><p className="muted-text">{peers.length} in call</p></div>}
+        {inCall ? (
+          <>
+            <div className={`voice-tile self${muted?' muted':''}`}>
+              <Avatar src={me?.avatar} name={displayName(me)} size="lg" badge={me?.badge} />
+              <span>{displayName(me)}</span>
+              <span className="voice-live-dot" title="You're connected" />
+              {muted && <span className="mute-badge">🔇</span>}
+            </div>
+            {roster.map(u => {
+              const hasMedia = Boolean(meshRef.current?.streamFor(u.userId));
+              return (
+                <div key={u.userId} className={`voice-tile${hasMedia?' live':' connecting'}`}>
+                  <Avatar src={u.avatar} name={displayName(u)} size="lg" badge={u.badge} />
+                  <span>{displayName(u)}</span>
+                  <audio ref={el => { audioRefs.current[u.userId] = el; }} autoPlay playsInline style={{display:'none'}} />
+                  {hasMedia
+                    ? <span className="voice-live-dot" title="Audio live" />
+                    : <span className="voice-connecting">connecting…</span>}
+                </div>
+              );
+            })}
+            {roster.length === 0 && <p className="voice-empty-note">No one else here yet — share the channel to bring friends in.</p>}
+          </>
+        ) : <div className="voice-idle"><p>🔊 {channel.name}</p><p className="muted-text">Talk live with everyone in this channel</p></div>}
       </div>
       <div className="voice-controls">
         {!inCall ? (
@@ -3595,6 +3800,11 @@ function RoomView({ roomId, me, socket, notify, onLaunchGame }) {
   const collabFocused = useRef(false);
   const videoRef = useRef(null);
   const [raises, setRaises] = useState([]);
+  const [voiceRoster, setVoiceRoster] = useState([]);   // peers actually live in voice (mesh)
+  const [streamTick, setStreamTick] = useState(0);
+  const [cameraOn, setCameraOn] = useState(true);       // local camera state (video rooms)
+  const meshRef = useRef(null);
+  const remoteRefs = useRef({});
 
   const meta = ROOM_META[room?.type] || ROOM_META.chat;
 
@@ -3653,6 +3863,33 @@ function RoomView({ roomId, me, socket, notify, onLaunchGame }) {
     api(`/api/rooms/${roomId}/polls`).then(d => { if (!d.error) setPolls(d); }).catch(()=>{});
   }, [roomId, room?.type]);
 
+  // Voice/video rooms run a real WebRTC mesh over the room's socket room.
+  useEffect(() => {
+    if (room?.type !== 'voice' && room?.type !== 'video') return undefined;
+    const mesh = createVoiceMesh({
+      socket, channelId: roomId, me,
+      onRoster: setVoiceRoster,
+      onRemoteStream: () => setStreamTick(t => t + 1),
+      onRemoteEnd: () => setStreamTick(t => t + 1),
+    });
+    meshRef.current = mesh;
+    return () => { mesh.destroy(); meshRef.current = null; };
+  }, [roomId, room?.type, me?.id]);
+
+  // Attach remote audio/video as streams arrive; honor the saved speaker.
+  useEffect(() => {
+    const mesh = meshRef.current;
+    if (!mesh || !inCall) return;
+    const speaker = loadMediaPrefs().speaker;
+    voiceRoster.forEach(u => {
+      const el = remoteRefs.current[u.userId];
+      const s = mesh.streamFor(u.userId);
+      if (!el) return;
+      if (s && el.srcObject !== s) el.srcObject = s;
+      applySpeakerSink(el, speaker);
+    });
+  }, [voiceRoster, streamTick, inCall, room?.type]);
+
   async function joinRoom() {
     const d = await api(`/api/rooms/${roomId}/join`, { method:'POST' });
     if (d.error) { notify(d.error, 'err'); return; }
@@ -3664,6 +3901,7 @@ function RoomView({ roomId, me, socket, notify, onLaunchGame }) {
   function leaveRoom() {
     api(`/api/rooms/${roomId}/leave`, { method:'POST' }).catch(()=>{});
     streamRef.current?.getTracks().forEach(t=>t.stop());
+    meshRef.current?.leave();
     setJoined(false); setInCall(false); setWaiting(false); setMessages([]);
   }
 
@@ -3690,20 +3928,32 @@ function RoomView({ roomId, me, socket, notify, onLaunchGame }) {
     await api(`/api/rooms/${roomId}/polls/${pollId}/vote`, { method:'POST', body: JSON.stringify({ optionIndex:idx }) });
   }
 
-  // ── Voice/video ──
+  // ── Voice/video: real peer media via the mesh ──
   async function joinVoice() {
     try {
       const wantsVideo = room?.type==='video';
-      streamRef.current = await navigator.mediaDevices.getUserMedia({ audio:true, video:wantsVideo });
+      const stream = await navigator.mediaDevices.getUserMedia(mediaConstraints(wantsVideo ? 'mic+camera' : 'mic'));
+      streamRef.current = stream;
+      setCameraOn(true);
+      meshRef.current?.join(stream);
       setInCall(true);
-      socket.emit('voice_join',{ channelId:roomId, userId:me.id });
     } catch { notify('Could not access ' + (room?.type==='video'?'camera':'microphone'), 'err'); }
   }
 
   function leaveVoice() {
     streamRef.current?.getTracks().forEach(t=>t.stop());
-    socket.emit('voice_leave',{ channelId:roomId, userId:me.id });
-    setInCall(false); setMuted(false); setPttDown(false);
+    meshRef.current?.leave();
+    remoteRefs.current = {};
+    setInCall(false); setMuted(false); setPttDown(false); setCameraOn(true);
+  }
+
+  // Turn the local camera off/on: the mesh disables the video track (peers
+  // stop receiving video) and broadcasts the state so everyone swaps the
+  // frozen frame for a “camera off” tile. Mic audio keeps flowing.
+  function toggleCamera() {
+    const next = !cameraOn;
+    meshRef.current?.setCamera(next);
+    setCameraOn(next);
   }
 
   function toggleMute() {
@@ -3816,12 +4066,44 @@ function RoomView({ roomId, me, socket, notify, onLaunchGame }) {
             {inCall ? (
               <>
                 <div className="room-self-tile">
-                  {room.type==='video'
+                  {room.type==='video' && cameraOn
                     ? <video ref={el=>{ if(el) el.srcObject = streamRef.current; }} autoPlay muted playsInline style={{width:'100%',borderRadius:10,aspectRatio:'16/9',background:'#000'}} />
-                    : <Avatar src={me?.avatar} name={me?.nickname||me?.username} size="lg" badge={me?.badge} />}
+                    : <>
+                        <Avatar src={me?.avatar} name={me?.nickname||me?.username} size="lg" badge={me?.badge} />
+                        {room.type==='video' && !cameraOn && <span className="cam-off-label">📷 camera off</span>}
+                      </>}
                   <span>{me?.nickname||me?.username} {muted && '🔇'}</span>
                 </div>
-                {admitted.filter(m=>m.user_id!==me?.id).map(m => <div key={m.user_id} className="room-peer-tile"><Avatar src={m.avatar} name={m.nickname||m.username} size="lg" badge={m.badge} /><span>{m.nickname||m.username}</span></div>)}
+                {voiceRoster.map(u => {
+                  const hasMedia = Boolean(meshRef.current?.streamFor(u.userId));
+                  const peerCamOn = u.camera !== false;
+                  return room.type==='video' ? (
+                    <div key={u.userId} className={`room-peer-tile${hasMedia?' live':' connecting'}${peerCamOn?'':' cam-off'}`}>
+                      {/* The video element stays mounted even when the peer's camera
+                          is off — it quietly carries their audio while hidden. */}
+                      <video ref={el => { remoteRefs.current[u.userId] = el; }} className={peerCamOn?'':'room-cam-off-video'} autoPlay playsInline style={{width:'100%',borderRadius:10,aspectRatio:'16/9',background:'#000',objectFit:'cover'}} />
+                      {!peerCamOn && (
+                        <div className="room-cam-placeholder">
+                          <Avatar src={u.avatar} name={u.nickname || u.username} size="md" badge={u.badge} />
+                          <span className="cam-off-label">📷 camera off</span>
+                        </div>
+                      )}
+                      <span className="room-peer-name">{u.nickname || u.username}
+                        {!peerCamOn ? <em className="voice-connecting">no video</em>
+                          : hasMedia ? <em className="voice-live-dot" title="Video live" />
+                          : <em className="voice-connecting">connecting…</em>}
+                      </span>
+                    </div>
+                  ) : (
+                    <div key={u.userId} className={`room-peer-tile${hasMedia?' live':' connecting'}`}>
+                      <Avatar src={u.avatar} name={u.nickname || u.username} size="lg" badge={u.badge} />
+                      <audio ref={el => { remoteRefs.current[u.userId] = el; }} autoPlay playsInline style={{display:'none'}} />
+                      <span>{u.nickname || u.username}</span>
+                      {hasMedia ? <span className="voice-live-dot" title="Audio live" /> : <span className="voice-connecting">connecting…</span>}
+                    </div>
+                  );
+                })}
+                {voiceRoster.length === 0 && <p className="voice-empty-note">Waiting for others to join…</p>}
               </>
             ) : <div className="room-idle"><span className="room-icon">{meta.icon}</span><p>Join to talk in this room</p></div>}
           </div>
@@ -3836,6 +4118,11 @@ function RoomView({ roomId, me, socket, notify, onLaunchGame }) {
                     onTouchStart={e=>{e.preventDefault(); pttDownFn();}} onTouchEnd={pttUpFn}>🎙 Hold to talk</button>
                 ) : (
                   <button className={`voice-ctrl-btn${muted?' active':''}`} onClick={toggleMute}>{muted?'🔇 Unmute':'🎤 Mute'}</button>
+                )}
+                {room.type==='video' && (
+                  <button className={`voice-ctrl-btn${!cameraOn?' active':''}`} onClick={toggleCamera} title={cameraOn ? 'Turn your camera off' : 'Turn your camera back on'}>
+                    {cameraOn ? '🎥 Camera' : '📷 Camera Off'}
+                  </button>
                 )}
                 <button className="voice-ctrl-btn leave" onClick={leaveVoice}>Leave</button>
               </>
