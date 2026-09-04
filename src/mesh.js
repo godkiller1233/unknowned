@@ -15,10 +15,11 @@
 // different app instances still negotiate (Socket.IO runs on a PostgreSQL
 // adapter and socket ids are unique cluster-wide).
 
-const ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }];
+import { getIceServers } from './rtc.js';
+
 const MAX_OFFER_RETRIES = 2;
 
-export function createVoiceMesh({ socket, channelId, me, onRoster, onRemoteStream, onRemoteEnd }) {
+export function createVoiceMesh({ socket, channelId, me, onRoster, onRemoteStream, onRemoteEnd, iceServers }) {
   const peers = new Map();            // userId -> { userId, socketId, pc, localInitiated, live, retries }
   const pendingIce = new Map();       // userId -> [candidate]
   let localStream = null;
@@ -60,7 +61,7 @@ export function createVoiceMesh({ socket, channelId, me, onRoster, onRemoteStrea
   function freshPeer(user, localInitiated) {
     let pc;
     try {
-      pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+      pc = new RTCPeerConnection({ iceServers: iceServers || getIceServers() });
     } catch {
       return null;
     }

@@ -54,3 +54,22 @@ export function applySpeakerSink(el, speakerId) {
     }
   } catch { /* ignore */ }
 }
+
+
+// External avatar apps (VTube Studio, OBS, Snap Camera, ManyCam…) expose their
+// output as a *virtual camera* — a normal webcam the browser can select. These
+// helpers let the UI label them and let calls pick the right device when the
+// user chose the “External app” avatar mode.
+export function isVirtualCamLabel(label) {
+  return /vtuber|vtube|vts ?(cam|webcam)|obs|virtual ?cam|virtual ?webcam|snap ?cam|manycam|ivcam|droidcam|unity ?(video )?capture|nvidia ?broadcast|prism ?live|mirillis|logi ?capture|e2e ?soft|teams ?webcam|epoccam|ipevo/i.test(String(label || ''));
+}
+
+/** Constraints for the external app camera: the saved virtual-cam device when
+ *  it still exists, otherwise the browser default. */
+export function externalVideoConstraints(externalId) {
+  const id = (externalId && typeof externalId === 'string') ? externalId : '';
+  const video = id
+    ? { deviceId: { exact: id }, width: { ideal: 1280 }, height: { ideal: 720 } }
+    : { width: { ideal: 1280 }, height: { ideal: 720 } };
+  return { video };
+}

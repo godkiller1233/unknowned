@@ -1,5 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { loadMediaPrefs, saveMediaPrefs } from './mediaPrefs.js';
+import { loadMediaPrefs, saveMediaPrefs, isVirtualCamLabel, externalVideoConstraints } from './mediaPrefs.js';
+import { loadAvatarConfig, saveAvatarConfig, saveAvatarFile, removeAvatarFile, getAvatarFile, saveAvatarFit, loadCalibration, saveCalibration, clearCalibration } from './avatar-store.js';
+import { createAvatarEngine } from './avatar-engine.js';
 
 const getToken = () => sessionStorage.token || localStorage.rememberToken || '';
 const api = (path, opts = {}) =>
@@ -81,8 +83,346 @@ export default function Settings({ me, boot, onClose, onSave, currentTheme, onTh
   const [privacyCheckup, setPrivacyCheckup] = useState(null);
   const [tempName, setTempName] = useState('');
   const [saved, setSaved] = useState('');
+  const [delPassword, setDelPassword] = useState('');
+  const [delConfirm, setDelConfirm] = useState(false);
+  const [deleteBusy, setDeleteBusy] = useState(false);
+  const [exporting, setExporting] = useState(false);
   const [err, setErr] = useState('');
+  // ── Security: two-factor auth + session manager ─────────────────────────
+  const [secBusy, setSecBusy] = useState(false);
+  const [secMsg, setSecMsg] = useState('');
+  const [secError, setSecError] = useState('');
+  const [totpEnabled, setTotpEnabled] = useState(false);
+  const [setupPending, setSetupPending] = useState(null);   // { secret, otpauthUrl, account }
+  const [recoveryCodes, setRecoveryCodes] = useState(null); // shown exactly once after enabling
+  const [secPassword, setSecPassword] = useState('');
+  const [verifyCode, setVerifyCode] = useState('');
+  const [disablePassword, setDisablePassword] = useState('');
+  const [disableCode, setDisableCode] = useState('');
+  const [sessions, setSessions] = useState([]);
+  const [sessionsLoaded, setSessionsLoaded] = useState(false);
   const [selectedInterests, setSelectedInterests] = useState([]);
+
+  // ── Avatar (virtual camera: 2D image or 3D model instead of your face) ────
+  const [avatarCfg, setAvatarCfg] = useState(loadAvatarConfig);
+  const [avatarAssets, setAvatarAssets] = useState({ '2d': null, '3d': null }); // {name} | null
+  const [avatarStatus, setAvatarStatus] = useState('');
+  const [avatarPreviewOn, setAvatarPreviewOn] = useState(false);
+  const avatarEngineRef = useRef(null);
+  const avatarPrevRef = useRef(null);
+  const avatarFileRef = useRef({ '2d': null, '3d': null });
+  const avatarCamRef = useRef(null);
+
+  async function refreshAvatarAssets() {
+    const out = { '2d': null, '3d': null };
+    const [a, b] = await Promise.all([getAvatarFile('2d'), getAvatarFile('3d')]);
+    if (a) out['2d'] = { name: a.name, url: a.url, fit: a.fit || null };
+    if (b) out['3d'] = { name: b.name, url: b.url, fit: b.fit || null };
+    setAvatarAssets(out);
+    return out;
+  }
+
+  async function stopAvatarPreview() {
+    setAvatarPreviewOn(false);
+    avatarCamRef.current?.getTracks().forEach(t => { try { t.stop(); } catch {} });
+    avatarCamRef.current = null;
+    const eng = avatarEngineRef.current;
+    avatarEngineRef.current = null;
+    if (eng) { try { await eng.destroy(); } catch {} }
+    if (avatarPrevRef.current) avatarPrevRef.current.srcObject = null;
+  }
+
+  async function startAvatarPreview() {
+    await stopAvatarPreview();
+    const cfg = loadAvatarConfig();
+    if (cfg.mode === 'camera') { setAvatarStatus('Choose a 2D, 3D avatar or an external app camera above to preview it.'); return; }
+    if (cfg.mode === 'external') {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia(externalVideoConstraints(cfg.externalId));
+        if (!stream.getVideoTracks().length) { stream.getTracks().forEach(t => t.stop()); setAvatarStatus('That device has no video track — pick the app’s virtual camera.'); return; }
+        avatarCamRef.current = stream;
+        const v = avatarPrevRef.current;
+        if (v) { v.srcObject = stream; v.play().catch(() => {}); }
+        setAvatarStatus('Showing the external app’s camera feed — calls will send exactly what it renders.');
+        setAvatarPreviewOn(true);
+      } catch (err) {
+        setAvatarStatus(String(err?.name || '').includes('NotAllowed')
+          ? 'Camera permission is blocked — allow it for this site, then try again.'
+          : String(err?.name || '').includes('NotFound') || String(err?.name || '').includes('Overconstrained')
+            ? 'That camera is gone — start the app (VTube Studio / OBS / Snap) and rescan devices.'
+            : 'Could not start that camera: ' + (err?.message || 'unknown error'));
+      }
+      return;
+    }
+    const kind = cfg.mode === '2d' ? '2d' : '3d';
+    const asset = await getAvatarFile(kind);
+    if (!asset) { setAvatarStatus('Upload ' + (kind === '2d' ? 'a picture' : 'a 3D model') + ' first — then it will preview here.'); return; }
+    // The webcam is optional: it only powers face/hand tracking and is never sent.
+    let cam = null;
+    try { cam = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 640 }, height: { ideal: 480 } } }); } catch { cam = null; }
+    avatarCamRef.current = cam;
+    setAvatarStatus('Starting…');
+    const cal = await loadCalibration();
+    const eng = createAvatarEngine({
+      mode: cfg.mode, assetUrl: asset.url, hands: cfg.hands, cameraStream: cam, calibration: cal, fit: asset.fit || null,
+      onStatus: st => { if (avatarEngineRef.current === eng) setAvatarStatus(st === 'tracking' ? '✅ Tracking your face — move to see the avatar react.' + (cal ? ' (calibrated)' : '') : st === 'tracking-or-idle' ? 'Tracking your face…' : st === 'no-camera-idle' ? 'No webcam needed — the avatar animates on its own. Allow the camera for face tracking.' : st === 'no-tracking-idle' ? 'Tracking unavailable — the avatar animates on its own.' : String(st)); },
+    });
+    avatarEngineRef.current = eng;
+    eng.start().catch(() => {});
+    const v = avatarPrevRef.current;
+    if (v) { v.srcObject = eng.stream; v.play().catch(() => {}); }
+    setAvatarPreviewOn(true);
+  }
+
+  async function pickAvatarFile(kind) {
+    avatarFileRef.current[kind]?.click();
+  }
+
+  async function onAvatarFile(kind, ev) {
+    const file = ev.target.files && ev.target.files[0];
+    ev.target.value = '';
+    if (!file) return;
+    if (kind === '3d' && !/\.(glb|vrm)$/i.test(file.name)) { notify('3D avatars must be a .glb or .vrm model file.', 'err'); return; }
+    if (kind === '2d' && !/\.(png|jpe?g|webp|gif)$/i.test(file.name)) { notify('2D avatars must be a picture (PNG/JPG/WebP/GIF).', 'err'); return; }
+    if (file.size > 40 * 1024 * 1024) { notify('That file is too large (max 40 MB).', 'err'); return; }
+    try {
+      await saveAvatarFile(kind, file);
+      await refreshAvatarAssets();
+      notify((kind === '2d' ? 'Picture' : '3D model') + ' saved — use it as your avatar by picking the mode above.');
+      if (loadAvatarConfig().mode === (kind === '2d' ? '2d' : '3d')) startAvatarPreview();
+    } catch { notify('Could not save that file on this device.', 'err'); }
+  }
+
+  async function removeAvatarAsset(kind) {
+    try { await removeAvatarFile(kind); } catch {}
+    if (avatarEngineRef.current && loadAvatarConfig().mode === (kind === '2d' ? '2d' : '3d')) await stopAvatarPreview();
+    await refreshAvatarAssets();
+    notify('Avatar ' + (kind === '2d' ? 'picture' : 'model') + ' removed.');
+  }
+
+  async function setAvatarMode(mode) {
+    const next = { ...avatarCfg, mode };
+    setAvatarCfg(next);
+    saveAvatarConfig(next);
+    if (mode === 'camera') { await stopAvatarPreview(); setAvatarStatus(''); }
+    else if (mode === 'external') { await stopAvatarPreview(); refreshDevices(); setAvatarStatus('Pick the app’s virtual camera below — VTube Studio, OBS, Snap Camera etc. ("External app").'); }
+    else startAvatarPreview();
+  }
+
+  // ── 2D avatar feature-fit editor (eyes on the picture) ───────────────────────────────────────────────────────────────────────────
+  const [fitOpen, setFitOpen] = useState(false);
+  const [fitDraft, setFitDraft] = useState(null); // { leftEye:{x,y}, rightEye:{x,y} } normalized to the image
+  const fitDragRef = useRef(null); // 'left' | 'right' while dragging
+  const fitImgRef = useRef(null);
+
+  const defaultFit = () => ({ leftEye: { x: 0.36, y: 0.42 }, rightEye: { x: 0.64, y: 0.42 } });
+
+  function openFitEditor() {
+    const asset = avatarAssets['2d'];
+    setFitDraft(asset && asset.fit ? { leftEye: { ...asset.fit.leftEye }, rightEye: { ...asset.fit.rightEye } } : defaultFit());
+    setFitOpen(true);
+  }
+
+  async function saveFit() {
+    if (!fitDraft) return;
+    try { await saveAvatarFit('2d', { leftEye: fitDraft.leftEye, rightEye: fitDraft.rightEye }); } catch { notify('Could not save the fit on this device.', 'err'); return; }
+    await refreshAvatarAssets();
+    setFitOpen(false);
+    notify('Avatar face fit saved — its eyes now track yours.');
+    if (avatarEngineRef.current && avatarPreviewOn && loadAvatarConfig().mode === '2d') { try { startAvatarPreview(); } catch {} }
+  }
+
+  function fitPointer(e, which) {
+    if (!fitDraft || !fitImgRef.current) return;
+    const rect = fitImgRef.current.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+    const x = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+    const y = Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height));
+    setFitDraft(d => ({ ...d, [which]: { x: +x.toFixed(3), y: +y.toFixed(3) } }));
+  }
+
+  function onFitMove(e) { if (fitDragRef.current) fitPointer(e, fitDragRef.current); }
+  function onFitUp() { fitDragRef.current = null; }
+
+  function onFitDown(e, which) {
+    fitDragRef.current = which;
+    fitPointer(e, which);
+    try { e.currentTarget.setPointerCapture(e.pointerId); } catch {}
+  }
+
+  function resetFit() { setFitDraft(defaultFit()); }
+
+  // ── Avatar tracking calibration wizard ────────────────────────────────────────────────────────────
+  // Each person's neutral head-hold and expression ranges differ, so a short
+  // guided capture (neutral pose, then eyes-closed / open-mouth / smile /
+  // brows-up, then a hands check) records min/max ranges that stretch the
+  // user's real movement across the avatar's full range of motion.
+  const CAL_STAGES = ['pose', 'blink', 'mouth', 'smile', 'brows', 'hands'];
+  const CAL_META = [
+    { id: 'pose', icon: '🧍', label: 'Neutral pose', tip: 'Face the camera, head straight, relaxed face. We record where your eyes, nose and mouth sit so the avatar lines up with you.' },
+    { id: 'blink', icon: '😑', label: 'Close your eyes', tip: 'Squeeze both eyes shut for a moment, then relax.', channels: ['eyeBlinkL', 'eyeBlinkR', 'eyeSquintL', 'eyeSquintR'] },
+    { id: 'mouth', icon: '😮', label: 'Open your mouth wide', tip: 'A big yawn-sized opening.', channels: ['jawOpen'] },
+    { id: 'smile', icon: '😁', label: 'Big smile', tip: 'A wide grin — show teeth if you can.', channels: ['mouthSmileL', 'mouthSmileR'] },
+    { id: 'brows', icon: '🤨', label: 'Raise your eyebrows', tip: 'Look surprised.', channels: ['browInnerUp', 'browOuterUpL', 'browOuterUpR'] },
+    { id: 'hands', icon: '🖐️', label: 'Show your hands', tip: 'Raise both hands, palms facing the camera, fingers apart.', channels: [] },
+  ];
+  const [calOpen, setCalOpen] = useState(false);
+  const [calBusy, setCalBusy] = useState(false);
+  const [calMsg, setCalMsg] = useState('');
+  const [calStream, setCalStream] = useState(null);
+  const [calRecs, setCalRecs] = useState({});
+  const [calHas, setCalHas] = useState(false);
+  const calEngRef = useRef(null);
+  const calCamRef = useRef(null);
+  const calDataRef = useRef(null);
+  const waitMs = ms => new Promise(r => setTimeout(r, ms));
+  async function openCalibration() {
+    if (calOpen) return;
+    setCalOpen(true);
+    setCalBusy(false);
+    setCalMsg('Starting your camera…');
+    setCalRecs({});
+    calDataRef.current = { pose: null, base: {}, peaks: {} };
+    setCalHas(!!(await loadCalibration()));
+    let cam = null;
+    try { cam = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 640 }, height: { ideal: 480 } } }); } catch { cam = null; }
+    calCamRef.current = cam;
+    const eng = createAvatarEngine({
+      mode: '2d', rawOverlay: true, hands: true, cameraStream: cam,
+      onStatus: st => { if (calEngRef.current === eng) setCalMsg(st === 'tracking' ? 'Face found — the rings should sit on your eyes and mouth. Now run each capture below.' : st === 'no-tracking-idle' ? 'Tracking unavailable — allow the camera and try again.' : st === 'no-camera-idle' ? 'No camera access — the wizard cannot see you. Allow camera permission in the browser and reopen this.' : String(st)); },
+    });
+    calEngRef.current = eng;
+    setCalStream(eng.stream);
+    eng.start().catch(() => {});
+    setCalMsg('Waiting for your camera… center your face in the frame.');
+  }
+
+  async function closeCalibration() {
+    if (!calOpen) return;
+    setCalOpen(false);
+    setCalStream(null);
+    setCalMsg('');
+    const eng = calEngRef.current; calEngRef.current = null;
+    if (eng) { try { await eng.destroy(); } catch {} }
+    const cam = calCamRef.current; calCamRef.current = null;
+    if (cam) { try { cam.getTracks().forEach(t => t.stop()); } catch {} }
+    setCalHas(!!(await loadCalibration()));
+  }
+
+  /** Poll N calibration samples; cb returns per-sample data. */
+  async function collectSamples(n, every, cb) {
+    const out = [];
+    for (let i = 0; i < n; i++) {
+      const snap = calEngRef.current && calEngRef.current.calibrationSample();
+      try { out.push(cb(snap)); } catch {}
+      await waitMs(every);
+    }
+    return out;
+  }
+
+  async function capturePose() {
+    setCalBusy(true);
+    setCalMsg('Keep your head still, face straight on, relaxed…');
+    const poses = [], blists = [];
+    await collectSamples(16, 110, snap => { if (snap) { if (snap.pose && snap.landmarks) poses.push(snap.pose); if (snap.blends) blists.push(snap.blends); } });
+    setCalBusy(false);
+    if (poses.length < 7) { setCalMsg('⚠️ We could not see your face clearly. Face the camera in good light, head fully in frame, then capture again.'); return; }
+    const avg = (arr, k) => arr.reduce((x, p) => x + (p[k] || 0), 0) / arr.length;
+    calDataRef.current.pose = {
+      yaw: avg(poses, 'yaw'), pitch: avg(poses, 'pitch'), roll: avg(poses, 'roll'),
+      noseX: avg(poses, 'noseX'), noseY: avg(poses, 'noseY'),
+    };
+    // Neutral baseline per channel: 30th percentile (a stray blink mid-capture
+    // must not inflate the resting value).
+    const base = {};
+    blists.forEach(b => Object.entries(b).forEach(([k, v]) => { (base[k] = base[k] || []).push(v); }));
+    const lows = {};
+    Object.entries(base).forEach(([k, arr]) => {
+      const sorted = arr.slice().sort((a, b) => a - b);
+      lows[k] = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.3))] || 0;
+    });
+    calDataRef.current.base = lows;
+    setCalRecs(r => ({ ...r, pose: '✓ Neutral captured' }));
+    setCalMsg('Neutral pose saved — the avatar will face straight when you relax. Now capture each expression below.');
+  }
+
+  async function captureExpr(id) {
+    const meta = CAL_META.find(m => m.id === id);
+    if (!meta) return;
+    setCalBusy(true);
+    setCalMsg('Hold it: ' + meta.label.toLowerCase() + '…');
+    const peaks = {};
+    let good = 0;
+    await collectSamples(12, 110, snap => {
+      if (!snap || !snap.blends) return;
+      good++;
+      Object.entries(snap.blends).forEach(([k, v]) => { peaks[k] = Math.max(peaks[k] || 0, v); });
+    });
+    setCalBusy(false);
+    if (good < 6) { setCalMsg('⚠️ We lost your face mid-capture — keep your head in frame and capture again.'); return; }
+    const peak = Math.max(...(meta.channels || []).map(c => peaks[c] || 0));
+    if (peak < 0.18) {
+      setCalMsg('⚠️ That read as only ' + Math.round(peak * 100) + '% on "' + meta.label.toLowerCase() + '" — the avatar would barely move. Try again with more of the expression.');
+      return;
+    }
+    calDataRef.current.peaks[id] = peaks;
+    setCalRecs(r => ({ ...r, [id]: '✓ ' + Math.round(peak * 100) + '%' }));
+    const idx = CAL_STAGES.indexOf(id);
+    if (idx >= 0 && idx < CAL_STAGES.length - 1) setCalMsg(CAL_META[idx + 1].tip + ' Capture it when ready.');
+    else setCalMsg('');
+  }
+
+  async function captureHands() {
+    setCalBusy(true);
+    setCalMsg('Raise both hands, palms facing the camera, fingers spread…');
+    const counts = await collectSamples(12, 110, snap => (snap && snap.hands) ? snap.hands.length : 0);
+    setCalBusy(false);
+    const saw = counts.filter(n => n >= 1).length;
+    const both = counts.filter(n => n >= 2).length;
+    if (saw < 7) { setCalMsg('⚠️ We could not see your hands. Raise them into the frame, palms open, fingers apart, then capture again.'); return; }
+    calDataRef.current.hands = { seen: both / counts.length };
+    setCalRecs(r => ({ ...r, hands: both >= 3 ? '✓ Both hands seen' : '✓ Hands seen' }));
+    setCalMsg('Everything is captured — review the list, then hit "Save calibration".');
+  }
+
+  const allCalCaptured = () => CAL_STAGES.every(id => calRecs[id]);
+
+  async function saveCalibrationNow() {
+    const d = calDataRef.current;
+    if (!d.pose) { setCalMsg('Capture your neutral pose first.'); return; }
+    if (!allCalCaptured()) { setCalMsg('Finish (or redo) every capture above first.'); return; }
+    setCalBusy(true);
+    const channels = {};
+    const loOf = ch => (d.base[ch] !== undefined ? Math.min(d.base[ch], 0.3) : 0);
+    CAL_META.filter(m => m.channels.length).forEach(meta => {
+      const pk = d.peaks[meta.id]; if (!pk) return;
+      meta.channels.forEach(ch => {
+        const lo = +loOf(ch).toFixed(3);
+        const hi = +(Math.max(pk[ch] || 0, lo + 0.05)).toFixed(3);
+        channels[ch] = { min: lo, max: hi };
+      });
+    });
+    const cal = { pose: d.pose, channels, hands: d.hands || { seen: 0 }, savedAt: Date.now() };
+    try { await saveCalibration(cal); } catch { setCalBusy(false); setCalMsg('⚠️ Could not save the calibration on this device.'); return; }
+    const eng = avatarEngineRef.current;
+    if (eng) { try { eng.setCalibration(cal); } catch {} }
+    setCalBusy(false);
+    setCalHas(true);
+    setCalRecs(r => ({ ...r, saved: '✓ Calibration saved' }));
+    notify('Tracking calibration saved — expressions will now drive your avatar at full strength.');
+    if (avatarEngineRef.current && avatarPreviewOn) { try { startAvatarPreview(); } catch {} }
+  }
+
+  async function resetCalibration() {
+    calDataRef.current = { pose: null, base: {}, peaks: {} };
+    await clearCalibration();
+    const eng = avatarEngineRef.current;
+    if (eng) { try { eng.setCalibration(null); } catch {} }
+    setCalRecs({});
+    setCalHas(false);
+    setCalMsg('Calibration cleared — start over whenever you are ready.');
+    notify('Tracking calibration cleared.');
+  }
 
   // ── Voice & Video devices (per machine, kept in localStorage) ──────────────
   const [mediaPrefs, setMediaPrefs] = useState(loadMediaPrefs);
@@ -143,10 +483,12 @@ export default function Settings({ me, boot, onClose, onSave, currentTheme, onTh
       refreshDevices();
     })();
     navigator.mediaDevices?.addEventListener?.('devicechange', refreshDevices);
+    refreshAvatarAssets();
     return () => {
       navigator.mediaDevices?.removeEventListener?.('devicechange', refreshDevices);
       stopMicTestStream();
       stopCamPreview();
+      stopAvatarPreview();
     };
   }, [tab]);
 
@@ -407,8 +749,48 @@ export default function Settings({ me, boot, onClose, onSave, currentTheme, onTh
     setSelectedInterests(prev => prev.includes(i) ? prev.filter(x => x !== i) : [...prev, i]);
   }
 
+  async function exportData() {
+    setErr(''); setSaved(''); setExporting(true);
+    try {
+      const r = await fetch('/api/me/export', { headers: { Authorization: 'Bearer ' + getToken() } });
+      if (!r.ok) {
+        let msg = 'Export failed';
+        try { const d = await r.json(); if (d && d.error) msg = d.error; } catch {}
+        setErr(msg);
+        return;
+      }
+      const blob = await r.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'unknown-data-' + String((me && me.username) || 'user').replace(/[^A-Za-z0-9_-]/g, '') + '.json';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+      setSaved('Your data archive is downloading.');
+    } catch { setErr('Export failed - try again.'); }
+    finally { setExporting(false); }
+  }
+
+  async function deleteAccount() {
+    setErr(''); setSaved(''); setDeleteBusy(true);
+    try {
+      const d = await api('/api/me', { method: 'DELETE', body: JSON.stringify({ password: delPassword }) });
+      if (d.ok) {
+        try { sessionStorage.removeItem('token'); } catch {}
+        try { localStorage.removeItem('rememberToken'); } catch {}
+        location.reload();
+      } else {
+        setErr(d.error || 'Could not delete the account');
+        setDelPassword('');
+      }
+    } catch { setErr('Could not delete the account'); }
+    finally { setDeleteBusy(false); }
+  }
   const TABS = [
     { id: 'account',      emoji: '👤', label: 'Account' },
+    { id: 'security',     emoji: '🔑', label: 'Security' },
     { id: 'ranks',        emoji: '🏆', label: 'Ranks & perks' },
     { id: 'privacy',      emoji: '🔒', label: 'Privacy' },
     { id: 'notifications',emoji: '🔔', label: 'Notifications' },
@@ -419,6 +801,82 @@ export default function Settings({ me, boot, onClose, onSave, currentTheme, onTh
     { id: 'checkup',      emoji: '🕵️', label: 'Privacy Checkup' },
     { id: 'support',      emoji: '💬', label: 'Support' },
   ];
+
+  // ── Security tab logic ───────────────────────────────────────────────────
+  async function loadSecurity() {
+    try {
+      const status = await api('/api/me/2fa/status');
+      if (typeof status.enabled === 'boolean') setTotpEnabled(status.enabled);
+      const list = await api('/api/me/sessions');
+      if (Array.isArray(list)) setSessions(list);
+    } catch {}
+    setSessionsLoaded(true);
+  }
+  const secNotice = (m) => { setSecMsg(m); setSecError(''); };
+  const secFail = (m) => { setSecError(m); setSecMsg(''); };
+  async function beginSetup(e) {
+    e.preventDefault();
+    setSecBusy(true); setSecMsg(''); setSecError('');
+    try {
+      const d = await api('/api/me/2fa/setup', { method: 'POST', body: JSON.stringify({ password: secPassword }) });
+      if (d.error) return secFail(d.error);
+      setSetupPending({ secret: d.secret, otpauthUrl: d.otpauthUrl, account: d.account });
+      setVerifyCode('');
+      setSecPassword('');
+    } finally { setSecBusy(false); }
+  }
+  async function enableTotp(e) {
+    e.preventDefault();
+    setSecBusy(true); setSecMsg(''); setSecError('');
+    try {
+      const d = await api('/api/me/2fa/enable', { method: 'POST', body: JSON.stringify({ code: verifyCode.trim() }) });
+      if (d.error) return secFail(d.error);
+      setTotpEnabled(true);
+      setSetupPending(null);
+      setVerifyCode('');
+      setRecoveryCodes(d.recoveryCodes || []);
+      await loadSecurity();
+    } finally { setSecBusy(false); }
+  }
+  async function disableTotp(e) {
+    e.preventDefault();
+    setSecBusy(true); setSecMsg(''); setSecError('');
+    try {
+      const d = await api('/api/me/2fa/disable', { method: 'POST', body: JSON.stringify({ password: disablePassword, code: disableCode.trim() }) });
+      if (d.error) return secFail(d.error);
+      setTotpEnabled(false);
+      setDisablePassword(''); setDisableCode('');
+      setRecoveryCodes(null);
+      secNotice('Two-factor authentication is now off.');
+      await loadSecurity();
+    } finally { setSecBusy(false); }
+  }
+  async function revokeSession(id) {
+    const d = await api('/api/me/sessions/revoke', { method: 'POST', body: JSON.stringify({ sessionId: id }) });
+    if (d.error) return secFail(d.error);
+    setSessions(s => s.filter(x => x.id !== id));
+  }
+  async function revokeOtherSessions() {
+    const d = await api('/api/me/sessions/revoke-others', { method: 'POST', body: '{}' });
+    if (d.error) return secFail(d.error);
+    setSessions(s => s.filter(x => x.current));
+    secNotice('Signed out of every other device.');
+  }
+  useEffect(() => {
+    if (tab === 'security') loadSecurity();
+  }, [tab]);
+
+  const ago = (iso) => {
+    if (!iso) return 'never';
+    const ms = Date.now() - new Date(String(iso).replace(' ', 'T')).getTime();
+    if (!(ms >= 0)) return 'just now';
+    const m = Math.floor(ms / 60000);
+    if (m < 1) return 'just now';
+    if (m < 60) return m + ' min ago';
+    const h = Math.floor(m / 60);
+    if (h < 24) return h + 'h ago';
+    return Math.floor(h / 24) + 'd ago';
+  };
 
   return (
     <div className="settings-overlay" onClick={onClose}>
@@ -431,7 +889,7 @@ export default function Settings({ me, boot, onClose, onSave, currentTheme, onTh
               <span className="settings-tab-label">{t.label}</span>
             </button>
           ))}
-          <button className="settings-tab danger" onClick={onClose} style={{ marginTop: 'auto' }}>✕ Close</button>
+          <button className="settings-tab danger" onClick={onClose} title="Close settings" aria-label="Close settings" style={{ marginTop: 'auto' }}>✕</button>
         </div>
 
         <div className="settings-content">
@@ -460,10 +918,96 @@ export default function Settings({ me, boot, onClose, onSave, currentTheme, onTh
 
               <hr className="settings-hr" />
               <p className="muted-text">Your username: <b>{me?.username}#{me?.tag}</b></p>
+              <hr className="settings-hr" />
+              <h3>Your data</h3>
+              <p className="muted-text">Download a JSON archive of your account: profile, messages, DMs, quest progress, uploads, anonymous identities and more. Nothing is hidden from you.</p>
+              <button type="button" onClick={exportData} disabled={exporting}>{exporting ? 'Preparing archive...' : 'Download my data (JSON)'}</button>
+
+              <hr className="settings-hr" />
+              <h3 style={{ color: 'var(--danger)' }}>Delete account</h3>
+              <p className="muted-text">Permanently deletes your account, your messages, DMs, uploads, quest progress and anonymous identities. Communities you own transfer to another member or are removed if empty. Moderation records are kept for safety. This cannot be undone.</p>
+              <form className="mini" onSubmit={e => { e.preventDefault(); deleteAccount(); }}>
+                <label>Password<input type="password" value={delPassword} onChange={e => setDelPassword(e.target.value)} placeholder="Enter your current password" /></label>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', margin: '0.4rem 0' }}>
+                  <input type="checkbox" checked={delConfirm} onChange={e => setDelConfirm(e.target.checked)} />
+                  <span>I understand everything will be permanently erased.</span>
+                </label>
+                <button type="submit" className="danger-btn" disabled={!delPassword || !delConfirm || deleteBusy}>{deleteBusy ? 'Deleting...' : 'Delete my account'}</button>
+              </form>
             </div>
           )}
 
-          {/* ── Ranks ── */}
+          {/* ── Security ── */}
+          {tab === 'security' && (
+            <div className="settings-section">
+              <h2>Security</h2>
+              {secMsg && <p className="settings-saved">{secMsg}</p>}
+              {secError && <p className="error" role="alert">{secError}</p>}
+
+              <h3>Two-factor authentication</h3>
+              <p className="muted-text">Protect this account with a one-time code from an authenticator app (Google Authenticator, Authy, 1Password…). You will be asked for a code after your password when signing in.</p>
+
+              {!totpEnabled && !setupPending && (
+                <form className="mini" onSubmit={beginSetup}>
+                  <label>Password<input type="password" value={secPassword} onChange={e => setSecPassword(e.target.value)} autoComplete="current-password" placeholder="Confirm your password" /></label>
+                  <button disabled={!secPassword || secBusy}>Turn on two-factor</button>
+                </form>
+              )}
+
+              {!totpEnabled && setupPending && (
+                <div className="mini">
+                  <p className="muted-text">Add the account to your authenticator app with the setup link or secret below, then enter the 6-digit code it shows.</p>
+                  <p className="muted-text">Account: <b>{setupPending.account}</b></p>
+                  <p className="muted-text">Secret: <code>{setupPending.secret}</code></p>
+                  <p className="muted-text">Setup link: <a href={setupPending.otpauthUrl} target="_blank" rel="noreferrer">open in authenticator</a></p>
+                  <form onSubmit={enableTotp}>
+                    <label>6-digit code<input aria-label="Authenticator code" value={verifyCode} onChange={e => setVerifyCode(e.target.value.replace(/[^0-9a-zA-Z-]/g, ''))} placeholder="000000" inputMode="numeric" autoFocus /></label>
+                    <button disabled={verifyCode.trim().length < 6 || secBusy}>Verify and enable</button>
+                    <button type="button" className="ghost" onClick={() => { setSetupPending(null); setSecPassword(''); setSecError(''); }}>Cancel</button>
+                  </form>
+                </div>
+              )}
+
+              {totpEnabled && (
+                <div className="mini">
+                  <p className="settings-saved">✓ Two-factor authentication is on.</p>
+                  <p className="muted-text">To turn it off, enter your password and a current code from your authenticator app.</p>
+                  <form onSubmit={disableTotp}>
+                    <label>Password<input type="password" value={disablePassword} onChange={e => setDisablePassword(e.target.value)} autoComplete="current-password" /></label>
+                    <label>Code<input aria-label="Authenticator code" value={disableCode} onChange={e => setDisableCode(e.target.value.replace(/[^0-9a-zA-Z-]/g, ''))} placeholder="000000" inputMode="numeric" /></label>
+                    <button type="submit" disabled={!disablePassword || disableCode.trim().length < 6 || secBusy}>Turn off two-factor</button>
+                  </form>
+                </div>
+              )}
+
+              {recoveryCodes && (
+                <div className="mini">
+                  <b>Save these recovery codes</b>
+                  <p className="muted-text">Each works once to sign in if you lose your authenticator. Store them somewhere safe — they are shown only this one time.</p>
+                  <pre>{recoveryCodes.join('\n')}</pre>
+                  <button type="button" onClick={() => { navigator.clipboard?.writeText(recoveryCodes.join('\n')).catch(() => {}); secNotice('Recovery codes copied to clipboard.'); }}>Copy codes</button>
+                </div>
+              )}
+
+              <hr className="settings-hr" />
+              <h3>Active sessions</h3>
+              <p className="muted-text">Devices currently signed in to your account. Sign out anything you do not recognize — a new sign-in from an unknown device also sends you a notice.</p>
+              {sessionsLoaded && sessions.length === 0 && <p className="empty-text">No active sessions.</p>}
+              {sessions.map(s => (
+                <div className="settings-toggle-row" key={s.id}>
+                  <div>
+                    <b>{s.device}{s.current && ' (this device)'}</b>
+                    <p>Last active {ago(s.lastSeen || s.createdAt)} · signed in {ago(s.createdAt)}</p>
+                  </div>
+                  {!s.current && <button className="ghost" onClick={() => revokeSession(s.id)}>Sign out</button>}
+                  {s.current && <span className="badge">Current</span>}
+                </div>
+              ))}
+              {sessions.length > 1 && (
+                <button type="button" className="ghost" onClick={revokeOtherSessions}>Log out all other sessions</button>
+              )}
+            </div>
+          )}          {/* ── Ranks ── */}
           {tab === 'ranks' && (
             <div className="settings-section">
               <h2>Ranks & perks</h2>
@@ -659,8 +1203,174 @@ export default function Settings({ me, boot, onClose, onSave, currentTheme, onTh
               <video ref={camPreviewRef} autoPlay muted playsInline style={{ width: '100%', maxHeight: 220, borderRadius: 8, background: '#000', marginTop: '.6rem', display: camOn ? 'block' : 'none' }} />
 
               <hr className="settings-hr" />
+              <h3>🤖 Your avatar — use it instead of your face</h3>
+              <p className="muted-text" style={{ fontSize: '.85rem', marginTop: '.35rem' }}>
+                In video rooms and when you turn the camera on in a call, you can send an animated avatar instead of your real face.
+                Your webcam (if you allow it) is used <b>only on this device</b> to track your face, eyes, mouth and hands — it is never transmitted.
+                Without a camera the avatar still breathes, blinks and talks along with your microphone.
+              </p>
+
+              <div className="avatar-mode-row">
+                {[['camera', '📷', 'Real camera'], ['2d', '🖼️', '2D picture'], ['3d', '🧍', '3D model'], ['external', '🧪', 'External app']].map(([id, ic, label]) => (
+                  <button key={id} className={`avatar-mode-btn${avatarCfg.mode === id ? ' active' : ''}`} onClick={() => setAvatarMode(id)}>
+                    {ic} {label}
+                  </button>
+                ))}
+              </div>
+
+              <div className="avatar-asset-grid">
+                <div className="avatar-asset-card">
+                  <div className="avatar-asset-title">🖼️ 2D picture</div>
+                  <p className="muted-text" style={{ fontSize: '.8rem' }}>PNG / WebP / JPG / GIF. Head-follow, closeness zoom, roll &amp; talking motion. Transparent PNGs look best.</p>
+                  {avatarAssets['2d']
+                    ? <div className="avatar-asset-file"><span>📄 {avatarAssets['2d'].name}</span><button className="avatar-asset-remove" onClick={() => removeAvatarAsset('2d')}>Remove</button></div>
+                    : <button className="avatar-asset-add" onClick={() => pickAvatarFile('2d')}>⬆ Upload picture</button>}
+                </div>
+                <div className="avatar-asset-card">
+                  <div className="avatar-asset-title">🧍 3D model</div>
+                  <p className="muted-text" style={{ fontSize: '.8rem' }}>.glb / .vrm. Full face animation — blink, eyes, brows, mouth — drives the model's morph targets when names match (VRM, ARKit, common exports).</p>
+                  {avatarAssets['3d']
+                    ? <div className="avatar-asset-file"><span>📄 {avatarAssets['3d'].name}</span><button className="avatar-asset-remove" onClick={() => removeAvatarAsset('3d')}>Remove</button></div>
+                    : <button className="avatar-asset-add" onClick={() => pickAvatarFile('3d')}>⬆ Upload model</button>}
+                </div>
+              </div>
+
+              {avatarAssets['2d'] && (
+                <div className="avatar-fit-toggle">
+                  <button onClick={openFitEditor}>🎯 {avatarAssets['2d'].fit ? "Refit avatar's eyes (fitted ✓)" : "Fit avatar's eyes"}</button>
+                  <span className="muted-text" style={{ fontSize: '.78rem' }}>
+                    If the picture's face is not centered, drag the markers onto its eyes so head-follow, closeness and turns pivot from its real face (like avatar software fitting).
+                  </span>
+                </div>
+              )}
+
+              {fitOpen && avatarAssets['2d'] && (
+                <div className="fit-editor">
+                  <b>Drag the markers onto the picture's eyes</b>
+                  <p className="muted-text" style={{ fontSize: '.8rem', margin: '.25rem 0 .5rem' }}>
+                    The ● markers track the picture's left and right eye. When saved, the avatar's eyes pin to the position and size of <i>your</i> tracked eyes.
+                  </p>
+                  <div className="fit-stage" onPointerMove={onFitMove} onPointerUp={onFitUp} onPointerLeave={onFitUp}>
+                    <img ref={fitImgRef} src={avatarAssets['2d'].url} alt="Avatar picture for eye fitting" draggable={false} />
+                    {fitDraft && (
+                      <>
+                        <button className="fit-marker fit-left" style={{ left: (fitDraft.leftEye.x * 100) + '%', top: (fitDraft.leftEye.y * 100) + '%' }}
+                          onPointerDown={e => onFitDown(e, 'leftEye')} aria-label="Left eye marker">L</button>
+                        <button className="fit-marker fit-right" style={{ left: (fitDraft.rightEye.x * 100) + '%', top: (fitDraft.rightEye.y * 100) + '%' }}
+                          onPointerDown={e => onFitDown(e, 'rightEye')} aria-label="Right eye marker">R</button>
+                      </>
+                    )}
+                  </div>
+                  <div className="fit-actions">
+                    <button onClick={resetFit}>Reset</button>
+                    <button onClick={() => setFitOpen(false)}>Cancel</button>
+                    <button className="cal-save" onClick={saveFit}>Save fit</button>
+                  </div>
+                </div>
+              )}
+
+              {avatarCfg.mode !== 'camera' && (
+                <div className="avatar-preview-block">
+                  {avatarCfg.mode === 'external' && (
+                    <div className="avatar-external-device">
+                      <b>🧪 External avatar app camera</b>
+                      <p className="muted-text" style={{ fontSize: '.82rem', margin: '.2rem 0 .4rem' }}>
+                        Run <b>VTube Studio</b>, <b>OBS</b>, <b>Snap Camera</b> (or any app that offers a virtual camera) and pick its device below.
+                        Calls and video rooms then send <i>exactly what that app renders</i> — no built-in face tracking is involved.
+                        “System default” auto-picks the first virtual camera the browser can find.
+                      </p>
+                      <select
+                        aria-label="External camera app device"
+                        value={mediaDevices.videoinput.some(d => d.id === avatarCfg.externalId) ? avatarCfg.externalId : ''}
+                        onChange={async (e) => {
+                          const next = { ...avatarCfg, externalId: e.target.value };
+                          setAvatarCfg(next);
+                          saveAvatarConfig(next);
+                          if (avatarPreviewOn) startAvatarPreview();
+                        }}
+                      >
+                        <option value="">System default (auto-detect virtual camera)</option>
+                        {(mediaDevices.videoinput || []).filter(d => d.id && d.id !== 'default' && d.id !== 'communications').map(d => (
+                          <option key={d.id} value={d.id}>{d.label || 'Unnamed device'}{isVirtualCamLabel(d.label) ? ' (virtual cam)' : ''}</option>
+                        ))}
+                      </select>
+                      {(!mediaDevices.videoinput || mediaDevices.videoinput.length === 0) && (
+                        <p className="muted-text" role="status" style={{ fontSize: '.8rem' }}>No cameras found — press 🔄 Scan (or allow camera access), start the app, then scan again.</p>
+                      )}
+                    </div>
+                  )}
+                  <div className="settings-toggle-row">
+                    <button onClick={startAvatarPreview} disabled={avatarPreviewOn || (avatarCfg.mode === 'external' ? !(mediaDevices.videoinput && mediaDevices.videoinput.length) : !(avatarCfg.mode === '2d' ? avatarAssets['2d'] : avatarAssets['3d']))}>
+                      {avatarPreviewOn ? '▶ Previewing…' : (avatarCfg.mode === 'external' ? '▶ Preview external camera' : '▶ Preview avatar')}
+                    </button>
+                    {avatarPreviewOn && <button onClick={() => stopAvatarPreview()}>⏹ Stop preview</button>}
+                    {avatarCfg.mode !== 'external' && (
+                      <label className="avatar-hands-label">
+                        <input type="checkbox" checked={avatarCfg.hands} onChange={async (e) => { const next = { ...avatarCfg, hands: e.target.checked }; setAvatarCfg(next); saveAvatarConfig(next); const eng = avatarEngineRef.current; if (eng) { try { eng.setHands(next.hands); } catch {} } }} />
+                        <span>Show tracked hands 🖐️</span>
+                      </label>
+                    )}
+                  </div>
+                  {avatarStatus && <p className="muted-text avatar-status" role="status">{avatarStatus}</p>}
+                  {avatarCfg.mode !== 'external' && (
+                    <div className="settings-toggle-row" style={{ alignItems: 'center', flexWrap: 'wrap' }}>
+                      <button onClick={openCalibration} disabled={calOpen}>📏 Calibrate tracking{calHas ? ' (calibrated ✓)' : ''}</button>
+                      <span className="muted-text" style={{ fontSize: '.8rem' }}>
+                        A 30-second guided setup — neutral pose, eyes-closed, open mouth, smile, brows, hands — so the tracker stretches <i>your</i> real ranges across the avatar's full motion.
+                      </span>
+                    </div>
+                  )}
+                  <video ref={avatarPrevRef} autoPlay muted playsInline style={{ display: avatarPreviewOn ? 'block' : 'none', width: '100%', maxHeight: 240, borderRadius: 10, background: '#0b0b12', marginTop: '.5rem', transform: 'scaleX(-1)' }} />
+                </div>
+              )}
+
+              <hr className="settings-hr" />
               <h3>Need help?</h3>
-              <p className="muted-text" style={{ fontSize: '.82rem' }}>If a device doesn't appear, make sure it is connected and that this site has permission to use it (the 🔄 Scan button asks for access). Video calls currently route your chosen camera for self-preview; direct calls carry audio through the speaker you pick here.</p>
+              <p className="muted-text" style={{ fontSize: '.82rem' }}>If a device doesn't appear, make sure it is connected and that this site has permission to use it (the 🔄 Scan button asks for access). When an avatar mode is active above, calls send your avatar instead of the camera.</p>
+              {calOpen && (
+                <div className="cal-overlay" role="dialog" aria-modal="true" aria-label="Calibrate avatar tracking">
+                  <div className="cal-modal">
+                    <div className="cal-head">
+                      <h3 style={{ margin: 0 }}>📏 Calibrate your avatar tracking</h3>
+                      <button className="cal-close" onClick={closeCalibration} aria-label="Close">✕</button>
+                    </div>
+                    <p className="muted-text" style={{ fontSize: '.83rem', margin: '.35rem 0 .7rem' }}>
+                      The rings show where the tracker sees your <b>eyes, pupils, mouth and hands</b> — if they sit on the right spots, run the six captures below. Each capture only takes a second and you can redo any of them.
+                    </p>
+                    <div className="cal-body">
+                      <div className="cal-stage">
+                        <video className="cal-video" ref={el => { if (el && el.srcObject !== calStream) el.srcObject = calStream; }} autoPlay muted playsInline />
+                        <div className="cal-msg" role="status">{calMsg}</div>
+                        {calHas && <div className="cal-has">✓ You already have a saved calibration — redo it any time for a better fit.</div>}
+                      </div>
+                      <div className="cal-steps">
+                        {CAL_META.map((m, i) => (
+                          <div key={m.id} className={'cal-step' + (calRecs[m.id] ? ' done' : '')}>
+                            <span className="cal-step-icon">{m.icon}</span>
+                            <div className="cal-step-info">
+                              <b>{i + 1}. {m.label}</b>
+                              <p>{m.tip}</p>
+                            </div>
+                            <button className="cal-capture" disabled={calBusy}
+                              onClick={() => { m.id === 'pose' ? capturePose() : m.id === 'hands' ? captureHands() : captureExpr(m.id); }}>
+                              {calBusy ? '…' : calRecs[m.id] ? 'Redo' : 'Capture'}
+                            </button>
+                            {calRecs[m.id] && <span className="cal-step-done">{calRecs[m.id]}</span>}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                    <div className="cal-foot">
+                      <button onClick={resetCalibration} disabled={calBusy}>🗑 Reset calibration</button>
+                      <span style={{ flex: 1 }} />
+                      <button onClick={closeCalibration} disabled={calBusy}>Cancel</button>
+                      <button className="cal-save" onClick={saveCalibrationNow} disabled={calBusy || !allCalCaptured()}>💾 Save calibration</button>
+                    </div>
+                  </div>
+                </div>
+              )}
+              <input ref={el => { avatarFileRef.current['2d'] = el; }} type="file" accept=".png,.jpg,.jpeg,.webp,.gif,image/*" style={{ display: 'none' }} onChange={(e) => onAvatarFile('2d', e)} />
+              <input ref={el => { avatarFileRef.current['3d'] = el; }} type="file" accept=".glb,.vrm,model/gltf-binary" style={{ display: 'none' }} onChange={(e) => onAvatarFile('3d', e)} />
             </div>
           )}
 

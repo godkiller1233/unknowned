@@ -15,6 +15,11 @@ import { stripImageMetadata } from './metadata.js';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
+import net from 'net';
+import { randomBytes } from 'crypto';
+import { generateSecret, verifyCode, otpauthUri, generateRecoveryCodes, hashRecoveryCode } from './totp.js';
+import dgram from 'dgram';
+import dns from 'dns/promises';
 
 const { Pool } = pg;
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -45,6 +50,153 @@ const PRIVILEGED_ACCOUNT_CONFIG = Object.freeze([
 const configuredPrivilegedAccounts = PRIVILEGED_ACCOUNT_CONFIG.filter(account => account.username && account.password && account.password !== 'change-me');
 const uploadDir = process.env.UPLOAD_DIR || path.join(root, 'uploads');
 fs.mkdirSync(uploadDir, { recursive: true });
+
+// ── WebRTC / TURN ──────────────────────────────────────────────────────────────
+// Operators behind restrictive NATs configure a TURN server so voice/video calls
+// can relay. TURN_URLS is a comma-separated list of urls (turn:/turns:), e.g.
+//   TURN_URLS=turn:turn.example.com:3478?transport=udp,turn:turn.example.com:3478?transport=tcp,turns:turn.example.com:5349?transport=tcp
+// When TURN_USERNAME/TURN_CREDENTIAL are set they are sent on every TURN url.
+// The public STUN fallback is always included so host/server-reflexive
+// candidates still work when clients are not behind symmetric NAT.
+const RTC_SETTING_KEYS = ['rtc_turn_urls', 'rtc_turn_username', 'rtc_turn_credential'];
+
+// Environment fallback (initial value / used when the DB value is cleared).
+function envRtcValues() {
+  return {
+    turnUrls: String(process.env.TURN_URLS || ''),
+    username: process.env.TURN_USERNAME || '',
+    credential: process.env.TURN_CREDENTIAL || '',
+  };
+}
+
+// Effective relay config: values stored in the shared PostgreSQL database win;
+// the environment variables are the fallback. Read on every bootstrap/health
+// call (cheap single-row lookups), so a change saved on one instance is served
+// by every other instance immediately — no restart, no per-instance env drift.
+async function effectiveRtcValues() {
+  let rows = [];
+  try {
+    rows = await store.all(`SELECT key, value FROM server_settings WHERE key IN (${RTC_SETTING_KEYS.map(() => '?').join(',')})`, ...RTC_SETTING_KEYS);
+  } catch {
+    // DB not reachable / not initialized yet — fall back to the environment.
+  }
+  const db = new Map(rows.filter(r => r && r.value).map(r => [r.key, r.value]));
+  const env = envRtcValues();
+  return {
+    turnUrls: db.get('rtc_turn_urls') || env.turnUrls,
+    username: db.get('rtc_turn_username') || env.username,
+    credential: db.get('rtc_turn_credential') || env.credential,
+  };
+}
+
+async function rtcIceServers() {
+  const { turnUrls: raw, username, credential } = await effectiveRtcValues();
+  const turnUrls = String(raw || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(s => /^turns?:(?:\/\/)?/i.test(s));
+  const servers = [{ urls: ['stun:stun.l.google.com:19302'] }];
+  if (turnUrls.length) {
+    servers.push(username && credential
+      ? { urls: turnUrls, username, credential }
+      : { urls: turnUrls });
+  }
+  return servers;
+}
+
+// ── RTC health ─────────────────────────────────────────────────────────────────
+// Operator-facing diagnostics for voice/video calls. Unlike /api/health (a DB
+// liveness ping) this endpoint reports whether a TURN relay is configured and —
+// without any credentials in the response — whether it answers. UDP TURN urls
+// are probed with a real STUN binding request (TURN servers answer those from
+// the same port); TCP/TLS urls with a TCP connect. A STUN-only server is
+// reported as "degraded": most calls work, but clients behind symmetric NAT
+// cannot connect until the operator configures a relay.
+const RTC_PROBE_TIMEOUT = 2500;
+
+function parseTurnUrl(url) {
+  const m = /^turns?:(?:\/\/)?([^:/?#]+)(?::(\d+))?(?:\?(.*))?$/i.exec(url);
+  if (!m) return null;
+  const scheme = /^turns:/i.test(url) ? 'turns' : 'turn';
+  const q = new URLSearchParams(m[3] || '');
+  return {
+    url,
+    host: m[1],
+    port: Number(m[2]) || (scheme === 'turns' ? 5349 : 3478),
+    scheme,
+    transport: (q.get('transport') || 'udp').toLowerCase(),
+  };
+}
+
+function stunProbeUdp(host, port, timeoutMs) {
+  return new Promise(resolve => {
+    const sock = dgram.createSocket('udp4');
+    const done = ok => { try { sock.close(); } catch {}; resolve(ok); };
+    const timer = setTimeout(() => done(false), timeoutMs);
+    sock.once('message', buf => {
+      clearTimeout(timer);
+      // A TURN server answers STUN binding requests; the magic cookie round-trips.
+      const ok = buf.length >= 20 && buf.readUInt32BE(4) === 0x2112a442;
+      done(ok);
+    });
+    sock.once('error', () => { clearTimeout(timer); done(false); });
+    const msg = Buffer.alloc(20);
+    msg.writeUInt16BE(0x0001, 0); // binding request
+    msg.writeUInt16BE(0, 2);
+    msg.writeUInt32BE(0x2112a442, 4); // magic cookie
+    randomBytes(12).copy(msg, 8);
+    try { sock.send(msg, port, host); } catch { clearTimeout(timer); done(false); }
+  });
+}
+
+function tcpProbe(host, port, timeoutMs) {
+  return new Promise(resolve => {
+    const sock = net.connect({ host, port });
+    const done = ok => { sock.destroy(); resolve(ok); };
+    sock.setTimeout(timeoutMs, () => done(false));
+    sock.once('connect', () => done(true));
+    sock.once('error', () => done(false));
+  });
+}
+
+async function probeTurnUrl(url) {
+  const parsed = parseTurnUrl(url);
+  if (!parsed) return { url, reachable: false, note: 'malformed url' };
+  const { host, port, scheme, transport } = parsed;
+  try {
+    await Promise.race([
+      dns.lookup(host),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('dns timeout')), RTC_PROBE_TIMEOUT)),
+    ]);
+  } catch {
+    return { url, host, port, scheme, transport, reachable: false, note: 'dns failed' };
+  }
+  let reachable;
+  let note;
+  if (transport === 'tcp' || scheme === 'turns') {
+    reachable = await tcpProbe(host, port, RTC_PROBE_TIMEOUT);
+    note = reachable ? 'tcp reachable' : 'tcp connect failed';
+  } else {
+    reachable = await stunProbeUdp(host, port, RTC_PROBE_TIMEOUT);
+    note = reachable ? 'stun binding answered' : 'udp stun request timed out';
+  }
+  return { url, host, port, scheme, transport, reachable, note };
+}
+
+async function rtcHealthReport() {
+  const servers = await rtcIceServers();
+  const turnUrls = [];
+  for (const s of servers) for (const u of s.urls || []) if (/^turns?:/i.test(String(u))) turnUrls.push(String(u));
+  const urls = await Promise.all(turnUrls.map(probeTurnUrl));
+  const configured = turnUrls.length > 0;
+  const reachable = configured ? urls.every(u => u.reachable === true) : null;
+  return {
+    ok: configured && reachable,   // fully healthy only with an answering relay
+    degraded: !configured,         // STUN-only: works for most, fails behind symmetric NAT
+    stun: { configured: true },
+    turn: { configured, reachable, urls },
+  };
+}
 
 // ── DB ────────────────────────────────────────────────────────────────────────
 function toPostgres(sql) {
@@ -89,9 +241,17 @@ async function initializeDb() {
       user_id TEXT NOT NULL,
       created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
       expires_at TIMESTAMPTZ NOT NULL,
-      revoked_at TIMESTAMPTZ
+      revoked_at TIMESTAMPTZ,
+      device TEXT DEFAULT '',
+      last_seen TIMESTAMPTZ
     );
     CREATE INDEX IF NOT EXISTS auth_sessions_user_idx ON auth_sessions(user_id);
+    CREATE TABLE IF NOT EXISTS server_settings (
+      key TEXT PRIMARY KEY,
+      value TEXT,
+      updated_by TEXT,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
     CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY, username TEXT UNIQUE, tag TEXT, password_hash TEXT,
       nickname TEXT, avatar TEXT, banner TEXT, bio TEXT DEFAULT '',
@@ -479,6 +639,11 @@ async function runMigrations() {
     // quest_logs earnedToday/cap queries SUM(reward); the column was missing on
     // PostgreSQL, which made /api/quests and claiming 500 on Postgres deployments.
     ['quest_logs','reward','INTEGER DEFAULT 0'],
+    ['users','totp_secret','TEXT'],
+    ['users','totp_enabled','INTEGER DEFAULT 0'],
+    ['users','recovery_codes','TEXT DEFAULT \'[]\''],
+    ['auth_sessions','device','TEXT DEFAULT \'\''],
+    ['auth_sessions','last_seen','TIMESTAMPTZ'],
   ];
   // seed starter credits for existing users
   try {
@@ -584,7 +749,21 @@ await initDb();
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 const app = express();
-app.use(helmet());
+// Blob/data URLs are required by the avatar feature (IndexedDB-hosted 2D/3D
+// avatar art is loaded as blob: URLs; canvas streams and data: images are used
+// across the media surfaces). Helmet's default CSP only allows 'self'.
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      ...helmet.contentSecurityPolicy.getDefaultDirectives(),
+      'script-src': ["'self'", "'wasm-unsafe-eval'"],
+      'img-src': ["'self'", 'data:', 'blob:'],
+      'media-src': ["'self'", 'blob:', 'data:'],
+      'connect-src': ["'self'", 'blob:'],
+      'worker-src': ["'self'", 'blob:'],
+    },
+  },
+}));
 const allowedOrigins = String(process.env.CORS_ORIGIN || '')
   .split(',').map(value => value.trim()).filter(Boolean);
 // Same-origin deployments do not need CORS. An explicit allowlist is only
@@ -926,6 +1105,105 @@ app.get('/api/health', route(async (_,res) => {
   res.json({ok:true,database:'postgres',service:'unknown-chat-platform'});
 }));
 
+// Operator-facing WebRTC/TURN diagnostics. Returns 200 even when degraded so
+// dashboards can read the flags; never echoes TURN credentials.
+app.get('/api/health/rtc', route(async (_,res) => {
+  res.json(await rtcHealthReport());
+}));
+
+// ── Relay (TURN) settings ─────────────────────────────────────────────────────
+// Operator-editable voice/video relay config, stored in the shared PostgreSQL
+// database so every instance serves the same iceServers. The environment
+// variables remain the fallback when a value is cleared. The credential is
+// write-only: it is never included in any response; the client only learns
+// whether one is configured.
+app.get('/api/admin/rtc', auth, adminOnly, route(async (req,res) => {
+  const { turnUrls, username, credential } = await effectiveRtcValues();
+  const rows = await store.all("SELECT key FROM server_settings WHERE key LIKE 'rtc_%'").catch(() => []);
+  res.json({
+    source: rows.length ? 'db' : 'env',
+    turnUrls: String(turnUrls || ''),
+    username: username || '',
+    credentialConfigured: Boolean(credential),
+    health: await rtcHealthReport(),
+  });
+}));
+
+app.put('/api/admin/rtc', auth, adminOnly, route(async (req,res) => {
+  const urls = String(req.body.turnUrls || '').trim();
+  const username = String(req.body.username || '').trim();
+  const credential = String(req.body.credential || '');
+  const clearCredential = Boolean(req.body.clearCredential);
+  if (urls) {
+    const bad = urls.split(',').map(x => x.trim()).filter(Boolean)
+      .find(x => !/^turns?:(?:\/\/)?[^:/?#\s]+(?::\d+)?(?:\?.*)?$/i.test(x));
+    if (bad) return res.status(400).json({ error: `Invalid TURN url: ${bad}` });
+  }
+  const setOrClear = async (key, value) => {
+    if (value) {
+      await store.run(`INSERT INTO server_settings (key, value, updated_by) VALUES (?,?,?)
+        ON CONFLICT (key) DO UPDATE SET value=excluded.value, updated_by=excluded.updated_by, updated_at=CURRENT_TIMESTAMP`,
+        key, value, req.user.id);
+    } else {
+      await store.run('DELETE FROM server_settings WHERE key=$1', key);
+    }
+  };
+  await setOrClear('rtc_turn_urls', urls);
+  await setOrClear('rtc_turn_username', username);
+  if (clearCredential) await store.run("DELETE FROM server_settings WHERE key='rtc_turn_credential'");
+  else if (credential) await setOrClear('rtc_turn_credential', credential);
+  const effective = await effectiveRtcValues();
+  res.json({
+    ok: true,
+    source: 'db',
+    credentialConfigured: Boolean(effective.credential),
+    health: await rtcHealthReport(),
+  });
+}));
+
+// TOTP second-factor helpers.
+function secretFor(user) {
+  const raw = user.totp_secret || '';
+  try {
+    const s = JSON.parse(raw);
+    if (s && typeof s === 'object' && s.v) return String(s.v);
+  } catch {}
+  // Raw base32 secrets (or any non-JSON value) are accepted as-is.
+  return raw;
+}
+async function consumeRecoveryCode(userId, code) {
+  const u = await store.get('SELECT recovery_codes FROM users WHERE id=$1', userId);
+  if (!u) return false;
+  let list = [];
+  try { list = JSON.parse(u.recovery_codes || '[]'); } catch {}
+  const h = hashRecoveryCode(code);
+  if (!list.includes(h)) return false;
+  await store.run('UPDATE users SET recovery_codes=$1 WHERE id=$2', JSON.stringify(list.filter(x => x !== h)), userId);
+  return true;
+}
+async function verifySecondFactor(user, code) {
+  const clean = String(code || '').replace(/\s/g, '');
+  const secret = secretFor(user);
+  if (secret && verifyCode(secret, clean)) return 'totp';
+  if (/^[A-Za-z0-9]{5}-[A-Za-z0-9]{5}$/.test(clean) && await consumeRecoveryCode(user.id, clean.toUpperCase())) return 'recovery';
+  return null;
+}
+async function noteNewDevice(userId, deviceLabel) {
+  if (!deviceLabel) return;
+  try {
+    // A fresh account is still being set up, so the extra live session is just
+    // the registration tab - only raise the banner once the account has had a
+    // chance to settle and a genuinely new device shows up.
+    const settled = await store.get("SELECT id FROM users WHERE id=$1 AND created_at::timestamptz < CURRENT_TIMESTAMP - INTERVAL '10 minutes'", userId);
+    if (!settled) return;
+    const live = await store.get('SELECT COUNT(*) AS c FROM auth_sessions WHERE user_id=$1 AND revoked_at IS NULL AND expires_at > CURRENT_TIMESTAMP', userId);
+    if (!live || Number(live.c) < 2) return;
+    const body = 'New sign-in from ' + deviceLabel;
+    await createNotification(userId, 'new_login', '', '', body);
+    io.to('user:' + userId).emit('notification', { type: 'new_login', sourceId: '', sourceType: '', body });
+  } catch {}
+}
+
 // ── Auth ──────────────────────────────────────────────────────────────────────
 app.post('/api/register', route(async (req,res) => {
   const username = String(req.body.username||'').replace(/[^\w-]/g,'').slice(0,24);
@@ -942,7 +1220,7 @@ app.post('/api/register', route(async (req,res) => {
       await store.run('INSERT INTO memberships VALUES (?,?,?,?,0) ON CONFLICT DO NOTHING', defaultComm.id, user.id, 'member', null);
     }
     const full = publicUser(await store.get('SELECT * FROM users WHERE id=$1', user.id));
-    res.json({token:await sessions.issue(full), user:full});
+    res.json({token:await sessions.issue(full, { device: String(req.body.device||'').slice(0, 80) }), user:full});
   } catch { res.status(409).json({error:'Username unavailable'}); }
 }));
 
@@ -953,8 +1231,34 @@ app.post('/api/login', route(async (req,res) => {
   if (!u || !bcrypt.compareSync(password, u.password_hash)) return res.status(401).json({error:'Invalid login'});
   if (Number(u.banned)) return res.status(403).json({error:'Account banned'});
   const pu = publicUser(u);
-  res.json({token:await sessions.issue(pu), user:pu});
+  if (Number(u.totp_enabled)) {
+    // Second step required: hand back a short-lived, purpose-bound pre-token.
+    const pre = jwt.sign({ id: u.id, purpose: '2fa' }, JWT_SECRET, { expiresIn: '10m' });
+    return res.json({ need2fa: true, preToken: pre, username: u.username });
+  }
+  const device = String(req.body.device||'').slice(0, 80);
+  const knownDevice = device ? await store.get('SELECT id FROM auth_sessions WHERE user_id=$1 AND device=$2 AND revoked_at IS NULL', u.id, device) : null;
+  const token = await sessions.issue(pu, { device });
+  if (!knownDevice) await noteNewDevice(u.id, device);
+  res.json({ token, user: pu, totpEnabled: false });
 }));
+
+app.post('/api/login/2fa', route(async (req,res) => {
+  let claims;
+  try { claims = jwt.verify(String(req.body.preToken||''), JWT_SECRET); } catch {}
+  if (!claims || claims.purpose !== '2fa' || !claims.id) return res.status(401).json({error:'Login expired, please sign in again'});
+  const u = await store.get('SELECT * FROM users WHERE id=$1', claims.id);
+  if (!u || Number(u.banned)) return res.status(403).json({error:'Account unavailable'});
+  const kind = await verifySecondFactor(u, String(req.body.code||''));
+  if (!kind) return res.status(401).json({error:'Invalid or expired code'});
+  const pu = publicUser(u);
+  const device = String(req.body.device||'').slice(0, 80);
+  const knownDevice = device ? await store.get('SELECT id FROM auth_sessions WHERE user_id=$1 AND device=$2 AND revoked_at IS NULL', u.id, device) : null;
+  const token = await sessions.issue(pu, { device });
+  if (!knownDevice) await noteNewDevice(u.id, device);
+  res.json({ token, user: pu, totpEnabled: true, usedRecovery: kind === 'recovery' });
+}));
+
 
 app.post('/api/logout', auth, route(async (req,res) => {
   await sessions.revoke(req.user.sessionId);
@@ -975,7 +1279,7 @@ app.get('/api/bootstrap', auth, route(async (req,res) => {
   const events = await store.all("SELECT * FROM events WHERE active=1 ORDER BY starts_at DESC LIMIT 5");
   const unreadNotifs = (await store.get('SELECT COUNT(*) AS c FROM notifications WHERE user_id=$1 AND read=0', req.user.id))?.c || 0;
   const challenge = await getTodayChallenge();
-  res.json({me, communities, channels, users, memberships, roles, friends, dms, groups, settings, events, unreadNotifs:Number(unreadNotifs), challenge, devMode: IS_DEV});
+  res.json({me, communities, channels, users, memberships, roles, friends, dms, groups, settings, events, unreadNotifs:Number(unreadNotifs), challenge, devMode: IS_DEV, rtc: { iceServers: await rtcIceServers() }});
 }));
 
 // ── Profile ───────────────────────────────────────────────────────────────────
@@ -1028,6 +1332,259 @@ app.get('/api/me/privacy-checkup', auth, route(async (req,res) => {
     settings: s
   });
 }));
+// ── Account data export / deletion ─────────────────────────────────────────
+// Self-service data portability and erasure (privacy-first). Export returns a
+// JSON archive of everything the account owns. DELETE erases the account and
+// its authored content inside one transaction; moderation / anti-abuse records
+// (moderation_logs, reports, mod_notes, data_requests, permission_audit_logs,
+// reveal_removals) are deliberately retained for accountability — they only
+// reference user ids as text and never block deletion.
+function uploadFileNames(...values) {
+  const out = [];
+  for (const v of values) {
+    if (typeof v !== 'string') continue;
+    const m = /^\/uploads\/([A-Za-z0-9._-]{1,200})$/.exec(v.trim());
+    if (m) out.push(m[1]);
+  }
+  return out;
+}
+const uploadAbsPath = name => path.join(uploadDir, name);
+
+app.get('/api/me/export', auth, route(async (req,res) => {
+  const uid = req.user.id;
+  const u = await store.get('SELECT * FROM users WHERE id=$1', uid);
+  if (!u) return res.status(404).json({ error: 'Account not found' });
+  const data = { exportedAt: new Date().toISOString() };
+  data.account = {
+    id: u.id, username: u.username, tag: u.tag, nickname: u.nickname || u.username,
+    avatar: u.avatar, banner: u.banner, bio: u.bio || '', status: u.status || 'Online',
+    custom_status: u.custom_status || '', badge: u.badge || '', karma: Number(u.karma || 0),
+    interests: u.interests || '', anon_active: Number(u.anon_active || 0),
+    anon_mask: u.anon_mask || '', anon_color: u.anon_color || '', anon_emoji: u.anon_emoji || '',
+    fav_mask: u.fav_mask || '', fav_color: u.fav_color || '', fav_emoji: u.fav_emoji || '',
+    privacy_mode: u.privacy_mode || 'standard', settings: u.settings || '{}',
+    banned: Number(u.banned || 0), created_at: u.created_at,
+  };
+  data.memberships = await store.all(
+    'SELECT m.community_id, m.role, m.nickname, m.muted, c.name AS community_name, c.visibility FROM memberships m LEFT JOIN communities c ON c.id = m.community_id WHERE m.user_id=$1', uid);
+  data.friends = await store.all(
+    'SELECT f.status, f.created_at, u.id AS other_id, u.username AS other_username, u.tag AS other_tag FROM friends f JOIN users u ON u.id = CASE WHEN f.requester_id=$1 THEN f.addressee_id ELSE f.requester_id END WHERE f.requester_id=$1 OR f.addressee_id=$1', uid);
+  data.dms = await store.all(
+    'SELECT d.id, d.created_at, ua.username AS user_a_name, ua.tag AS user_a_tag, ub.username AS user_b_name, ub.tag AS user_b_tag FROM dms d LEFT JOIN users ua ON ua.id = d.user_a LEFT JOIN users ub ON ub.id = d.user_b WHERE d.user_a=$1 OR d.user_b=$1', uid);
+  data.messages = await store.all(
+    'SELECT id, channel_id, dm_id, group_id, body, attachment, attachment_name, attachment_type, reply_to, pinned, created_at FROM messages WHERE sender_id=$1 ORDER BY created_at', uid);
+  data.roomMessages = await store.all(
+    'SELECT rm.id, rm.room_id, rm.body, rm.created_at, tr.name AS room_name FROM room_messages rm LEFT JOIN temp_rooms tr ON tr.id = rm.room_id WHERE rm.sender_id=$1 ORDER BY rm.created_at', uid);
+  data.questLogs = await store.all('SELECT quest, day, reward FROM quest_logs WHERE user_id=$1 ORDER BY day', uid);
+  data.gameLogs = await store.all('SELECT game, result, day, created_at FROM game_logs WHERE user_id=$1', uid);
+  data.inventory = await store.all('SELECT item_id, name, aquired_at FROM inventory WHERE user_id=$1', uid);
+  data.bookmarks = await store.all(
+    'SELECT b.folder, b.created_at, m.body, m.created_at AS message_at, m.channel_id, m.dm_id, m.group_id FROM bookmarks b LEFT JOIN messages m ON m.id = b.message_id WHERE b.user_id=$1 ORDER BY b.created_at', uid);
+  data.anonymousIdentities = await store.all('SELECT id, mask_name, mask_color, mask_emoji, active, gradient, created_at FROM anonymous_identities WHERE user_id=$1', uid);
+  data.notifications = await store.all('SELECT type, source_type, body, read, created_at FROM notifications WHERE user_id=$1 ORDER BY created_at', uid);
+  data.reminders = await store.all('SELECT preview, remind_at, fired, created_at FROM reminders WHERE user_id=$1', uid);
+  data.tempUsernames = await store.all('SELECT temp_name, context, created_at FROM temp_usernames WHERE user_id=$1', uid);
+  data.reactions = await store.all('SELECT r.emoji, r.message_id, m.body FROM reactions r LEFT JOIN messages m ON m.id = r.message_id WHERE r.user_id=$1', uid);
+  data.pollVotes = await store.all('SELECT pv.option_index, p.question FROM poll_votes pv LEFT JOIN polls p ON p.id = pv.poll_id WHERE pv.user_id=$1', uid);
+  data.giftLogs = await store.all('SELECT from_id, to_id, amount, day, created_at FROM gift_logs WHERE from_id=$1 OR to_id=$1 ORDER BY created_at', uid);
+  data.revealPosts = await store.all('SELECT id, type, body, media, media_name, quiz, created_at FROM reveal_posts WHERE author_id=$1 ORDER BY created_at', uid);
+  data.revealComments = await store.all('SELECT id, post_id, body, created_at FROM reveal_comments WHERE author_id=$1 ORDER BY created_at', uid);
+  data.blocks = await store.all('SELECT blocker_id, blocked_id FROM blocks WHERE blocker_id=$1 OR blocked_id=$1', uid);
+  data.ratings = await store.all('SELECT cr.community_id, cr.rating, c.name AS community_name FROM community_ratings cr LEFT JOIN communities c ON c.id = cr.community_id WHERE cr.user_id=$1', uid);
+  data.dataRequests = await store.all('SELECT id, requester_id, target_id, reason, status, note, created_at, responded_at FROM data_requests WHERE requester_id=$1 OR target_id=$1 ORDER BY created_at', uid);
+  const counts = {};
+  for (const [key, value] of Object.entries(data)) if (Array.isArray(value)) counts[key] = value.length;
+  data.counts = counts;
+  res.setHeader('Content-Type', 'application/json');
+  res.setHeader('Content-Disposition', 'attachment; filename="unknown-data-' + String(u.username || 'user').replace(/[^A-Za-z0-9_-]/g, '') + '-' + new Date().toISOString().slice(0, 10) + '.json"');
+  res.json(data);
+}));
+
+// Erase an account and everything it owns, atomically. Everything runs inside
+// one transaction so a failure mid-way rolls back to the untouched account.
+async function deleteUserAccount(userId, ownedFiles) {
+  const files = ownedFiles || [];
+  const client = await pool.connect();
+  const q = (sql, ...params) => client.query(sql, params);
+  try {
+    await client.query('BEGIN');
+    // Audit first: keep a permanent, self-describing record of the erasure.
+    await q("INSERT INTO moderation_logs (id, actor_id, action, target, details, created_at) VALUES ($1,$2,'account_self_deleted',$3,$4,CURRENT_TIMESTAMP)",
+      nanoid(), userId, userId, JSON.stringify({ selfService: true }));
+
+    // Messages: the user's own, plus everything inside their closed DM threads
+    // (a DM row is shared; removing the account closes the conversation).
+    const USER_MSGS = 'sender_id=$1 OR dm_id IN (SELECT id FROM dms WHERE user_a=$1 OR user_b=$1)';
+    const msgRows = await q('SELECT id, attachment FROM messages WHERE ' + USER_MSGS, userId);
+    for (const row of msgRows.rows) files.push(...uploadFileNames(row.attachment));
+    await q('DELETE FROM message_edits WHERE message_id IN (SELECT id FROM messages WHERE ' + USER_MSGS + ')', userId);
+    await q('DELETE FROM reactions WHERE user_id=$1 OR message_id IN (SELECT id FROM messages WHERE ' + USER_MSGS + ')', userId);
+    await q('DELETE FROM threads WHERE root_message_id IN (SELECT id FROM messages WHERE ' + USER_MSGS + ')', userId);
+    await q('DELETE FROM polls WHERE created_by=$1 OR message_id IN (SELECT id FROM messages WHERE ' + USER_MSGS + ')', userId);
+    await q('DELETE FROM poll_votes WHERE user_id=$1 OR poll_id IN (SELECT id FROM polls WHERE created_by=$1 OR message_id IN (SELECT id FROM messages WHERE ' + USER_MSGS + '))', userId);
+    const delMessages = await q('DELETE FROM messages WHERE ' + USER_MSGS, userId);
+    const delDms = await q('DELETE FROM dms WHERE user_a=$1 OR user_b=$1', userId);
+    const delRoomMessages = await q('DELETE FROM room_messages WHERE sender_id=$1', userId);
+        // Everything keyed by user id: one allowlisted sweep (never a wildcard).
+    // Declarative on purpose - adding a user-scoped table is a one-line change.
+    const USER_SCOPED = [
+      'user_settings', 'notifications', 'reminders',
+      'inventory', 'game_logs', 'temp_usernames', 'arg_completions', 'bookmarks',
+      'memberships', 'member_roles', 'community_ratings', 'active_effects',
+      'bot_reviews', 'voice_sessions', 'room_members', 'room_poll_votes', 'group_members',
+    ];
+    for (const table of USER_SCOPED) {
+      await q('DELETE FROM ' + table + ' WHERE user_id=$1', userId);
+    }
+    await q('DELETE FROM server_cosmetics WHERE purchased_by=$1', userId);
+    // Two-sided relationships belong to both parties.
+    await q('DELETE FROM friends WHERE requester_id=$1 OR addressee_id=$1', userId);
+    await q('DELETE FROM blocks WHERE blocker_id=$1 OR blocked_id=$1', userId);
+    const delQuests = await q('DELETE FROM quest_logs WHERE user_id=$1', userId);
+    const delAnon = await q('DELETE FROM anonymous_identities WHERE user_id=$1', userId);
+    await q('DELETE FROM events WHERE created_by=$1', userId);
+
+    // Reveal (anonymous posting) content authored by the user, plus the rows
+    // attached to it (other users' comments/likes on removed posts).
+    const revPosts = await q('SELECT id, media FROM reveal_posts WHERE author_id=$1', userId);
+    const revPostIds = revPosts.rows.map(r => r.id);
+    for (const row of revPosts.rows) files.push(...uploadFileNames(row.media));
+    const revCommentIds = (await q('SELECT id FROM reveal_comments WHERE author_id=$1 OR post_id = ANY($2::text[])', userId, revPostIds)).rows.map(r => r.id);
+    await q('UPDATE reveal_comments SET parent_id=NULL WHERE parent_id IN (SELECT id FROM reveal_comments WHERE author_id=$1)', userId);
+    await q('DELETE FROM reveal_comment_likes WHERE user_id=$1 OR comment_id = ANY($2::text[]) OR comment_id IN (SELECT id FROM reveal_comments WHERE post_id = ANY($3::text[]))', userId, revCommentIds, revPostIds);
+    await q('DELETE FROM reveal_likes WHERE user_id=$1 OR post_id = ANY($2::text[])', userId, revPostIds);
+    await q('DELETE FROM reveal_post_views WHERE user_id=$1 OR post_id = ANY($2::text[])', userId, revPostIds);
+    await q('DELETE FROM reveal_removals WHERE post_id = ANY($1::text[])', revPostIds);
+    await q('DELETE FROM reveal_comments WHERE author_id=$1 OR post_id = ANY($2::text[])', userId, revPostIds);
+    await q('DELETE FROM reveal_posts WHERE author_id=$1', userId);
+    await q('DELETE FROM reveal_follows WHERE follower_id=$1 OR followed_id=$1', userId);
+    await q('DELETE FROM reveal_bans WHERE user_id=$1', userId);
+
+    // Ownership: communities/groups/rooms the user created either transfer to a
+    // remaining member or (with nobody left) are removed completely.
+    const ownedRooms = await q('SELECT id FROM temp_rooms WHERE owner_id=$1', userId);
+    for (const row of ownedRooms.rows) {
+      const next = await q('SELECT user_id FROM room_members WHERE room_id=$1 AND user_id<>$2 AND waiting=0 ORDER BY joined_at LIMIT 1', row.id, userId);
+      if (next.rows.length) {
+        await q('UPDATE temp_rooms SET owner_id=$1 WHERE id=$2', next.rows[0].user_id, row.id);
+      } else {
+        await q('DELETE FROM room_poll_votes WHERE poll_id IN (SELECT id FROM room_polls WHERE room_id=$1)', row.id);
+        await q('DELETE FROM room_polls WHERE room_id=$1', row.id);
+        await q('DELETE FROM room_messages WHERE room_id=$1', row.id);
+        await q('DELETE FROM room_members WHERE room_id=$1', row.id);
+        await q('DELETE FROM temp_rooms WHERE id=$1', row.id);
+      }
+    }
+    const ownedGroups = await q('SELECT id FROM groups_chat WHERE owner_id=$1', userId);
+    for (const row of ownedGroups.rows) {
+      const next = await q('SELECT user_id FROM group_members WHERE group_id=$1 AND user_id<>$2 ORDER BY user_id LIMIT 1', row.id, userId);
+      if (next.rows.length) {
+        await q('UPDATE groups_chat SET owner_id=$1 WHERE id=$2', next.rows[0].user_id, row.id);
+      } else {
+        await q('DELETE FROM poll_votes WHERE poll_id IN (SELECT id FROM polls WHERE group_id=$1)', row.id);
+        await q('DELETE FROM polls WHERE group_id=$1', row.id);
+        await q('DELETE FROM message_edits WHERE message_id IN (SELECT id FROM messages WHERE group_id=$1)', row.id);
+        await q('DELETE FROM reactions WHERE message_id IN (SELECT id FROM messages WHERE group_id=$1)', row.id);
+        await q('DELETE FROM threads WHERE root_message_id IN (SELECT id FROM messages WHERE group_id=$1)', row.id);
+        await q('DELETE FROM messages WHERE group_id=$1', row.id);
+        await q('DELETE FROM group_members WHERE group_id=$1', row.id);
+        await q('DELETE FROM groups_chat WHERE id=$1', row.id);
+      }
+    }
+    const ownedComms = await q('SELECT id FROM communities WHERE owner_id=$1', userId);
+    for (const row of ownedComms.rows) {
+      const next = await q("SELECT user_id FROM memberships WHERE community_id=$1 AND user_id<>$2 ORDER BY CASE role WHEN 'owner' THEN 100 WHEN 'admin' THEN 90 WHEN 'mod' THEN 10 ELSE 5 END DESC, user_id LIMIT 1", row.id, userId);
+      if (next.rows.length) {
+        await q('UPDATE communities SET owner_id=$1 WHERE id=$2', next.rows[0].user_id, row.id);
+      } else {
+        const chans = await q('SELECT id FROM channels WHERE community_id=$1', row.id);
+        const chanIds = chans.rows.map(r => r.id);
+        if (chanIds.length) {
+          await q('DELETE FROM message_edits WHERE message_id IN (SELECT id FROM messages WHERE channel_id = ANY($1::text[]))', chanIds);
+          await q('DELETE FROM reactions WHERE message_id IN (SELECT id FROM messages WHERE channel_id = ANY($1::text[]))', chanIds);
+          await q('DELETE FROM threads WHERE root_message_id IN (SELECT id FROM messages WHERE channel_id = ANY($1::text[]))', chanIds);
+          await q('DELETE FROM poll_votes WHERE poll_id IN (SELECT id FROM polls WHERE channel_id = ANY($1::text[]))', chanIds);
+          await q('DELETE FROM polls WHERE channel_id = ANY($1::text[])', chanIds);
+          await q('DELETE FROM messages WHERE channel_id = ANY($1::text[])', chanIds);
+          await q('DELETE FROM channel_permissions WHERE channel_id = ANY($1::text[])', chanIds);
+          await q('DELETE FROM channels WHERE id = ANY($1::text[])', chanIds);
+        }
+        const rooms = await q('SELECT id FROM temp_rooms WHERE community_id=$1', row.id);
+        for (const r2 of rooms.rows) {
+          await q('DELETE FROM room_poll_votes WHERE poll_id IN (SELECT id FROM room_polls WHERE room_id=$1)', r2.id);
+          await q('DELETE FROM room_polls WHERE room_id=$1', r2.id);
+          await q('DELETE FROM room_messages WHERE room_id=$1', r2.id);
+          await q('DELETE FROM room_members WHERE room_id=$1', r2.id);
+        }
+        await q('DELETE FROM temp_rooms WHERE community_id=$1', row.id);
+        const roles = await q('SELECT id FROM community_roles WHERE community_id=$1', row.id);
+        const roleIds = roles.rows.map(r => r.id);
+        if (roleIds.length) {
+          await q('DELETE FROM member_roles WHERE role_id = ANY($1::text[])', roleIds);
+          await q('DELETE FROM channel_permissions WHERE role_id = ANY($1::text[])', roleIds);
+        }
+        await q('DELETE FROM community_roles WHERE community_id=$1', row.id);
+        await q('DELETE FROM memberships WHERE community_id=$1', row.id);
+        await q('DELETE FROM community_ratings WHERE community_id=$1', row.id);
+        await q('DELETE FROM active_effects WHERE community_id=$1', row.id);
+        await q('DELETE FROM communities WHERE id=$1', row.id);
+      }
+    }
+
+    // Authored platform content that others still use keeps working: drop the
+    // author link instead of deleting the row.
+    await q('UPDATE announcements SET author_id=NULL WHERE author_id=$1', userId);
+    await q('UPDATE custom_quests SET created_by=NULL WHERE created_by=$1', userId);
+    await q('UPDATE marketplace_bots SET author_id=NULL WHERE author_id=$1', userId);
+    await q('UPDATE bot_releases SET released_by=NULL WHERE released_by=$1', userId);
+    await q('UPDATE gift_logs SET from_id=NULL WHERE from_id=$1', userId);
+    await q('UPDATE gift_logs SET to_id=NULL WHERE to_id=$1', userId);
+
+    await q('DELETE FROM auth_sessions WHERE user_id=$1', userId);
+    const delUser = await q('DELETE FROM users WHERE id=$1', userId);
+    await client.query('COMMIT');
+    const summary = {
+      account: Number(delUser.rowCount || 0),
+      messages: Number(delMessages.rowCount || 0),
+      dms: Number(delDms.rowCount || 0),
+      roomMessages: Number(delRoomMessages.rowCount || 0),
+      questLogs: Number(delQuests.rowCount || 0),
+      anonymousIdentities: Number(delAnon.rowCount || 0),
+      uploadFiles: files.length,
+    };
+    return { summary, files };
+  } catch (error) {
+    try { await client.query('ROLLBACK'); } catch {}
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+app.delete('/api/me', auth, route(async (req,res) => {
+  const password = String((req.body && req.body.password) || '');
+  const u = await store.get('SELECT * FROM users WHERE id=$1', req.user.id);
+  if (!u) return res.status(404).json({ error: 'Account not found' });
+  if (Number(u.is_admin)) {
+    return res.status(403).json({ error: 'Administrator accounts cannot be deleted from the app; use a normal account for day-to-day use' });
+  }
+  if (!password || !bcrypt.compareSync(password, u.password_hash)) {
+    return res.status(401).json({ error: 'Current password incorrect' });
+  }
+  const ownedFiles = uploadFileNames(u.avatar, u.banner);
+  const { summary, files } = await deleteUserAccount(u.id, ownedFiles);
+  // Files are removed only after the transaction committed successfully.
+  for (const name of files) { try { fs.rmSync(uploadAbsPath(name), { force: true }); } catch {} }
+  // Tell every connected client (this instance and, via the shared adapter,
+  // every other instance) that the account is gone, then drop its sockets.
+  io.emit('account_deleted', { userId: u.id, username: u.username });
+  for (const s of io.sockets.sockets.values()) {
+    if (s.data && s.data.user && s.data.user.id === u.id) { try { s.disconnect(true); } catch {} }
+  }
+  res.json({ ok: true, deleted: true, summary });
+}));
+
+
 
 // ── Settings ──────────────────────────────────────────────────────────────────
 app.get('/api/settings', auth, route(async (req,res) => {
@@ -1057,6 +1614,72 @@ app.post('/api/me/change-password', auth, route(async (req,res) => {
   await store.run('UPDATE users SET password_hash=$1 WHERE id=$2', bcrypt.hashSync(newPassword,10), req.user.id);
   await sessions.revokeUserExcept(req.user.id, req.user.sessionId);
   res.json({ok:true});
+}));
+
+// ── Two-factor authentication ─────────────────────────────────────────────────
+app.post('/api/me/2fa/setup', auth, route(async (req,res) => {
+  const u = await store.get('SELECT * FROM users WHERE id=$1', req.user.id);
+  if (!bcrypt.compareSync(String(req.body.password||''), u.password_hash)) return res.status(401).json({error:'Password incorrect'});
+  if (Number(u.totp_enabled)) return res.status(400).json({error:'Two-factor is already enabled'});
+  const secret = generateSecret();
+  const label = (u.nickname || u.username) + '@' + (req.get('host') || 'unknown');
+  await store.run('UPDATE users SET totp_secret=$1 WHERE id=$2', JSON.stringify({ v: secret }), u.id);
+  res.json({ secret, otpauthUrl: otpauthUri(secret, label), account: label });
+}));
+
+app.post('/api/me/2fa/enable', auth, route(async (req,res) => {
+  const u = await store.get('SELECT * FROM users WHERE id=$1', req.user.id);
+  if (Number(u.totp_enabled)) return res.status(400).json({error:'Two-factor is already enabled'});
+  const secret = secretFor(u);
+  if (!secret) return res.status(400).json({error:'Run setup first'});
+  const clean = String(req.body.code||'').replace(/\s/g, '');
+  if (!verifyCode(secret, clean)) return res.status(401).json({error:'Code did not verify — check your authenticator app'});
+  const codes = generateRecoveryCodes(10);
+  await store.run('UPDATE users SET totp_enabled=1, recovery_codes=$1 WHERE id=$2', JSON.stringify(codes.map(hashRecoveryCode)), u.id);
+  await sessions.revokeUserExcept(u.id, req.user.sessionId);
+  res.json({ ok: true, recoveryCodes: codes });
+}));
+
+app.post('/api/me/2fa/disable', auth, route(async (req,res) => {
+  const u = await store.get('SELECT * FROM users WHERE id=$1', req.user.id);
+  if (!bcrypt.compareSync(String(req.body.password||''), u.password_hash)) return res.status(401).json({error:'Password incorrect'});
+  if (!Number(u.totp_enabled)) return res.status(400).json({error:'Two-factor is not enabled'});
+  const kind = await verifySecondFactor(u, String(req.body.code||''));
+  if (!kind) return res.status(401).json({error:'Invalid or expired code'});
+  await store.run("UPDATE users SET totp_enabled=0, totp_secret=NULL, recovery_codes='[]' WHERE id=$1", u.id);
+  res.json({ ok: true });
+}));
+
+app.get('/api/me/2fa/status', auth, route(async (req,res) => {
+  const u = await store.get('SELECT totp_enabled FROM users WHERE id=$1', req.user.id);
+  res.json({ enabled: Boolean(u && Number(u.totp_enabled)) });
+}));
+
+// ── Session manager ───────────────────────────────────────────────────────────
+app.get('/api/me/sessions', auth, route(async (req,res) => {
+  const rows = await store.all('SELECT id, device, created_at, last_seen, expires_at FROM auth_sessions WHERE user_id=$1 AND revoked_at IS NULL ORDER BY created_at DESC LIMIT 50', req.user.id);
+  res.json(rows.map(s => ({
+    id: s.id,
+    device: s.device || 'Unknown device',
+    createdAt: s.created_at,
+    lastSeen: s.last_seen,
+    current: s.id === req.user.sessionId,
+  })));
+}));
+
+app.post('/api/me/sessions/revoke', auth, route(async (req,res) => {
+  const target = String(req.body.sessionId||'');
+  if (!target) return res.status(400).json({error:'sessionId required'});
+  if (target === req.user.sessionId) return res.status(400).json({error:'Use logout to end the current session'});
+  await store.run('UPDATE auth_sessions SET revoked_at=CURRENT_TIMESTAMP WHERE id=$1 AND user_id=$2', target, req.user.id);
+  io.to('user:' + req.user.id).emit('session_revoked', { sessionId: target });
+  res.json({ ok: true });
+}));
+
+app.post('/api/me/sessions/revoke-others', auth, route(async (req,res) => {
+  await sessions.revokeUserExcept(req.user.id, req.user.sessionId);
+  io.to('user:' + req.user.id).emit('session_revoked', { allOthers: true });
+  res.json({ ok: true });
 }));
 
 // ── Anonymous mode ────────────────────────────────────────────────────────────
@@ -4587,6 +5210,22 @@ function sendPresence(socket) {
   presenceSnapshot().then(list => socket.emit('presence_sync', list)).catch(() => {});
 }
 
+// Temp-room membership cleanup with a grace period. When a socket dies without
+// sending `room_leave` (tab closed, crash, network drop) its room_members row is
+// deleted — and remaining members are told — after ROOM_LEAVE_GRACE_MS, UNLESS
+// the user reconnects first (re-emitting `room_join` cancels the pending removal).
+// A grace is required here (unlike voice rooms, which the mesh re-joins on
+// reconnect) because a plain network blip must not drop an active member, and
+// the member list is DB-backed: there is no live "this user left" signal to
+// recover from otherwise.
+const ROOM_LEAVE_GRACE_MS = Math.max(1000, Number(process.env.ROOM_LEAVE_GRACE_MS) || 30000);
+const roomLeaveTimers = new Map(); // `${roomId}|${userId}` -> timeout handle
+function cancelRoomLeaveTimer(roomId, userId) {
+  const key = `${roomId}|${userId}`;
+  const t = roomLeaveTimers.get(key);
+  if (t) { clearTimeout(t); roomLeaveTimers.delete(key); }
+}
+
 io.on('connection', socket => {
   const userId = socket.data.user.id;
   socket.on('join', async id => {
@@ -4726,6 +5365,7 @@ io.on('connection', socket => {
     const roomId = typeof d === 'string' ? d : d?.roomId;
     if (typeof roomId !== 'string' || roomId.length > 128) return;
     try {
+      cancelRoomLeaveTimer(roomId, userId);
       const member = await store.get('SELECT 1 FROM room_members WHERE room_id=$1 AND user_id=$2', roomId, userId);
       if (member || socket.data.user.is_admin) socket.join(`room:${roomId}`);
     } catch {}
@@ -4735,6 +5375,7 @@ io.on('connection', socket => {
     if (typeof roomId !== 'string' || roomId.length > 128) return;
     const roomName = `room:${roomId}`;
     if (!socket.rooms.has(roomName)) return;
+    cancelRoomLeaveTimer(roomId, userId);
     socket.leave(roomName);
     store.run('DELETE FROM room_members WHERE room_id=$1 AND user_id=$2', roomId, userId).catch(()=>{});
     io.to(roomName).emit('room_presence', { action:'left', userId });
@@ -4785,7 +5426,11 @@ io.on('connection', socket => {
   // Mic mute state for DM calls — the receiver shows a true “muted” chip instead
   // of guessing from silence. Same DM-auth + user-room routing as the other
   // call signals, so it works across app instances.
-  socket.on('call_mute',  d => relayToUser('call_mute', d));
+  socket.on('call_mute',   d => relayToUser('call_mute', d));
+  // Camera on/off state for DM calls — lets the peer swap the video for a
+  // “camera off” placeholder instead of a frozen last frame. Same DM-auth +
+  // user-room routing as the other call signals.
+  socket.on('call_camera', d => relayToUser('call_camera', d));
 
   // Screen share is restricted to an authenticated voice room membership.
   const relayScreenShare = (event, data) => {
@@ -4818,10 +5463,26 @@ io.on('connection', socket => {
   // tear down their peer connection instead of showing a ghost tile.
   socket.on('disconnecting', () => {
     for (const roomName of socket.rooms) {
-      if (!roomName.startsWith('voice:')) continue;
-      const channelId = roomName.slice('voice:'.length);
-      socket.to(roomName).emit('voice_user_left', { channelId, userId, socketId: socket.id });
-      io.to(roomName).emit('voice_state', { channelId, userId, joined: false });
+      if (roomName.startsWith('voice:')) {
+        const channelId = roomName.slice('voice:'.length);
+        socket.to(roomName).emit('voice_user_left', { channelId, userId, socketId: socket.id });
+        io.to(roomName).emit('voice_state', { channelId, userId, joined: false });
+        continue;
+      }
+      if (!roomName.startsWith('room:')) continue;
+      // Abrupt disconnect from a temp room: schedule membership cleanup unless
+      // the user reconnects within the grace window (room_join cancels it).
+      const roomId = roomName.slice('room:'.length);
+      const key = `${roomId}|${userId}`;
+      if (roomLeaveTimers.has(key)) continue; // another of this user's sockets already pending
+      const timer = setTimeout(async () => {
+        roomLeaveTimers.delete(key);
+        try {
+          await store.run('DELETE FROM room_members WHERE room_id=$1 AND user_id=$2', roomId, userId);
+        } catch {}
+        io.to(`room:${roomId}`).emit('room_presence', { action: 'left', userId });
+      }, ROOM_LEAVE_GRACE_MS);
+      roomLeaveTimers.set(key, timer);
     }
   });
   socket.on('disconnect', () => {

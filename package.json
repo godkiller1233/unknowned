@@ -15,6 +15,7 @@
     "node": ">=20"
   },
   "dependencies": {
+    "@mediapipe/tasks-vision": "^1.0.1",
     "@socket.io/postgres-adapter": "^0.5.0",
     "@vitejs/plugin-react": "latest",
     "bcryptjs": "latest",
@@ -30,6 +31,7 @@
     "react-dom": "latest",
     "socket.io": "latest",
     "socket.io-client": "latest",
+    "three": "^0.185.1",
     "typescript": "latest",
     "vite": "latest"
   },

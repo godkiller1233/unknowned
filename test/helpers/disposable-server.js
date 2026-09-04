@@ -74,16 +74,18 @@ export async function isPgReachable(adminUrl = ADMIN_URL) {
 // Returns { base, api, admin, serverLog, stop } where `admin` is a pg Pool
 // connected to the throwaway database (for direct assertions) and `stop()` is
 // idempotent and drops the database even if the server crashed.
-export async function startDisposableServer({ adminUrl = ADMIN_URL } = {}) {
+export async function startDisposableServer({ adminUrl = ADMIN_URL, env: extraEnv = {}, reuse = null } = {}) {
   const admin = new pg.Pool({ connectionString: adminUrl, max: 2 });
-  const dbName = 'unknown_it_' + crypto.randomBytes(4).toString('hex');
+  const dbName = reuse ? reuse.dbName : 'unknown_it_' + crypto.randomBytes(4).toString('hex');
   let child = null;
   let serverLog = '';
 
-  await admin.query(`CREATE DATABASE ${dbName}`);
+  if (!reuse) await admin.query(`CREATE DATABASE ${dbName}`);
   const port = await getFreePort();
   const base = `http://127.0.0.1:${port}`;
-  const dbUrl = adminUrl.replace(/\/[^/]*$/, '/' + dbName);
+  // With `reuse`, boot a second instance against an existing throwaway database
+  // (multi-instance tests). The reusing instance never drops the database.
+  const dbUrl = reuse ? reuse.dbUrl : adminUrl.replace(/\/[^/]*$/, '/' + dbName);
 
   const env = {
     ...process.env,
@@ -95,6 +97,7 @@ export async function startDisposableServer({ adminUrl = ADMIN_URL } = {}) {
     // seed creates this account with is_admin=1 (tag 'real').
     ADMIN_USERNAME: 'TestAdmin',
     ADMIN_PASSWORD: 'test-admin-pass-1',
+    ...extraEnv,
   };
   delete env.UPLOAD_DIR;
 
@@ -131,9 +134,9 @@ export async function startDisposableServer({ adminUrl = ADMIN_URL } = {}) {
     // Close the direct-DB pool before the FORCE drop so no live client is
     // terminated mid-query (which would surface as async noise after the test).
     await db.end().catch(() => {});
-    try { await admin.query(`DROP DATABASE IF EXISTS ${dbName} WITH (FORCE)`); } catch {}
+    if (!reuse) { try { await admin.query(`DROP DATABASE IF EXISTS ${dbName} WITH (FORCE)`); } catch {} }
     await admin.end().catch(() => {});
   };
 
-  return { base, api, admin: db, dbName, serverLog: () => serverLog, stop };
+  return { base, api, admin: db, dbName, dbUrl, serverLog: () => serverLog, stop };
 }

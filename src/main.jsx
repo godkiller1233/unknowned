@@ -5,8 +5,73 @@ import './styles.css';
 const Settings = lazy(() => import('./Settings.jsx'));
 const Game = lazy(() => import('./Game.jsx'));
 import { Logo, Mascot } from './Logo.jsx';
-import { mediaConstraints, applySpeakerSink, loadMediaPrefs } from './mediaPrefs.js';
+import { mediaConstraints, applySpeakerSink, loadMediaPrefs, isVirtualCamLabel, externalVideoConstraints } from './mediaPrefs.js';
+import { loadAvatarConfig, getAvatarFile, loadCalibration } from './avatar-store.js';
+import { createAvatarEngine } from './avatar-engine.js';
 import { createVoiceMesh } from './mesh.js';
+import { createCallNegotiator } from './call-negotiation.js';
+
+// ── Avatar virtual camera (one live session at a time) ───────────────────────
+// When avatar mode is on, video surfaces send this engine's canvas stream — a
+// tracked 2D image or 3D model — instead of the raw camera. The webcam (if the
+// user allows it) is used only on this machine to power face/hand tracking.
+let liveAvatarEngine = null;
+
+async function openAvatarTrack({ micStream } = {}) {
+  const cfg = loadAvatarConfig();
+  if (cfg.mode !== '2d' && cfg.mode !== '3d') return null;
+  const kind = cfg.mode === '2d' ? '2d' : '3d';
+  const asset = await getAvatarFile(kind);
+  if (!asset) return null; // nothing imported — callers fall back to the real camera
+  closeAvatarTrack();
+  let cam = null;
+  try { cam = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 640 }, height: { ideal: 480 } } }); } catch { cam = null; }
+  const cal = await loadCalibration();
+  const eng = createAvatarEngine({ mode: cfg.mode, assetUrl: asset.url, hands: cfg.hands, cameraStream: cam, audioStream: micStream || null, calibration: cal, fit: asset.fit || null });
+  liveAvatarEngine = eng;
+  eng.start().catch(() => {});
+  return eng.track;
+}
+
+function liveAvatarStream() {
+  return liveAvatarEngine ? liveAvatarEngine.stream : null;
+}
+
+function closeAvatarTrack() {
+  const eng = liveAvatarEngine;
+  liveAvatarEngine = null;
+  if (eng) eng.destroy().catch(() => {});
+}
+
+// “External app” avatar source: VTube Studio / OBS / Snap Camera etc. provide a
+// virtual camera that shows up as a normal webcam. We transmit that device's
+// stream directly — the app (not our engine) renders the face/avatar.
+async function externalVideoStream() {
+  const cfg = loadAvatarConfig();
+  let devices = [];
+  try {
+    // Unlock device labels once so virtual cameras can be detected by name.
+    if (navigator.mediaDevices?.enumerateDevices) {
+      const probe = await navigator.mediaDevices.getUserMedia({ video: true }).catch(() => null);
+      probe && probe.getTracks().forEach(t => t.stop());
+      devices = await navigator.mediaDevices.enumerateDevices();
+    }
+  } catch { /* labels stay hidden — fall back to the chosen id or default */ }
+  const cams = (devices || []).filter(d => d.kind === 'videoinput' && d.deviceId && d.deviceId !== 'default' && d.deviceId !== 'communications');
+  let id = '';
+  if (cams.some(d => d.deviceId === cfg.externalId)) id = cfg.externalId;
+  else {
+    const virt = cams.find(d => isVirtualCamLabel(d.label));
+    if (virt) id = virt.deviceId;            // auto: first virtual camera app
+    else if (cfg.externalId && !cams.length) id = ''; // saved device vanished — use default
+  }
+  try {
+    return await navigator.mediaDevices.getUserMedia(externalVideoConstraints(id));
+  } catch {
+    // Saved/auto device refused or gone — try the browser default once.
+    try { return await navigator.mediaDevices.getUserMedia(externalVideoConstraints('')); } catch { return null; }
+  }
+}
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 function storageValue(storage, key) {
@@ -276,7 +341,7 @@ function PollRenderer({ poll: rawPoll, messageId, me }) {
 }
 
 // ── Emoji picker ──────────────────────────────────────────────────────────────
-const EMOJIS = ['👍','❤️','😂','😮','😢','😡','🔥','🎉','✅','💀','💯','🤔','😭','👀','🙌','🥳','😎','🤯','👏','🙏','✨','🚀','💜','🫶','🎮','🐱','🦊','🌈','☕','🍕'];
+const EMOJIS = ['👍','❤️','😂','😮','😢','😡','🔥','🎉','✅','💀','💯','🤔','😭','👀','🙌','🥳','😎','🤯','👏','🙏','✨','🚀','💜','🫶','🎮','🐱','🦊','🌈','☕','🍕','👤','🔑','🏆','🔒','🔔','🎙️','🎨','⭐','🎭','🕵️','💬'];  // + Settings rail icons
 // 🎲 DO SOMETHING RANDOM — prompt question + poll catalogs
 const RANDOM_PROMPTS = [
   "If your life had a theme song, what would it be and why?",
@@ -341,6 +406,20 @@ function callMicStateText(s) {
     : '🎙️ Mic connected';
 }
 
+// ICE-server cache: remember the operator-configured STUN/TURN relays from the
+// bootstrap payload so every RTCPeerConnection (DM calls included) uses them.
+let rtcServers = [{ urls: ['stun:stun.l.google.com:19302'] }];
+function rememberRtcServers(boot) {
+  const servers = boot && boot.rtc && Array.isArray(boot.rtc.iceServers) && boot.rtc.iceServers.length
+    ? boot.rtc.iceServers : null;
+  if (servers) rtcServers = servers;
+  return rtcServers;
+}
+function rtcIceServers() { return rtcServers; }
+function rtcRelayConfigured() {
+  return rtcServers.some(s => (s.urls || []).some(u => /^turns?:/i.test(String(u))));
+}
+
 function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClose }) {
   const [status, setStatus] = useState(incoming ? 'incoming' : 'calling');
   const [muted, setMuted]   = useState(false);
@@ -352,10 +431,23 @@ function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClo
   const [peerMic, setPeerMic] = useState('idle');
   // True when the other participant signaled they muted their mic (call_mute).
   const [remoteMuted, setRemoteMuted] = useState(false);
+  // Camera: am I sending video, and is a video track actually flowing back?
+  const [camOn, setCamOn] = useState(false);
+  const [camBusy, setCamBusy] = useState(false);
+  const [camWarn, setCamWarn] = useState('');
+  // null (never told) | true | false — peer's signaled camera state (call_camera).
+  const [remoteCam, setRemoteCam] = useState(null);
+  const [remoteVid, setRemoteVid] = useState(false);
+  // True when the avatar canvas (not the real camera) is what we send.
+  const [avatarLive, setAvatarLive] = useState(false);
   const localRef  = useRef(null);
   const remoteRef = useRef(null);
+  const localVidRef  = useRef(null);
+  const remoteVidRef = useRef(null);
   const streamRef = useRef(null);
+  const camStreamRef = useRef(null);
   const pcRef     = useRef(null);
+  const negotiatorRef = useRef(null);
   const pendingStart = useRef(null);
   const peerTimer = useRef(0);
   const peerCtx = useRef(null);
@@ -367,18 +459,38 @@ function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClo
     const onAccept  = async d => {
       if (!isThisCall(d) || (d.from && d.from !== targetUser?.id)) return;
       setStatus('connected');
-      if (pcRef.current && d.sdp) await pcRef.current.setRemoteDescription(new RTCSessionDescription(d.sdp)).catch(()=>{});
+      const ng = negotiatorRef.current;
+      if (ng && d.sdp) await ng.handleRemoteDescription(d.sdp).catch(()=>{});
+      else if (pcRef.current && d.sdp) await pcRef.current.setRemoteDescription(new RTCSessionDescription(d.sdp)).catch(()=>{});
     };
     const onDecline = d => { if (!isThisCall(d)) return; setStatus('declined'); setTimeout(onClose, 1500); };
     const onEnd     = d => { if (!isThisCall(d)) return; cleanup(); onClose(); };
     const onOffer   = async d => {
       if (!isThisCall(d) || (d.from && d.from !== targetUser?.id)) return;
+      const ng = negotiatorRef.current;
+      if (ng && d.sdp) { await ng.handleRemoteDescription(d.sdp).catch(()=>{}); return; }
+      // Legacy path: no negotiator yet (call accepted pre-negotiation) — build the line.
       setStatus('connecting');
       await startCall(false, d);
     };
-    const onAnswer  = async d => { if (isThisCall(d) && pcRef.current) await pcRef.current.setRemoteDescription(new RTCSessionDescription(d.sdp)).catch(()=>{}); };
-    const onIce     = d => { if (isThisCall(d) && pcRef.current && d.candidate) pcRef.current.addIceCandidate(new RTCIceCandidate(d.candidate)).catch(()=>{}); };
+    const onAnswer  = async d => {
+      if (!isThisCall(d)) return;
+      const ng = negotiatorRef.current;
+      if (ng && d.sdp) await ng.handleRemoteDescription(d.sdp).catch(()=>{});
+      else if (pcRef.current && d.sdp) await pcRef.current.setRemoteDescription(new RTCSessionDescription(d.sdp)).catch(()=>{});
+    };
+    const onIce     = d => {
+      if (!isThisCall(d) || !d.candidate) return;
+      const ng = negotiatorRef.current;
+      if (ng) ng.handleRemoteCandidate(d.candidate).catch(()=>{});
+      else if (pcRef.current) pcRef.current.addIceCandidate(new RTCIceCandidate(d.candidate)).catch(()=>{});
+    };
     const onMute    = d => { if (!isThisCall(d) || (d.from && d.from !== targetUser?.id)) return; setRemoteMuted(d.muted === true); };
+    const onCam     = d => {
+      if (!isThisCall(d) || (d.from && d.from !== targetUser?.id)) return;
+      if (d.on === true) setRemoteCam(true);
+      else { setRemoteCam(false); setRemoteVid(false); }
+    };
 
     socket.on('call_accept',  onAccept);
     socket.on('call_decline', onDecline);
@@ -387,6 +499,7 @@ function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClo
     socket.on('rtc_answer',   onAnswer);
     socket.on('rtc_ice',      onIce);
     socket.on('call_mute',    onMute);
+    socket.on('call_camera',  onCam);
 
     if (!incoming) startCall(true);
 
@@ -398,6 +511,7 @@ function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClo
       socket.off('rtc_answer', onAnswer);
       socket.off('rtc_ice', onIce);
       socket.off('call_mute', onMute);
+      socket.off('call_camera', onCam);
       cleanup();
     };
   }, []);
@@ -425,28 +539,42 @@ function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClo
       streamRef.current = stream;
       if (localRef.current) localRef.current.srcObject = stream;
 
-      const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+      const pc = new RTCPeerConnection({ iceServers: rtcIceServers() });
       pcRef.current = pc;
       stream.getTracks().forEach(t => pc.addTrack(t, stream));
 
       pc.ontrack = e => {
         if (remoteRef.current) remoteRef.current.srcObject = e.streams[0];
         startPeerMonitor(e.streams[0]);
-      };
-      pc.onicecandidate = e => {
-        if (e.candidate) socket.emit('rtc_ice', { toUserId: targetUser?.id, dmId, candidate: e.candidate });
+        const vt = e.streams[0]?.getVideoTracks?.();
+        if (vt && vt.length) {
+          setRemoteVid(true);
+          vt.forEach(t => { try { t.addEventListener('ended', () => setRemoteVid(false), { once: true }); } catch {} });
+        }
       };
 
+      // Perfect-negotiation state machine: serializes camera (and ICE-restart)
+      // renegotiation so simultaneous toggles on both ends can't desync the call.
+      const ng = createCallNegotiator({
+        pc,
+        polite: !isInitiator,
+        send: (kind, payload) => {
+          if (!socket.connected) return;
+          const base = { toUserId: targetUser?.id, dmId };
+          if (kind === 'invite') socket.emit('call_invite', { ...base, sdp: payload });
+          else if (kind === 'accept') socket.emit('call_accept', { ...base, sdp: payload });
+          else if (kind === 'ice') socket.emit('rtc_ice', { ...base, candidate: payload });
+          else socket.emit('rtc_' + kind, { ...base, sdp: payload });
+        },
+      });
+      negotiatorRef.current = ng;
+      pc.onicecandidate = e => { if (e.candidate) ng.handleLocalCandidate(e.candidate); };
+
       if (isInitiator) {
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        socket.emit('call_invite', { toUserId: targetUser?.id, dmId, sdp: offer });
         setStatus('calling');
+        await ng.negotiate({ via: 'invite' });
       } else if (offerData) {
-        await pc.setRemoteDescription(new RTCSessionDescription(offerData.sdp));
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        socket.emit('call_accept', { toUserId: targetUser?.id, dmId, sdp: answer });
+        await ng.handleRemoteDescription(offerData.sdp || offerData, { via: 'accept' });
         setStatus('connected');
       }
     } catch { cleanup(); setStatus('error'); }
@@ -462,6 +590,7 @@ function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClo
       stopPeerMonitor();
     }
     if (remoteRef.current) applySpeakerSink(remoteRef.current, loadMediaPrefs().speaker);
+    if (remoteVidRef.current) applySpeakerSink(remoteVidRef.current, loadMediaPrefs().speaker);
   }, [status]);
 
   // Watch the remote audio track and flip the indicator when they actually speak.
@@ -535,8 +664,14 @@ function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClo
 
   function cleanup() {
     stopPeerMonitor();
+    closeAvatarTrack();
+    negotiatorRef.current?.close();
+    negotiatorRef.current = null;
+    camStreamRef.current?.getTracks().forEach(t => t.stop());
+    camStreamRef.current = null;
     streamRef.current?.getTracks().forEach(t => t.stop());
     pcRef.current?.close();
+    pcRef.current = null;
   }
 
   function toggleMute() {
@@ -555,6 +690,150 @@ function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClo
     socket.on('connect', resend);
     return () => socket.off('connect', resend);
   }, [socket, muted, targetUser?.id, dmId]);
+
+  // Camera on/off mid-call. We use the saved camera device (Settings → Voice &
+  // Video), swap the video sender's track, and let the perfect-negotiation
+  // machine push the renegotiation. The peer learns our state via call_camera.
+  async function enableCam() {
+    setCamWarn('');
+    // External app mode: transmit the chosen app's virtual camera (VTube
+    // Studio / OBS / Snap…) directly instead of our avatar engine.
+    if (loadAvatarConfig().mode === 'external') {
+      const ext = await externalVideoStream();
+      if (!ext || !ext.getVideoTracks().length) {
+        setCamWarn('🧪 No external app camera feed found. Start VTube Studio / OBS / Snap Camera with its virtual camera on, pick that device in Settings → Voice & Video → External app, then try again.');
+        return;
+      }
+      try {
+        const local = streamRef.current;
+        const vtrackE = ext.getVideoTracks()[0];
+        if (local && !local.getVideoTracks().includes(vtrackE)) { try { local.addTrack(vtrackE); } catch {} }
+        camStreamRef.current = ext;
+        const pc = pcRef.current;
+        if (pc) {
+          const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
+          if (sender) await sender.replaceTrack(vtrackE);
+          else pc.addTrack(vtrackE, local || ext);
+        }
+        if (localVidRef.current) localVidRef.current.srcObject = local || ext;
+        setCamOn(true);
+        setAvatarLive(false);
+        negotiatorRef.current?.markDirty();
+        if (socket.connected) socket.emit('call_camera', { toUserId: targetUser?.id, dmId, on: true });
+        return;
+      } catch {
+        ext.getTracks().forEach(t => t.stop());
+        camStreamRef.current = null;
+        setCamWarn('🧪 Could not start the external app camera. Try again.');
+        return;
+      }
+    }
+    // Avatar mode first: the canvas track of the avatar engine replaces the
+    // real camera. The webcam is only ever used locally for tracking.
+    let vtrack = null;
+    try { vtrack = await openAvatarTrack({ micStream: streamRef.current }); }
+    catch { /* avatar startup failed — fall through to the real camera */ }
+    if (vtrack) {
+      try {
+        const pc = pcRef.current;
+        if (pc) {
+          const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
+          if (sender) await sender.replaceTrack(vtrack);
+          else pc.addTrack(vtrack, streamRef.current || liveAvatarStream());
+        }
+        if (localVidRef.current) localVidRef.current.srcObject = liveAvatarStream();
+        setCamOn(true);
+        setAvatarLive(true);
+        negotiatorRef.current?.markDirty();
+        if (socket.connected) socket.emit('call_camera', { toUserId: targetUser?.id, dmId, on: true });
+        return;
+      } catch {
+        closeAvatarTrack();
+        setAvatarLive(false);
+        setCamWarn('🤖 Could not start your avatar. Try again.');
+        return;
+      }
+    }
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia(mediaConstraints('camera'));
+    } catch (err) {
+      const name = err?.name || '';
+      setCamWarn(name === 'NotAllowedError' || name === 'PermissionDeniedError' || name === 'SecurityError'
+        ? '📷 Camera permission is blocked. Allow camera access for this site, then try again.'
+        : (name === 'NotFoundError' || name === 'OverconstrainedError' || name === 'DevicesNotFoundError')
+          ? '📷 No camera found. Pick one in Settings → Voice & Video.'
+          : '📷 Could not start your camera. Try again.');
+      return;
+    }
+    const vtrack2 = stream.getVideoTracks()[0];
+    if (!vtrack2) {
+      stream.getTracks().forEach(t => t.stop());
+      setCamWarn('📷 No camera found. Pick one in Settings → Voice & Video.');
+      return;
+    }
+    try {
+      const local = streamRef.current;
+      if (local && !local.getVideoTracks().includes(vtrack2)) { try { local.addTrack(vtrack2); } catch {} }
+      camStreamRef.current = stream;
+      const pc = pcRef.current;
+      if (pc) {
+        const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
+        if (sender) await sender.replaceTrack(vtrack2);
+        else pc.addTrack(vtrack2, local || stream);
+      }
+      if (localVidRef.current) localVidRef.current.srcObject = local || stream;
+      setCamOn(true);
+      setAvatarLive(false);
+      negotiatorRef.current?.markDirty();
+      if (socket.connected) socket.emit('call_camera', { toUserId: targetUser?.id, dmId, on: true });
+    } catch {
+      stream.getTracks().forEach(t => t.stop());
+      camStreamRef.current = null;
+      setCamWarn('📷 Could not turn the camera on. Try again.');
+    }
+  }
+
+  async function disableCam() {
+    setCamOn(false);
+    setCamWarn('');
+    setAvatarLive(false);
+    closeAvatarTrack();
+    if (localVidRef.current) localVidRef.current.srcObject = null;
+    try {
+      const pc = pcRef.current;
+      const sender = pc?.getSenders().find(s => s.track && s.track.kind === 'video');
+      if (sender) await sender.replaceTrack(null);
+      negotiatorRef.current?.markDirty();
+    } catch {}
+    const local = streamRef.current;
+    if (local) local.getVideoTracks().forEach(t => { try { local.removeTrack(t); } catch {} });
+    camStreamRef.current?.getTracks().forEach(t => t.stop());
+    camStreamRef.current = null;
+    if (socket.connected) socket.emit('call_camera', { toUserId: targetUser?.id, dmId, on: false });
+  }
+
+  async function toggleCam() {
+    if (camBusy) return;
+    setCamBusy(true);
+    try { if (camOn) await disableCam(); else await enableCam(); }
+    finally { setCamBusy(false); }
+  }
+
+  // If the socket dropped mid-negotiation, recover the media path with an
+  // ICE restart once we're back, and re-announce our camera state.
+  useEffect(() => {
+    if (!socket) return undefined;
+    const resend = () => {
+      if (!pcRef.current || !negotiatorRef.current) return;
+      if (socket.connected) {
+        negotiatorRef.current.restart();
+        if (camOn) socket.emit('call_camera', { toUserId: targetUser?.id, dmId, on: true });
+      }
+    };
+    socket.on('connect', resend);
+    return () => socket.off('connect', resend);
+  }, [socket, camOn, targetUser?.id, dmId]);
 
   const micWarn = micIssue
     ? micIssue === 'denied' ? 'Microphone permission is blocked, so the call can’t start. Allow mic access for this site (address-bar icon or OS privacy settings), then retry.'
@@ -578,6 +857,12 @@ function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClo
           : status === 'error'     ? '⚠ Could not connect'
           : '⏳ Connecting…'}
         </p>
+        {status === 'error' && !rtcRelayConfigured() && (
+          <p className="call-rtc-hint" role="status">
+            🔁 Still can't connect? This server has <b>no TURN relay</b> configured, so calls between strict networks fail.
+            Ask the server admin to add <code>TURN_URLS</code> (plus<code> TURN_USERNAME</code> / <code>TURN_CREDENTIAL</code>) and restart.
+          </p>
+        )}
         {status === 'connected' && (() => {
           const micState = remoteMuted ? 'muted' : peerMic;
           const cls = 'call-mic-chip'
@@ -605,6 +890,15 @@ function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClo
         )}
         <audio ref={localRef}  autoPlay muted style={{display:'none'}} />
         <audio ref={remoteRef} autoPlay       style={{display:'none'}} />
+        {status === 'connected' && (camOn || remoteVid || remoteCam === false) && (
+          <div className="call-video-stage">
+            <video ref={remoteVidRef} autoPlay playsInline className={`call-vid-remote${remoteVid ? ' on' : ''}`} />
+            {remoteCam === false && <span className="call-vid-off-chip">📷 Camera off</span>}
+            {camOn && <video ref={localVidRef} autoPlay muted playsInline className={`call-vid-local${remoteVid ? ' pip' : ' main'}`} />}
+            {camOn && avatarLive && <span className="call-av-note" role="note">📷 camera used for avatar tracking only — face never sent</span>}
+          </div>
+        )}
+        {camWarn && <p className="call-cam-warn" role="alert">{camWarn}</p>}
         <div className="call-controls">
           {status === 'incoming' && !micWarn ? (
             <>
@@ -616,6 +910,12 @@ function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClo
               {status === 'connected' && (
                 <button className={`call-btn mute${muted?' active':''}`} onClick={toggleMute}>
                   {muted ? '🔇' : '🎤'}
+                </button>
+              )}
+              {status === 'connected' && (
+                <button className={`call-btn cam${camOn?' active':''}`} onClick={toggleCam} disabled={camBusy}
+                  title={camOn ? 'Turn ' + (loadAvatarConfig().mode === 'camera' ? 'camera' : 'avatar') + ' off' : (loadAvatarConfig().mode === 'camera' ? 'Turn camera on' : 'Send your avatar')}>
+                  {camOn ? (loadAvatarConfig().mode === 'camera' ? '📷' : '🤖') : '🎥'}
                 </button>
               )}
               <button className="call-btn end" onClick={endCall}>End</button>
@@ -829,6 +1129,23 @@ function ArgModal({ onClose, notify }) {
   );
 }
 
+// A small human-readable label for this device/browser, stored on each auth
+// session so the Security → Sessions list can tell devices apart.
+function deviceLabel() {
+  const ua = navigator.userAgent;
+  const os = /Windows NT/i.test(ua) ? 'Windows'
+    : /Mac OS X/i.test(ua) ? 'macOS'
+    : /Android/i.test(ua) ? 'Android'
+    : /iPhone|iPad|iPod/i.test(ua) ? 'iOS'
+    : /Linux/i.test(ua) ? 'Linux' : 'Unknown OS';
+  const browser = /Edg\//i.test(ua) ? 'Edge'
+    : /OPR\/|Opera/i.test(ua) ? 'Opera'
+    : /Chrome\/|CriOS\//i.test(ua) ? 'Chrome'
+    : /Firefox\//i.test(ua) ? 'Firefox'
+    : /Safari\//i.test(ua) ? 'Safari' : 'Unknown browser';
+  return `${browser} on ${os}`;
+}
+
 function Auth({ onAuth, initialError = '' }) {
   useEffect(() => {
     if (!('Notification' in window) || Notification.permission !== 'default') return;
@@ -840,6 +1157,9 @@ function Auth({ onAuth, initialError = '' }) {
   const [remember, setRemember] = useState(false);
   const [err, setErr]     = useState(initialError);
   const [loading, setLoading] = useState(false);
+  const [pre2fa, setPre2fa]   = useState(null); // { preToken, username } while awaiting the code step
+  const [code, setCode]       = useState('');
+  const [codeFails, setCodeFails] = useState(0); // invalid second-factor attempts on this screen
 
   async function submit(e) {
     e.preventDefault();
@@ -854,14 +1174,47 @@ function Auth({ onAuth, initialError = '' }) {
     }
     setLoading(true); setErr('');
     try {
-      const d = await api(`/api/${mode}`, { method:'POST', body:JSON.stringify({ ...form, username }), headers:{ Authorization:'' } });
+      const d = await api(`/api/${mode}`, { method:'POST', body:JSON.stringify({ ...form, username, device: deviceLabel() }), headers:{ Authorization:'' } });
       if (d.error) {
         setErr([502, 503, 504].includes(d.status)
           ? 'The chat server is temporarily unavailable. Check that the server is running, then try again.'
           : d.error);
       }
+      else if (d.need2fa && mode === 'login' && d.preToken) {
+        // Password was right; the account requires a second factor.
+        setPre2fa({ preToken: d.preToken, username: d.username || username });
+        setForm({ username: '', password: '' });
+        setCode('');
+        setCodeFails(0);
+      }
       else if (!d.token || !d.user) setErr('The server returned an incomplete login response. Check the server logs.');
       else { setToken(d.token, remember); onAuth(d.user); }
+    } catch (error) {
+      setErr(`Unable to reach the server: ${error.message || 'network error'}`);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function submit2fa(e) {
+    e.preventDefault();
+    const clean = code.trim();
+    if (clean.length < 6) {
+      setErr('Enter the 6-digit code from your authenticator app, or a recovery code.');
+      return;
+    }
+    setLoading(true); setErr('');
+    try {
+      const d = await api('/api/login/2fa', { method:'POST', body:JSON.stringify({ preToken: pre2fa.preToken, code: clean, device: deviceLabel() }), headers:{ Authorization:'' } });
+      if (d.error) {
+        const fails = codeFails + 1;
+        setCodeFails(fails);
+        setErr(fails >= 3
+          ? "That code did not work. If you no longer have your authenticator app or any recovery code, there is no email-based reset on Unknown — use the support link below to recover your account."
+          : d.error);
+      }
+      else if (d.token && d.user) { setToken(d.token, remember); onAuth(d.user); }
+      else setErr('The server returned an incomplete login response. Try again.');
     } catch (error) {
       setErr(`Unable to reach the server: ${error.message || 'network error'}`);
     } finally {
@@ -892,23 +1245,49 @@ function Auth({ onAuth, initialError = '' }) {
         </div>
         <p className="support-link">Need help? <a href="mailto:bertrude.white2006@gmail.com">bertrude.white2006@gmail.com</a></p>
       </section>
-      <form onSubmit={submit} className="panel auth-form">
+      <form onSubmit={pre2fa ? submit2fa : submit} className="panel auth-form">
         <div className="auth-logo"><Logo size={40} /></div>
-        <div className="auth-form-heading">
-          <div>
-            <h2>{mode === 'login' ? 'Welcome back' : 'Create an account'}</h2>
-            <p>{mode === 'login' ? 'Pick up where you left off.' : 'Use a handle that keeps your real identity private.'}</p>
+        {!pre2fa ? (
+          <div className="auth-form-heading">
+            <div>
+              <h2>{mode === 'login' ? 'Welcome back' : 'Create an account'}</h2>
+              <p>{mode === 'login' ? 'Pick up where you left off.' : 'Use a handle that keeps your real identity private.'}</p>
+            </div>
+            <span className="auth-step" aria-label={mode === 'login' ? 'Sign in' : 'Registration'}>{mode === 'login' ? '1 / 1' : '1 / 1'}</span>
           </div>
-          <span className="auth-step" aria-label={mode === 'login' ? 'Sign in' : 'Registration'}>{mode === 'login' ? '1 / 1' : '1 / 1'}</span>
-        </div>
-        <label className="auth-field">Username<input aria-label="Username" placeholder="Choose a handle" value={form.username} onChange={e => setForm({...form,username:e.target.value})} autoComplete="username" required /></label>
-        <label className="auth-field">Password<input aria-label="Password" placeholder="Your password" type="password" value={form.password} onChange={e => setForm({...form,password:e.target.value})} autoComplete={mode === 'login' ? 'current-password' : 'new-password'} required /></label>
+        ) : (
+          <div className="auth-form-heading">
+            <div>
+              <h2>Two-step verification</h2>
+              <p>Enter the code for <b>{pre2fa.username}</b> from your authenticator app, or use a recovery code.</p>
+            </div>
+            <span className="auth-step" aria-label="Second factor">2 / 2</span>
+          </div>
+        )}
+        {!pre2fa ? (
+          <>
+            <label className="auth-field">Username<input aria-label="Username" placeholder="Choose a handle" value={form.username} onChange={e => setForm({...form,username:e.target.value})} autoComplete="username" required /></label>
+            <label className="auth-field">Password<input aria-label="Password" placeholder="Your password" type="password" value={form.password} onChange={e => setForm({...form,password:e.target.value})} autoComplete={mode === 'login' ? 'current-password' : 'new-password'} required /></label>
+          </>
+        ) : (
+          <>
+            <label className="auth-field">Code<input aria-label="Authenticator code" placeholder="000000 or XXXXX-XXXXX" autoComplete="one-time-code" value={code} onChange={e => setCode(e.target.value.replace(/[^0-9a-zA-Z-]/g, ''))} autoFocus required /></label>
+            <p className="auth-2fa-hint" role="note"><span aria-hidden="true">💡</span><span><b>Recovery codes work here too.</b> If you do not have your authenticator app handy, enter any saved recovery code (10 characters, like <code>XXXXX-XXXXX</code>) in this field instead of the 6-digit code.</span></p>
+            <p className="auth-2fa-support">Lost your authenticator app <b>and</b> all recovery codes? Unknown has no email-based reset, so contact <a href="mailto:bertrude.white2006@gmail.com">bertrude.white2006@gmail.com</a> for account-recovery help.</p>
+          </>
+        )}
         {err && <p className="error" role="alert" aria-live="polite">{err}</p>}
-        <label className="remember"><input type="checkbox" checked={remember} onChange={e => setRemember(e.target.checked)} /> Keep me signed in</label>
-        <button disabled={loading} aria-busy={loading}>{loading ? <><span className="button-spinner" aria-hidden="true" /> {mode === 'login' ? 'Checking…' : 'Creating…'}</> : mode === 'login' ? 'Log in' : 'Register'}</button>
-        <button type="button" className="ghost auth-switch" onClick={() => { setMode(mode==='login'?'register':'login'); setForm({ username: form.username, password: '' }); setErr(''); }}>
-          {mode === 'login' ? 'Need an account? Register' : 'Have an account? Log in'}
-        </button>
+        {!pre2fa && <label className="remember"><input type="checkbox" checked={remember} onChange={e => setRemember(e.target.checked)} /> Keep me signed in</label>}
+        <button disabled={loading} aria-busy={loading}>{loading ? <><span className="button-spinner" aria-hidden="true" /> {pre2fa ? 'Verifying…' : mode === 'login' ? 'Checking…' : 'Creating…'}</> : pre2fa ? 'Verify & sign in' : mode === 'login' ? 'Log in' : 'Register'}</button>
+        {pre2fa ? (
+          <button type="button" className="ghost auth-switch" onClick={() => { setPre2fa(null); setCode(''); setErr(''); setCodeFails(0); }}>
+            Back to password
+          </button>
+        ) : (
+          <button type="button" className="ghost auth-switch" onClick={() => { setMode(mode==='login'?'register':'login'); setForm({ username: form.username, password: '' }); setErr(''); }}>
+            {mode === 'login' ? 'Need an account? Register' : 'Have an account? Log in'}
+          </button>
+        )}
       </form>
     </main>
   );
@@ -3805,6 +4184,8 @@ function RoomView({ roomId, me, socket, notify, onLaunchGame }) {
   const [cameraOn, setCameraOn] = useState(true);       // local camera state (video rooms)
   const meshRef = useRef(null);
   const remoteRefs = useRef({});
+  const camExtraRef = useRef(null);
+  const [avatarSending, setAvatarSending] = useState(false);
 
   const meta = ROOM_META[room?.type] || ROOM_META.chat;
 
@@ -3900,8 +4281,12 @@ function RoomView({ roomId, me, socket, notify, onLaunchGame }) {
 
   function leaveRoom() {
     api(`/api/rooms/${roomId}/leave`, { method:'POST' }).catch(()=>{});
+    closeAvatarTrack();
+    camExtraRef.current?.getTracks().forEach(t=>t.stop());
+    camExtraRef.current = null;
     streamRef.current?.getTracks().forEach(t=>t.stop());
     meshRef.current?.leave();
+    setAvatarSending(false);
     setJoined(false); setInCall(false); setWaiting(false); setMessages([]);
   }
 
@@ -3932,18 +4317,57 @@ function RoomView({ roomId, me, socket, notify, onLaunchGame }) {
   async function joinVoice() {
     try {
       const wantsVideo = room?.type==='video';
-      const stream = await navigator.mediaDevices.getUserMedia(mediaConstraints(wantsVideo ? 'mic+camera' : 'mic'));
+      const cfg = loadAvatarConfig();
+      const avatarKind = (cfg.mode === '2d' || cfg.mode === '3d' || cfg.mode === 'external') ? cfg.mode : null;
+      let stream;
+      if (wantsVideo && avatarKind) {
+        if (avatarKind === 'external') {
+          // External app video room: mic audio + the app's virtual camera
+          // stream (VTube Studio / OBS / Snap…) — no built-in tracking.
+          stream = await navigator.mediaDevices.getUserMedia(mediaConstraints('mic'));
+          const es = await externalVideoStream();
+          if (!es || !es.getVideoTracks().length) {
+            stream.getTracks().forEach(t => t.stop());
+            notify('External camera app not found — start VTube Studio / OBS / Snap Camera, then pick its virtual camera in Settings → Voice & Video → External app.', 'err');
+            return;
+          }
+          es.getVideoTracks().forEach(t => stream.addTrack(t));
+          camExtraRef.current = es;
+          setAvatarSending(false);
+        } else {
+          // Avatar video room: mic audio + the avatar engine's canvas track. A
+          // tracking webcam (if granted) never leaves this machine.
+          stream = await navigator.mediaDevices.getUserMedia(mediaConstraints('mic'));
+          const vtrack = await openAvatarTrack({ micStream: stream });
+          if (vtrack) {
+            stream.addTrack(vtrack);
+            setAvatarSending(true);
+          } else {
+            setAvatarSending(false);
+            const cs = await navigator.mediaDevices.getUserMedia(mediaConstraints('camera'));
+            cs.getVideoTracks().forEach(t => stream.addTrack(t));
+            camExtraRef.current = cs;
+          }
+        }
+      } else {
+        stream = await navigator.mediaDevices.getUserMedia(mediaConstraints(wantsVideo ? 'mic+camera' : 'mic'));
+        setAvatarSending(false);
+      }
       streamRef.current = stream;
       setCameraOn(true);
       meshRef.current?.join(stream);
       setInCall(true);
-    } catch { notify('Could not access ' + (room?.type==='video'?'camera':'microphone'), 'err'); }
+    } catch { notify('Could not access ' + (room?.type==='video'?'camera/microphone':'microphone'), 'err'); }
   }
 
   function leaveVoice() {
+    closeAvatarTrack();
+    camExtraRef.current?.getTracks().forEach(t=>t.stop());
+    camExtraRef.current = null;
     streamRef.current?.getTracks().forEach(t=>t.stop());
     meshRef.current?.leave();
     remoteRefs.current = {};
+    setAvatarSending(false);
     setInCall(false); setMuted(false); setPttDown(false); setCameraOn(true);
   }
 
@@ -4067,12 +4491,15 @@ function RoomView({ roomId, me, socket, notify, onLaunchGame }) {
               <>
                 <div className="room-self-tile">
                   {room.type==='video' && cameraOn
-                    ? <video ref={el=>{ if(el) el.srcObject = streamRef.current; }} autoPlay muted playsInline style={{width:'100%',borderRadius:10,aspectRatio:'16/9',background:'#000'}} />
+                    ? (avatarSending
+                        ? <video ref={el=>{ if(el) el.srcObject = liveAvatarStream(); }} autoPlay muted playsInline style={{width:'100%',borderRadius:10,aspectRatio:'16/9',background:'#0b0b12'}} />
+                        : <video ref={el=>{ if(el) el.srcObject = streamRef.current; }} autoPlay muted playsInline style={{width:'100%',borderRadius:10,aspectRatio:'16/9',background:'#000'}} />)
                     : <>
                         <Avatar src={me?.avatar} name={me?.nickname||me?.username} size="lg" badge={me?.badge} />
                         {room.type==='video' && !cameraOn && <span className="cam-off-label">📷 camera off</span>}
                       </>}
-                  <span>{me?.nickname||me?.username} {muted && '🔇'}</span>
+                  <span>{me?.nickname||me?.username} {avatarSending && <em className="avatar-send-chip">🤖 avatar</em>} {muted && '🔇'}</span>
+                  {room.type==='video' && avatarSending && cameraOn && <span className="avatar-cam-note" role="note">📷 camera used for avatar tracking only — face never sent</span>}
                 </div>
                 {voiceRoster.map(u => {
                   const hasMedia = Boolean(meshRef.current?.streamFor(u.userId));
@@ -4748,8 +5175,85 @@ function OwnerHistoryModal({ me, boot, onClose, notify }) {
   );
 }
 
+// ── Voice relay (TURN) admin ─────────────────────────────────────────────────
+// Health badge + DB-stored relay editor for the Owner Console. The relay config
+// lives in PostgreSQL (shared by every instance), with env vars as fallback.
+function RtcHealthBadge({ refreshKey = 0 }) {
+  const [state, setState] = useState('loading');
+  const [count, setCount] = useState(0);
+  useEffect(() => {
+    let alive = true;
+    api('/api/health/rtc').then(d => {
+      if (!alive) return;
+      if (!d || d.error) { setState('error'); return; }
+      setCount(d.turn?.urls?.length || 0);
+      setState(d.turn?.configured ? (d.ok ? 'ok' : 'unreachable') : 'no-turn');
+    }).catch(() => { if (alive) setState('error'); });
+    return () => { alive = false; };
+  }, [refreshKey]);
+  if (state === 'loading') return null;
+  const tone = state === 'ok' ? 'ok' : state === 'no-turn' ? 'warn' : 'bad';
+  const text = state === 'ok' ? `✅ Voice relay reachable (${count} TURN url${count === 1 ? '' : 's'})`
+    : state === 'no-turn' ? `⚠️ No TURN relay configured — calls between strict networks can't connect. Add one in the Voice relay (TURN) settings below — it is stored in the database and shared by every instance.`
+    : state === 'unreachable' ? `🛑 TURN relay configured but unreachable — check the host, port, and firewall rules, then fix it in the Voice relay (TURN) settings below.`
+    : `⚠️ Relay health unavailable — the /api/health/rtc endpoint did not respond.`;
+  return <p className={`rtc-health-badge ${tone}`} role="status">{text}</p>;
+}
+
+function RtcAdminEditor({ onSaved, notify }) {
+  const [loaded, setLoaded] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [source, setSource] = useState('env');
+  const [credStored, setCredStored] = useState(false);
+  const [form, setForm] = useState({ turnUrls: '', username: '', credential: '', clearCredential: false });
+  useEffect(() => {
+    let alive = true;
+    api('/api/admin/rtc').then(d => {
+      if (!alive) return;
+      if (d && !d.error) {
+        setForm(f => ({ ...f, turnUrls: d.turnUrls || '', username: d.username || '' }));
+        setSource(d.source || 'env');
+        setCredStored(Boolean(d.credentialConfigured));
+      }
+      setLoaded(true);
+    }).catch(() => setLoaded(true));
+    return () => { alive = false; };
+  }, []);
+  async function save(e) {
+    e.preventDefault();
+    setSaving(true);
+    const d = await api('/api/admin/rtc', { method: 'PUT', body: JSON.stringify(form) });
+    setSaving(false);
+    if (d.error) return notify(d.error, 'err');
+    setForm(f => ({ ...f, credential: '', clearCredential: false }));
+    setSource('db');
+    setCredStored(Boolean(d.credentialConfigured));
+    onSaved();
+    notify('Relay settings saved — stored in the database and served by every instance.', 'ok');
+  }
+  if (!loaded) return null;
+  return (
+    <details className="rtc-admin-editor">
+      <summary>Voice relay (TURN) settings — shared by every server instance</summary>
+      <p className="muted-text rtc-editor-hint">Stored in the database so all instances serve the same relay without environment changes. Empty fields fall back to the environment variables (<code>TURN_URLS</code>,<code> TURN_USERNAME</code>, <code>TURN_CREDENTIAL</code>). Current source: <b>{source === 'db' ? 'database' : 'environment variables'}</b>{credStored ? ' · credential stored (never shown again)' : ' · no credential stored'}.</p>
+      <form className="rtc-admin-form" onSubmit={save}>
+        <label>TURN urls (comma separated)</label>
+        <textarea rows={3} value={form.turnUrls} placeholder="turn:turn.example.com:3478?transport=udp,turn:turn.example.com:3478?transport=tcp,turns:turn.example.com:5349?transport=tcp"
+          onChange={e => setForm(f => ({ ...f, turnUrls: e.target.value }))} />
+        <div className="rtc-admin-row">
+          <label>Username<input value={form.username} placeholder="turn-username" onChange={e => setForm(f => ({ ...f, username: e.target.value }))} /></label>
+          <label>Credential (write-only)<input type="password" value={form.credential} placeholder={credStored ? '•••••• stored — leave blank to keep' : 'turn-credential'} onChange={e => setForm(f => ({ ...f, credential: e.target.value }))} /></label>
+        </div>
+        <label className="rtc-clear-cred"><input type="checkbox" checked={form.clearCredential} onChange={e => setForm(f => ({ ...f, clearCredential: e.target.checked }))} /> Remove the stored credential</label>
+        <div className="rtc-admin-actions"><button className="rtc-save-btn" disabled={saving}>{saving ? 'Saving…' : 'Save relay settings'}</button></div>
+      </form>
+    </details>
+  );
+}
+
 function AdminPanel({ onNotice, boot, onBootRefresh, me }) {
   const [tab, setTab]     = useState('stats');
+  const [rtcTick, setRtcTick] = useState(0); // bump to re-probe relay health after a save
   const [users, setUsers] = useState([]);
   const [reports, setReports] = useState([]);
   const [stats, setStats] = useState(null);
@@ -4918,6 +5422,7 @@ function AdminPanel({ onNotice, boot, onBootRefresh, me }) {
   return (
     <section className="admin panel">
       <h2>⚙ Owner Console</h2>
+      <RtcHealthBadge refreshKey={rtcTick} />
       {stats && (
         <div className="admin-stats">
           <span>{stats.users} users</span>
@@ -4927,6 +5432,7 @@ function AdminPanel({ onNotice, boot, onBootRefresh, me }) {
           <span>{stats.bots} bots</span>
         </div>
       )}
+      <RtcAdminEditor onSaved={() => setRtcTick(t => t + 1)} notify={onNotice} />
       <div className="admin-tabs">
         {TABS.map(t => <button key={t} className={tab===t?'active':''} onClick={()=>setTab(t)}>{t.charAt(0).toUpperCase()+t.slice(1)}</button>)}
       </div>
@@ -5425,6 +5931,7 @@ function App() {
       }
       setMe(d.me);
       setBoot(d);
+      rememberRtcServers(d);
       // Only auto-open a community the user actually belongs to; otherwise land on
       // the guided start state (Discover / create / friends) instead of a denied server.
       const joinedIds = new Set((d.memberships || []).map(m => m.community_id));
@@ -5519,6 +6026,27 @@ function App() {
       const self = me && byId.get(me.id);
       if (self) setMe(m => (m.status || '') === (self.status || '') && (m.custom_status || '') === (self.custom_status || '') ? m : { ...m, status: self.status, custom_status: self.custom_status });
     };
+    // An account was erased (self-service delete or moderation). If it was THIS
+    // account (deleted from another device/instance) sign straight out; peers
+    // drop the erased user from their live user/friend/DM lists immediately
+    // instead of keeping stale entries until the next reload or heartbeat.
+    const onAccountDeleted = ({ userId } = {}) => {
+      if (!userId) return;
+      if (me && me.id === userId) {
+        clearToken();
+        socket.disconnect();
+        location.reload();
+        return;
+      }
+      setBoot(b => {
+        if (!b) return b;
+        const users   = (b.users   || []).filter(u => u.id !== userId);
+        const friends = (b.friends || []).filter(f => f.requester_id !== userId && f.addressee_id !== userId);
+        const dms     = (b.dms     || []).filter(d => d.user_a !== userId && d.user_b !== userId);
+        if (users.length === (b.users || []).length && friends.length === (b.friends || []).length && dms.length === (b.dms || []).length) return b;
+        return { ...b, users, friends, dms };
+      });
+    };
     socket.on('connect', joinRooms);
     socket.on('connect_error', onSocketError);
     if (!socket.connected) socket.connect();
@@ -5536,6 +6064,7 @@ function App() {
     socket.on('call_invite', onCallInvite);
     socket.on('community_locked', onCommunityLocked);
     socket.on('presence_sync', onPresenceSync);
+    socket.on('account_deleted', onAccountDeleted);
     // Presence heartbeat: periodically pull the DB-backed snapshot so statuses
     // apply even if a user_update event was missed or happened on another
     // instance. The server also pushes a snapshot on every (re)connect.
@@ -5548,6 +6077,7 @@ function App() {
       socket.off('global_event', onGlobalEvent); socket.off('global_event_end', onGlobalEventEnd); socket.off('global_announcement', onGlobalAnnouncement);
       socket.off('challenge_roll', onChallengeRoll); socket.off('call_invite', onCallInvite); socket.off('community_locked', onCommunityLocked);
       socket.off('presence_sync', onPresenceSync);
+      socket.off('account_deleted', onAccountDeleted);
     };
   }, [socket, me, channelId, boot?.dms, boot?.groups]);
 

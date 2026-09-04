@@ -1840,6 +1840,20 @@ html[data-theme=ocean]  { --bg:#0a1628;--panel:#0d1f3c;--sidebar:#071323;--soft:
 .call-btn.end     { background: var(--danger); color: #fff; }
 .call-btn.mute    { background: var(--soft); }
 .call-btn.mute.active { background: var(--danger); color: #fff; }
+.call-btn.cam     { background: var(--soft); }
+.call-btn.cam.active { background: var(--danger); color: #fff; }
+.call-btn.cam:disabled { opacity: 0.5; cursor: not-allowed; }
+/* DM-call camera: a rounded stage showing the peer's video (or our own while
+   the peer is still audio-only); our camera shrinks to a PiP once theirs plays. */
+.call-video-stage { position: relative; width: 320px; height: 200px; border-radius: 12px; overflow: hidden; background: #000; box-shadow: var(--shadow); }
+.call-vid-remote, .call-vid-local { position: absolute; object-fit: cover; background: #000; }
+.call-vid-remote { inset: 0; width: 100%; height: 100%; display: none; }
+.call-vid-remote.on { display: block; }
+.call-vid-local { display: none; }
+.call-vid-local.main { inset: 0; width: 100%; height: 100%; display: block; }
+.call-vid-local.pip { inset: auto auto 8px 8px; width: 34%; height: 34%; border-radius: 8px; border: 1px solid rgba(255,255,255,0.4); z-index: 2; }
+.call-vid-off-chip { position: absolute; inset: auto 8px 8px auto; font-size: 0.72rem; font-weight: 600; color: #fff; background: rgba(0,0,0,0.55); border: 1px solid rgba(255,255,255,0.25); padding: 0.25rem 0.6rem; border-radius: 999px; z-index: 3; }
+.call-cam-warn { color: var(--warn, #ffb74d); font-size: 0.8rem; margin: 0; max-width: 300px; }
 .call-ring-wrap { border-radius: 50%; padding: 3px; display: inline-block; }
 .call-ring-wrap.ringing { animation: call-ring 1.3s ease-out infinite; }
 @keyframes call-ring {
@@ -2050,6 +2064,12 @@ html[data-theme=ocean]  { --bg:#0a1628;--panel:#0d1f3c;--sidebar:#071323;--soft:
 /* ── Auth support link ── */
 .support-link { font-size: 0.82rem; color: var(--muted); margin-top: 0.75rem; }
 .support-link a { color: var(--brand); }
+
+/* ── Two-step (2FA) hints on the auth screen ── */
+.auth-2fa-hint { display: flex; gap: 0.5rem; align-items: flex-start; text-align: left; background: rgba(88,101,242,0.08); border: 1px solid rgba(88,101,242,0.25); border-radius: var(--radius); padding: 0.55rem 0.7rem; color: var(--text); font-size: 0.8rem; line-height: 1.45; margin: 0.25rem 0 0; }
+.auth-2fa-hint code { background: rgba(88,101,242,0.18); padding: 0.05rem 0.3rem; border-radius: 3px; font-family: monospace; font-size: 0.75rem; }
+.auth-2fa-support { margin: 0.45rem 0 0; font-size: 0.75rem; color: var(--muted); line-height: 1.5; text-align: left; }
+.auth-2fa-support a { color: var(--brand); text-decoration: underline; }
 .auth-logo { display: flex; justify-content: center; margin-bottom: 0.5rem; }
 
 /* ── OK pill ── */
@@ -2436,4 +2456,155 @@ button.dis { opacity:.5; }
   display:inline-flex; align-items:center; gap:4px; margin:0.25rem 0;
   padding:0.2rem 0.6rem; border-radius:999px; font-size:0.8rem;
   background:var(--soft); color:var(--text);
+}
+
+/* Relay / TURN guidance shown when calls fail or peers stay stuck connecting. */
+.call-rtc-hint, .rtc-relay-hint {
+  font-size: 0.78rem; line-height: 1.4; max-width: 320px; margin: 0.25rem 0 0;
+  color: var(--warn, #ffb74d);
+  background: rgba(255, 183, 77, 0.08);
+  border: 1px solid rgba(255, 183, 77, 0.35);
+  border-radius: 8px; padding: 0.45rem 0.6rem; text-align: left;
+}
+.rtc-relay-hint { margin: 0.4rem auto 0; }
+.call-rtc-hint code, .rtc-relay-hint code { color: var(--text, #fff); font-size: 0.72rem; }
+/* Operator console badge fed by /api/health/rtc. */
+.rtc-health-badge {
+  font-size: 0.75rem; line-height: 1.4; margin: 0 0 0.5rem; padding: 0.45rem 0.6rem;
+  border-radius: 8px; border: 1px solid var(--border, #333);
+  background: var(--soft, rgba(255,255,255,0.05)); color: var(--muted, #aaa);
+}
+.rtc-health-badge.ok { color: var(--ok, #4caf50); border-color: var(--ok, #4caf50); background: rgba(76, 175, 80, 0.08); }
+.rtc-health-badge.warn { color: var(--warn, #ffb74d); border-color: var(--warn, #ffb74d); background: rgba(255, 183, 77, 0.08); }
+.rtc-health-badge.bad { color: var(--danger, #ed4245); border-color: var(--danger, #ed4245); background: rgba(237, 66, 69, 0.08); }
+
+/* Owner Console: DB-backed relay (TURN) settings editor. */
+.rtc-admin-editor {
+  border: 1px solid var(--border, #333); border-radius: 8px;
+  background: var(--soft, rgba(255,255,255,0.03)); margin: 0.4rem 0 0.6rem;
+}
+.rtc-admin-editor summary {
+  cursor: pointer; font-size: 0.8rem; font-weight: 600; padding: 0.5rem 0.65rem;
+  color: var(--text, #fff); list-style: none;
+}
+.rtc-admin-editor summary::-webkit-details-marker { display: none; }
+.rtc-admin-editor[open] summary { border-bottom: 1px solid var(--border, #333); }
+.rtc-admin-editor summary::before { content: '▸ '; }
+.rtc-admin-editor[open] summary::before { content: '▾ '; }
+.rtc-admin-form { padding: 0.5rem 0.65rem 0.65rem; display: flex; flex-direction: column; gap: 0.4rem; }
+.rtc-admin-form > label { font-size: 0.68rem; color: var(--muted, #aaa); }
+.rtc-editor-hint { font-size: 0.68rem; line-height: 1.45; margin: 0; padding: 0.5rem 0.65rem 0; }
+.rtc-editor-hint code { color: var(--text, #fff); }
+.rtc-admin-form textarea {
+  width: 100%; box-sizing: border-box; resize: vertical; font-size: 0.72rem;
+  font-family: inherit; color: var(--text, #fff); min-height: 3.2rem;
+  background: var(--panel, #1e1f22); border: 1px solid var(--border, #333);
+  border-radius: 6px; padding: 0.35rem 0.5rem;
+}
+.rtc-admin-row { display: flex; gap: 0.5rem; }
+.rtc-admin-row label { flex: 1; display: flex; flex-direction: column; gap: 0.25rem; }
+.rtc-admin-row input {
+  font-size: 0.72rem; color: var(--text, #fff);
+  background: var(--panel, #1e1f22); border: 1px solid var(--border, #333);
+  border-radius: 6px; padding: 0.3rem 0.5rem; font-family: inherit;
+}
+.rtc-clear-cred { display: flex; align-items: center; gap: 0.4rem; font-size: 0.7rem !important; }
+.rtc-clear-cred input { accent-color: var(--accent, #5865f2); }
+.rtc-admin-actions { display: flex; justify-content: flex-end; }
+.rtc-save-btn {
+  font-size: 0.75rem; padding: 0.35rem 0.85rem; cursor: pointer;
+  color: #fff; background: var(--accent, #5865f2); border: none;
+  border-radius: 6px; font-family: inherit;
+}
+.rtc-save-btn:disabled { opacity: 0.6; cursor: default; }
+
+
+/* ── Avatar (virtual camera) settings ─────────────────────────────── */
+.avatar-mode-row { display: flex; flex-wrap: wrap; gap: .5rem; margin: .7rem 0; }
+.avatar-mode-btn { padding: .45rem .8rem; border-radius: 999px; border: 1px solid var(--border, #333); background: var(--bg2, #232428); color: var(--text, #e6e6e6); cursor: pointer; font-size: .88rem; }
+.avatar-mode-btn.active { border-color: var(--brand, #5865f2); background: color-mix(in srgb, var(--brand, #5865f2) 24%, transparent); box-shadow: 0 0 0 1px var(--brand, #5865f2) inset; }
+.avatar-asset-grid { display: grid; grid-template-columns: 1fr 1fr; gap: .7rem; margin: .5rem 0 .7rem; }
+@media (max-width: 640px) { .avatar-asset-grid { grid-template-columns: 1fr; } }
+.avatar-asset-card { border: 1px solid var(--border, #333); border-radius: 10px; padding: .7rem .8rem; background: var(--bg2, #232428); display: flex; flex-direction: column; gap: .4rem; }
+.avatar-asset-title { font-weight: 600; font-size: .92rem; }
+.avatar-asset-file { display: flex; align-items: center; justify-content: space-between; gap: .5rem; font-size: .82rem; overflow: hidden; }
+.avatar-asset-file span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.avatar-asset-remove, .avatar-asset-add { border-radius: 8px; border: 1px solid var(--border, #444); background: transparent; color: var(--text, #ddd); padding: .3rem .6rem; cursor: pointer; font-size: .8rem; white-space: nowrap; }
+.avatar-asset-add { border-style: dashed; }
+.avatar-asset-remove:hover { border-color: #ef4444; color: #ef4444; }
+.avatar-preview-block { margin-top: .4rem; }
+.avatar-hands-label { display: inline-flex; align-items: center; gap: .35rem; font-size: .85rem; cursor: pointer; }
+.avatar-status { margin-top: .4rem; font-size: .82rem; }
+.avatar-send-chip { font-style: normal; font-size: .72rem; margin-left: .35rem; padding: .05rem .45rem; border-radius: 999px; background: color-mix(in srgb, var(--brand, #5865f2) 30%, transparent); border: 1px solid var(--brand, #5865f2); color: #fff; vertical-align: middle; }
+
+/* ── Avatar tracking calibration wizard ── */
+.cal-overlay { position: fixed; inset: 0; z-index: 400; background: rgba(5,5,10,0.72); display: grid; place-items: center; padding: 1rem; animation: fadeIn 0.15s ease; }
+.cal-modal { width: min(880px, 96vw); max-height: calc(100dvh - 2rem); overflow-y: auto; background: var(--panel); border-radius: 14px; box-shadow: var(--shadow); padding: 1.1rem 1.2rem 1rem; animation: popIn 0.2s ease; display: flex; flex-direction: column; gap: .4rem; }
+.cal-head { display: flex; align-items: center; justify-content: space-between; }
+.cal-close { background: transparent; border: 0; color: var(--muted); font-size: 1rem; cursor: pointer; padding: .3rem .5rem; border-radius: 6px; }
+.cal-close:hover { background: var(--hover); color: var(--text); }
+.cal-body { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 6fr); gap: .9rem; align-items: start; }
+.cal-stage { display: flex; flex-direction: column; gap: .5rem; }
+.cal-video { width: 100%; aspect-ratio: 16/10; background: #000; border-radius: 10px; border: 1px solid var(--border); object-fit: cover; }
+.cal-msg { font-size: .84rem; line-height: 1.45; color: var(--text); min-height: 2.4em; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: .45rem .6rem; }
+.cal-has { font-size: .78rem; color: var(--ok); }
+.cal-steps { display: flex; flex-direction: column; gap: .45rem; max-height: 420px; overflow-y: auto; padding-right: .2rem; }
+.cal-step { display: flex; align-items: flex-start; gap: .6rem; background: var(--bg); border: 1px solid var(--border); border-radius: 10px; padding: .55rem .65rem; }
+.cal-step.done { border-color: rgba(35,165,89,0.45); background: rgba(35,165,89,0.06); }
+.cal-step-icon { font-size: 1.15rem; line-height: 1.4; }
+.cal-step-info { flex: 1; min-width: 0; }
+.cal-step-info b { font-size: .86rem; display: block; }
+.cal-step-info p { margin: .15rem 0 0; font-size: .74rem; color: var(--muted); line-height: 1.35; }
+.cal-capture { flex-shrink: 0; font-size: .78rem; padding: .3rem .6rem; border-radius: 7px; }
+.cal-step-done { flex-shrink: 0; font-size: .76rem; color: var(--ok); white-space: nowrap; padding-top: .25rem; }
+.cal-foot { display: flex; align-items: center; gap: .55rem; margin-top: .35rem; padding-top: .7rem; border-top: 1px solid var(--border); }
+.cal-save { background: var(--brand, #5865f2); border-color: transparent; color: #fff; font-weight: 600; }
+.cal-save:disabled { opacity: .5; cursor: not-allowed; }
+@media (max-width: 720px) {
+  .cal-body { grid-template-columns: 1fr; }
+  .cal-steps { max-height: none; }
+}
+
+/* ── 2D avatar feature-fit editor ── */
+.avatar-fit-toggle { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; padding: .5rem 0; }
+.fit-editor { background: var(--bg); border: 1px solid var(--border); border-radius: 10px; padding: .7rem .8rem; margin: .2rem 0 .8rem; }
+.fit-stage { position: relative; display: inline-block; max-width: 100%; border-radius: 8px; overflow: visible; cursor: crosshair; }
+.fit-stage img { display: block; max-width: 100%; max-height: 280px; border-radius: 8px; border: 1px solid var(--border); user-select: none; -webkit-user-drag: none; }
+.fit-marker { position: absolute; width: 24px; height: 24px; border-radius: 50%; transform: translate(-50%, -50%); display: grid; place-items: center; font-size: .7rem; font-weight: 800; color: #fff; border: 2px solid #fff; box-shadow: 0 1px 6px rgba(0,0,0,.55); cursor: grab; touch-action: none; }
+.fit-marker:active { cursor: grabbing; }
+.fit-left { background: #0891b2; }
+.fit-right { background: #db2777; }
+.fit-actions { display: flex; gap: .5rem; margin-top: .6rem; }
+
+/* Avatar-on notes: the camera indicator stays lit while an avatar hides the
+   face (it feeds tracking locally), so tell the user what the light means. */
+.call-av-note { position: absolute; left: 50%; bottom: 6px; transform: translateX(-50%); z-index: 3; font-size: .68rem; line-height: 1.2; color: #fff; background: rgba(0,0,0,.62); border: 1px solid rgba(255,255,255,.22); padding: .22rem .6rem; border-radius: 999px; white-space: nowrap; pointer-events: none; }
+.avatar-cam-note { display: block; font-size: .68rem; line-height: 1.3; color: var(--muted, #949ba4); text-align: center; max-width: 230px; padding: 0 .3rem; }
+
+.avatar-external-device { display: flex; flex-direction: column; gap: .4rem; margin: .6rem 0 .8rem; padding: .7rem .8rem; border: 1px dashed var(--border, #444); border-radius: 10px; background: var(--bg2, #232428); font-size: .88rem; }
+.avatar-external-device select { width: 100%; padding: .4rem .5rem; border-radius: 8px; border: 1px solid var(--border, #333); background: var(--bg, #1e1f22); color: var(--text, #e6e6e6); }
+.avatar-external-device b { color: var(--text, #e6e6e6); }
+
+/* ── Settings icon rail (desktop) ─────────────────────────────────────────
+   Tabs collapse to emoji only; the text label pops out beside the icon on
+   hover/focus. Touch devices (no hover) keep emoji + label rows. */
+@media (hover: hover) {
+  .settings-sidebar { width: 64px; padding: 1.1rem .4rem .7rem; }
+  .settings-title { display: none; }
+  .settings-tab {
+    position: relative; display: flex; align-items: center; justify-content: center;
+    text-align: center; padding: .5rem .2rem; font-size: 1.3rem; border-radius: 10px;
+    min-height: 48px; line-height: 1;
+  }
+  .settings-tab .settings-tab-label {
+    position: absolute; left: calc(100% + 12px); top: 50%; transform: translateY(-50%);
+    background: var(--panel, #2b2d31); border: 1px solid var(--border, #3a3d42);
+    color: var(--text, #e6e6e6); font-size: .82rem; font-weight: 600;
+    white-space: nowrap; padding: .4rem .7rem; border-radius: 8px;
+    box-shadow: var(--shadow); z-index: 130; pointer-events: none;
+    opacity: 0; visibility: hidden; transition: opacity .12s ease, visibility .12s ease;
+  }
+  .settings-tab:hover .settings-tab-label,
+  .settings-tab:focus-visible .settings-tab-label { opacity: 1; visibility: visible; }
+  .settings-tab.danger { font-size: 1rem; }
 }
