@@ -38,6 +38,9 @@ function fakeSocket() {
   const emits = [];
   return {
     handlers, emits, connected: true,
+    // The session-keyed offer rule compares socket ids — this fixture must look
+    // like a real connected socket that sorts below the roster's 's2'.
+    id: 's1',
     on(ev, fn) { handlers[ev] = fn; },
     off(ev) { delete handlers[ev]; },
     emit(ev, payload) { emits.push([ev, payload]); },

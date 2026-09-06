@@ -4094,8 +4094,8 @@ function VoiceChannel({ channel, me, socket }) {
     if (!mesh) return;
     const speaker = loadMediaPrefs().speaker;
     roster.forEach(u => {
-      const el = audioRefs.current[u.userId];
-      const s = mesh.streamFor(u.userId);
+      const el = audioRefs.current[u.socketId];
+      const s = mesh.streamFor(u.socketId);
       if (el) {
         if (s && el.srcObject !== s) el.srcObject = s;
         applySpeakerSink(el, speaker);
@@ -4157,12 +4157,13 @@ function VoiceChannel({ channel, me, socket }) {
               {muted && <span className="mute-badge">🔇</span>}
             </div>
             {roster.map(u => {
-              const hasMedia = Boolean(meshRef.current?.streamFor(u.userId));
+              const hasMedia = Boolean(meshRef.current?.streamFor(u.socketId));
+              const isMyOtherDevice = u.userId === me?.id;
               return (
-                <div key={u.userId} className={`voice-tile${hasMedia?' live':' connecting'}`}>
+                <div key={u.socketId} className={`voice-tile${hasMedia?' live':' connecting'}${isMyOtherDevice?' self-other':''}`}>
                   <Avatar src={u.avatar} name={displayName(u)} size="lg" badge={u.badge} />
-                  <span>{displayName(u)}</span>
-                  <audio ref={el => { audioRefs.current[u.userId] = el; }} autoPlay playsInline style={{display:'none'}} />
+                  <span>{displayName(u)}{isMyOtherDevice ? ' (you — other device)' : ''}</span>
+                  <audio ref={el => { audioRefs.current[u.socketId] = el; }} autoPlay playsInline style={{display:'none'}} />
                   {hasMedia
                     ? <span className="voice-live-dot" title="Audio live" />
                     : <span className="voice-connecting">connecting…</span>}
@@ -4355,8 +4356,8 @@ function RoomView({ roomId, me, socket, notify, onLaunchGame }) {
     if (!mesh || !inCall) return;
     const speaker = loadMediaPrefs().speaker;
     voiceRoster.forEach(u => {
-      const el = remoteRefs.current[u.userId];
-      const s = mesh.streamFor(u.userId);
+      const el = remoteRefs.current[u.socketId];
+      const s = mesh.streamFor(u.socketId);
       if (!el) return;
       if (s && el.srcObject !== s) el.srcObject = s;
       applySpeakerSink(el, speaker);
@@ -4594,30 +4595,32 @@ function RoomView({ roomId, me, socket, notify, onLaunchGame }) {
                   {room.type==='video' && avatarSending && cameraOn && <span className="avatar-cam-note" role="note">📷 camera used for avatar tracking only — face never sent</span>}
                 </div>
                 {voiceRoster.map(u => {
-                  const hasMedia = Boolean(meshRef.current?.streamFor(u.userId));
+                  const hasMedia = Boolean(meshRef.current?.streamFor(u.socketId));
                   const peerCamOn = u.camera !== false;
+                  const isMyOtherDevice = u.userId === me?.id;
+                  const peerName = (u.nickname || u.username || 'Unknown') + (isMyOtherDevice ? ' (you — other device)' : '');
                   return room.type==='video' ? (
-                    <div key={u.userId} className={`room-peer-tile${hasMedia?' live':' connecting'}${peerCamOn?'':' cam-off'}`}>
+                    <div key={u.socketId} className={`room-peer-tile${hasMedia?' live':' connecting'}${peerCamOn?'':' cam-off'}`}>
                       {/* The video element stays mounted even when the peer's camera
                           is off — it quietly carries their audio while hidden. */}
-                      <video ref={el => { remoteRefs.current[u.userId] = el; }} className={peerCamOn?'':'room-cam-off-video'} autoPlay playsInline style={{width:'100%',borderRadius:10,aspectRatio:'16/9',background:'#000',objectFit:'cover'}} />
+                      <video ref={el => { remoteRefs.current[u.socketId] = el; }} className={peerCamOn?'':'room-cam-off-video'} autoPlay playsInline style={{width:'100%',borderRadius:10,aspectRatio:'16/9',background:'#000',objectFit:'cover'}} />
                       {!peerCamOn && (
                         <div className="room-cam-placeholder">
                           <Avatar src={u.avatar} name={u.nickname || u.username} size="md" badge={u.badge} />
                           <span className="cam-off-label">📷 camera off</span>
                         </div>
                       )}
-                      <span className="room-peer-name">{u.nickname || u.username}
+                      <span className="room-peer-name">{peerName}
                         {!peerCamOn ? <em className="voice-connecting">no video</em>
                           : hasMedia ? <em className="voice-live-dot" title="Video live" />
                           : <em className="voice-connecting">connecting…</em>}
                       </span>
                     </div>
                   ) : (
-                    <div key={u.userId} className={`room-peer-tile${hasMedia?' live':' connecting'}`}>
+                    <div key={u.socketId} className={`room-peer-tile${hasMedia?' live':' connecting'}`}>
                       <Avatar src={u.avatar} name={u.nickname || u.username} size="lg" badge={u.badge} />
-                      <audio ref={el => { remoteRefs.current[u.userId] = el; }} autoPlay playsInline style={{display:'none'}} />
-                      <span>{u.nickname || u.username}</span>
+                      <audio ref={el => { remoteRefs.current[u.socketId] = el; }} autoPlay playsInline style={{display:'none'}} />
+                      <span>{peerName}</span>
                       {hasMedia ? <span className="voice-live-dot" title="Audio live" /> : <span className="voice-connecting">connecting…</span>}
                     </div>
                   );

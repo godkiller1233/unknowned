@@ -5582,7 +5582,7 @@ io.on('connection', socket => {
   socket.on('voice_camera', data => {
     const channelId = data?.channelId;
     if (typeof channelId !== 'string' || channelId.length > 128 || !socket.rooms.has(`voice:${channelId}`)) return;
-    socket.to(`voice:${channelId}`).emit('voice_camera', { channelId, userId, on: data.on === true });
+    socket.to(`voice:${channelId}`).emit('voice_camera', { channelId, userId, socketId: socket.id, on: data.on === true });
   });
 
   // Mesh signaling. The sender must currently be a member of that voice room;

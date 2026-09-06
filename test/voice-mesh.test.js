@@ -214,3 +214,84 @@ test('voice mesh: abrupt disconnect drops the peer (disconnecting broadcast)', {
     sockets.forEach(s => { try { s.close?.(); s.destroy?.(); } catch {} });
   }
 });
+
+
+test('voice mesh: same account on two devices appears as two participants', { timeout: 120000 }, async t => {
+  if (!(await isPgReachable())) {
+    t.skip('PostgreSQL not reachable — set TEST_PG_ADMIN_URL (e.g. a CI postgres service container) to run integration tests');
+    return;
+  }
+
+  const srv = await startDisposableServer();
+  t.after(() => srv.stop());
+  const sockets = [];
+
+  try {
+    const { base, api } = srv;
+    const stamp = Date.now().toString(36).slice(-6);
+
+    // ONE account, TWO devices (two independent sockets, same user token).
+    const u = await api('/api/register', null, { method: 'POST', body: { username: `vm2_${stamp}`, password: 'mesh-pass-1' } });
+    assert.equal(u.status, 200, 'register: ' + JSON.stringify(u));
+    const boot = await api('/api/bootstrap', u.token);
+    const voiceCh = boot.channels.find(ch => ch.type === 'voice');
+    assert.ok(voiceCh, 'seeded voice channel must exist');
+
+    const sockPhone = createSocket(base, { auth: { token: u.token }, transports: ['websocket'], reconnection: false });
+    const sockDesktop = createSocket(base, { auth: { token: u.token }, transports: ['websocket'], reconnection: false });
+    sockets.push(sockPhone, sockDesktop);
+    await Promise.all([sockPhone, sockDesktop].map(s => new Promise((res, rej) => { s.once('connect', res); s.once('connect_error', rej); })));
+    assert.notEqual(sockPhone.id, sockDesktop.id, 'two devices must have distinct socket ids');
+
+    const state = { phoneRoster: [], desktopRoster: [] };
+    // fakePCs is file-global and earlier tests already created PCs — only PCs
+    // created from here on belong to this self-pair.
+    const pcStart = fakePCs.length;
+    const meshPhone = createVoiceMesh({
+      socket: sockPhone, channelId: voiceCh.id, me: { id: u.user.id },
+      onRoster: r => { state.phoneRoster = r; }, onRemoteStream: () => {}, onRemoteEnd: () => {},
+    });
+    const meshDesktop = createVoiceMesh({
+      socket: sockDesktop, channelId: voiceCh.id, me: { id: u.user.id },
+      onRoster: r => { state.desktopRoster = r; }, onRemoteStream: () => {}, onRemoteEnd: () => {},
+    });
+
+    // Phone joins first (empty roster), then desktop joins. The desktop is the
+    // SAME user — with session-keyed peers it must still appear as a peer.
+    meshPhone.join(fakeStream());
+    await sleep(300);
+    meshDesktop.join(fakeStream());
+
+    await waitFor(() => state.phoneRoster.length === 1, 8000);
+    assert.equal(state.phoneRoster.length, 1, 'phone must see exactly one other participant');
+    assert.equal(state.phoneRoster[0].userId, u.user.id, 'that participant is the same account...');
+    assert.equal(state.phoneRoster[0].socketId, sockDesktop.id, '...on the second device (distinct socket session)');
+    assert.equal(state.desktopRoster.length, 1, 'desktop must see the phone as a participant');
+    assert.equal(state.desktopRoster[0].socketId, sockPhone.id);
+
+    // The smaller SOCKET id offered; exactly one offer for the self-pair and it
+    // was answered — the old userId-keyed engine deadlocked here (no offer).
+    const newPCs = fakePCs.slice(pcStart);
+    await waitFor(() => newPCs.reduce((n, p) => n + p.offerCount, 0) === 1, 8000);
+    const live = newPCs.filter(p => !p.closed);
+    assert.equal(live.length, 2, 'one peer connection per device');
+    await waitFor(() => live.every(p => p.remoteDescription), 8000);
+    assert.ok(live.every(p => p.remoteDescription), 'self-pair must fully negotiate (offer + answer)');
+
+    // Camera off on the phone → the desktop row for that session flips too.
+    meshPhone.setCamera(false);
+    await waitFor(() => state.desktopRoster.find(x => x.socketId === sockPhone.id)?.camera === false, 5000);
+    assert.equal(state.desktopRoster.find(x => x.socketId === sockPhone.id)?.camera, false, 'camera state reaches the other device');
+
+    // Desktop leaves → the phone roster empties (that session is gone).
+    meshDesktop.leave();
+    await waitFor(() => state.phoneRoster.length === 0, 8000);
+    assert.equal(state.phoneRoster.length, 0, 'phone must drop the desktop session after it leaves');
+
+    meshPhone.destroy();
+    meshDesktop.destroy();
+    await sleep(200);
+  } finally {
+    sockets.forEach(s => { try { s.close?.(); s.destroy?.(); } catch {} });
+  }
+});
