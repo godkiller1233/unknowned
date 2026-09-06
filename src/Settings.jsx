@@ -57,6 +57,89 @@ const BG_OPTIONS = [
   { id: 'gradient3', label: 'Forest' },
 ];
 
+// ── Custom emoji manager (Appearance tab) ─────────────────────────────────────
+// Anyone can add a platform emoji by URL or by uploading an image; creators and
+// admins can remove them. Picker + chat pick the list up live via a window event.
+function CustomEmojiManager({ me, notify }) {
+  const [list, setList] = useState([]);
+  const [name, setName] = useState('');
+  const [url, setUrl] = useState('');
+  const [busy, setBusy] = useState(false);
+  const fileRef = useRef(null);
+
+  const load = () => api('/api/emojis').then(d => setList(Array.isArray(d.emojis) ? d.emojis : [])).catch(() => {});
+  useEffect(() => { load(); window.addEventListener('custom-emoji-changed', load); return () => window.removeEventListener('custom-emoji-changed', load); }, []);
+  const changed = () => { load(); try { window.dispatchEvent(new Event('custom-emoji-changed')); } catch {} };
+
+  async function addUrl(e) {
+    e.preventDefault();
+    if (!name.trim() || !url.trim()) return;
+    setBusy(true);
+    const d = await api('/api/emojis', { method: 'POST', body: JSON.stringify({ name: name.trim(), url: url.trim() }) });
+    setBusy(false);
+    if (d.error) { notify(d.error); return; }
+    setName(''); setUrl(''); notify(`:${d.emoji.name}: added to the emoji picker!`);
+    changed();
+  }
+
+  async function addFile(file) {
+    if (!file) return;
+    if (!name.trim()) { notify('Type a name first, then choose the image.'); return; }
+    setBusy(true);
+    try {
+      const fd = new FormData(); fd.append('file', file);
+      const r = await fetch('/api/upload', { method: 'POST', headers: { Authorization: 'Bearer ' + getToken() }, body: fd });
+      const up = await r.json();
+      if (!r.ok || !up.url) { notify(up.error || 'Upload failed'); return; }
+      const d = await api('/api/emojis', { method: 'POST', body: JSON.stringify({ name: name.trim(), url: up.url }) });
+      if (d.error) { notify(d.error); return; }
+      setName(''); notify(`:${d.emoji.name}: added to the emoji picker!`);
+      changed();
+    } catch { notify('Upload failed'); }
+    finally { setBusy(false); }
+  }
+
+  async function remove(em) {
+    const d = await api(`/api/emojis/${encodeURIComponent(em.name)}`, { method: 'DELETE' });
+    if (d.error) { notify(d.error); return; }
+    notify(`:${em.name}: removed`);
+    changed();
+  }
+
+  return (
+    <div className="custom-emoji-manager">
+      <p className="muted-text">Custom emojis are platform-wide. Use them in chat by typing <code>:name:</code> — they also appear in the emoji picker's Custom tab.</p>
+      <form onSubmit={addUrl} className="mini" style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', alignItems: 'flex-end' }}>
+        <label>Name
+          <input value={name} onChange={e => setName(e.target.value.toLowerCase().replace(/[^a-z0-9_]/g, ''))} placeholder="parrot" maxLength={24} style={{ width: 140 }} />
+        </label>
+        <label>Image URL
+          <input value={url} onChange={e => setUrl(e.target.value)} placeholder="https://… (or upload below)" style={{ width: 260 }} />
+        </label>
+        <button disabled={busy || !name || !url}>Add emoji</button>
+      </form>
+      <button type="button" className="ghost" disabled={busy || !name} style={{ marginTop: '0.4rem' }} onClick={() => fileRef.current && fileRef.current.click()}>
+        📁 …or upload an image {name ? `for :${name}:` : '(type a name first)'}
+      </button>
+      <input ref={fileRef} type="file" accept="image/png,image/jpeg,image/gif,image/webp" style={{ display: 'none' }}
+        onChange={e => { const f = e.target.files && e.target.files[0]; e.target.value = ''; addFile(f); }} />
+      {list.length > 0 && (
+        <div className="emoji-manage-list" style={{ marginTop: '0.6rem' }}>
+          {list.map(em => (
+            <div key={em.id} className="emoji-manage-row" style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', padding: '0.25rem 0' }}>
+              <img src={em.url} alt={`:${em.name}:`} className="custom-emoji" />
+              <code>:{em.name}:</code>
+              {(me.is_admin || em.creator_id === me.id)
+                ? <button type="button" className="danger" style={{ marginLeft: 'auto', padding: '0.15rem 0.5rem', fontSize: '0.75rem' }} onClick={() => remove(em)}>Remove</button>
+                : <span className="muted-text" style={{ marginLeft: 'auto', fontSize: '0.72rem' }}>added by someone else</span>}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function Settings({ me, boot, onClose, onSave, currentTheme, onThemeChange, onOpenDataRequests }) {
   const [tab, setTab] = useState('account');
   const [settings, setSettings] = useState({});
@@ -1279,6 +1362,10 @@ export default function Settings({ me, boot, onClose, onSave, currentTheme, onTh
                 onChange={e => saveSettings({ profile_theme: e.target.value })}
                 style={{ width: 48, height: 36, padding: 2, cursor: 'pointer' }}
               />
+
+              <hr className="settings-hr" />
+              <h3>Custom Emojis</h3>
+              <CustomEmojiManager me={me} notify={notify} />
             </div>
           )}
 

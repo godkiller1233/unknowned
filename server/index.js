@@ -490,6 +490,15 @@ async function initializeDb() {
     CREATE TABLE IF NOT EXISTS arg_completions (
       user_id TEXT PRIMARY KEY, completed_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
+    CREATE TABLE IF NOT EXISTS arg_progress (
+      user_id TEXT PRIMARY KEY, step TEXT DEFAULT 'login',
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS custom_emojis (
+      id TEXT PRIMARY KEY, community_id TEXT, name TEXT,
+      url TEXT, creator_id TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_custom_emojis_comm ON custom_emojis(community_id);
     CREATE TABLE IF NOT EXISTS events (
       id TEXT PRIMARY KEY, title TEXT, description TEXT,
       starts_at TEXT, ends_at TEXT, created_by TEXT, channel_id TEXT,
@@ -1468,7 +1477,11 @@ app.get('/api/bootstrap', auth, route(async (req,res) => {
   const events = await store.all("SELECT * FROM events WHERE active=1 ORDER BY starts_at DESC LIMIT 5");
   const unreadNotifs = (await store.get('SELECT COUNT(*) AS c FROM notifications WHERE user_id=$1 AND read=0', req.user.id))?.c || 0;
   const challenge = await getTodayChallenge();
-  res.json({me, communities, channels, users, memberships, roles, friends, dms, groups, settings, events, unreadNotifs:Number(unreadNotifs), challenge, devMode: IS_DEV, rtc: { iceServers: await rtcIceServers() }});
+  const customEmojis = await store.all(
+    "SELECT * FROM custom_emojis WHERE community_id IS NULL OR community_id IN (SELECT community_id FROM memberships WHERE user_id=?) ORDER BY created_at",
+    me.id).catch(() => []);
+  const myArgProgress = await store.get('SELECT step FROM arg_progress WHERE user_id=$1', me.id).catch(() => null);
+  res.json({me, communities, channels, users, memberships, roles, friends, dms, groups, settings, events, unreadNotifs:Number(unreadNotifs), challenge, devMode: IS_DEV, rtc: { iceServers: await rtcIceServers() }, customEmojis: customEmojis||[], argStep: myArgProgress?.step || null});
 }));
 
 // ── Profile ───────────────────────────────────────────────────────────────────
@@ -1663,7 +1676,7 @@ async function deleteUserAccount(userId, ownedFiles) {
     // Declarative on purpose - adding a user-scoped table is a one-line change.
     const USER_SCOPED = [
       'user_settings', 'notifications', 'reminders',
-      'inventory', 'game_logs', 'temp_usernames', 'arg_completions', 'bookmarks',
+      'inventory', 'game_logs', 'temp_usernames', 'arg_completions', 'arg_progress', 'bookmarks',
       'memberships', 'member_roles', 'community_ratings', 'active_effects',
       'bot_reviews', 'voice_sessions', 'room_members', 'room_poll_votes', 'group_members',
     ];
@@ -5792,7 +5805,8 @@ io.on('connection', socket => {
 // Award the FTD badge once a user completes the ARG. One-time per user.
 app.get('/api/arg/status', auth, route(async (req,res) => {
   const done = await store.get('SELECT * FROM arg_completions WHERE user_id=$1', req.user.id);
-  res.json({ completed: !!done });
+  const prog = await store.get('SELECT step FROM arg_progress WHERE user_id=$1', req.user.id).catch(() => null);
+  res.json({ completed: !!done, step: prog?.step || null });
 }));
 
 app.post('/api/arg/award', auth, route(async (req,res) => {
@@ -5809,6 +5823,76 @@ app.post('/api/arg/award', auth, route(async (req,res) => {
   const fresh = await store.get('SELECT * FROM users WHERE id=$1', req.user.id);
   io.to(`user:${req.user.id}`).emit('user_update', publicUser(fresh));
   res.json({ awarded:true, badge:newBadge });
+}));
+
+// ── Custom emojis ─────────────────────────────────────────────────────────────
+// Platform-wide custom emojis any member can add via URL; admins can delete.
+// Stored in the shared DB so every instance serves the same set. They render
+// in chat as :name: and live in the emoji picker's Custom tab.
+const EMOJI_NAME_RE = /^[a-z0-9_]{2,24}$/;
+app.get('/api/emojis', auth, route(async (req,res) => {
+  const rows = await store.all(
+    "SELECT * FROM custom_emojis WHERE community_id IS NULL OR community_id IN (SELECT community_id FROM memberships WHERE user_id=?) ORDER BY created_at",
+    req.user.id).catch(() => []);
+  res.json({ emojis: rows || [] });
+}));
+
+app.post('/api/emojis', auth, route(async (req,res) => {
+  // Sanitize first (be liberal in what you accept), then validate the result.
+  const name = String(req.body.name || '').trim().toLowerCase().replace(/[^a-z0-9_]/g, '');
+  const url = String(req.body.url || '').trim();
+  if (!EMOJI_NAME_RE.test(name)) return res.status(400).json({ error:'Name must be 2-24 chars: lowercase letters, numbers, underscores' });
+  try {
+    const u = new URL(url, `${req.protocol}://${req.get('host')}`);
+    if (!['http:','https:'].includes(u.protocol)) return res.status(400).json({ error:'Invalid URL' });
+    // Same-origin upload URLs are stored as paths; external URLs go through the img proxy at render time.
+    const storeUrl = u.origin === `${req.protocol}://${req.get('host')}` ? u.pathname : u.toString();
+    const dupe = await store.get('SELECT id FROM custom_emojis WHERE name=?', name);
+    if (dupe) return res.status(409).json({ error:`An emoji named "${name}" already exists` });
+    const id = nanoid();
+    await store.run('INSERT INTO custom_emojis (id, community_id, name, url, creator_id) VALUES (?,?,?,?,?)', id, null, name, storeUrl, req.user.id);
+    const row = await store.get('SELECT * FROM custom_emojis WHERE id=?', id);
+    io.emit('custom_emojis_update');
+    res.json({ emoji: row });
+  } catch {
+    return res.status(400).json({ error:'Invalid URL' });
+  }
+}));
+
+app.delete('/api/emojis/:name', auth, route(async (req,res) => {
+  const row = await store.get('SELECT * FROM custom_emojis WHERE name=?', String(req.params.name).toLowerCase());
+  if (!row) return res.status(404).json({ error:'Not found' });
+  if (!req.user.is_admin && row.creator_id !== req.user.id) return res.status(403).json({ error:'Only the creator or an admin can delete this emoji' });
+  await store.run('DELETE FROM custom_emojis WHERE id=?', row.id);
+  io.emit('custom_emojis_update');
+  res.json({ ok:true });
+}));
+
+// ── ARG progress tracking ─────────────────────────────────────────────────────
+// Each step the player reaches is recorded so admins can watch how far
+// everyone has gotten. Steps: login → terminal → code (complete).
+const ARG_STEPS = ['login','terminal','code'];
+app.post('/api/arg/progress', auth, route(async (req,res) => {
+  const step = String(req.body.step || '');
+  if (!ARG_STEPS.includes(step)) return res.status(400).json({ error:'Invalid step' });
+  await store.run(
+    `INSERT INTO arg_progress (user_id, step, updated_at) VALUES (?,?,CURRENT_TIMESTAMP)
+     ON CONFLICT(user_id) DO UPDATE SET step=excluded.step, updated_at=CURRENT_TIMESTAMP`,
+    req.user.id, step);
+  res.json({ ok:true });
+}));
+
+app.get('/api/admin/arg/progress', auth, adminOnly, route(async (req,res) => {
+  const progress = await store.all(
+    `SELECT p.user_id, p.step, p.updated_at, u.username, u.nickname, u.rank, u.badge,
+            (SELECT completed_at FROM arg_completions c WHERE c.user_id=p.user_id) AS completed_at
+     FROM arg_progress p LEFT JOIN users u ON u.id=p.user_id
+     ORDER BY p.updated_at DESC`).catch(() => []);
+  const done = await store.all(
+    `SELECT c.user_id, c.completed_at, u.username, u.nickname, u.rank
+     FROM arg_completions c LEFT JOIN users u ON u.id=c.user_id
+     WHERE c.user_id NOT IN (SELECT user_id FROM arg_progress)`).catch(() => []);
+  res.json({ progress: progress || [], doneOnly: done || [] });
 }));
 
 // ── Static ────────────────────────────────────────────────────────────────────

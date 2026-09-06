@@ -359,7 +359,7 @@ function ProbableImage({ url, link }) {
 function MsgBody({ text, me }) {
   const [revealed, setRevealed] = useState(() => new Set());
   if (!text) return null;
-  const tokens = text.split(/(```[\s\S]*?```|\|\|[\s\S]*?\|\||https?:\/\/[^\s]+|@[\w-]+)/g);
+  const tokens = text.split(/(```[\s\S]*?```|\|\|[\s\S]*?\|\||https?:\/\/[^\s]+|:[a-z0-9_]{2,24}:|@[\w-]+)/g);
   return <span>{tokens.map((p,i) => {
     if (p.startsWith('```')) return <code key={i} className="code-block">{p.slice(3,-3).replace(/^\w+\n/,'')}</code>;
     if (p.startsWith('||') && p.endsWith('||')) return <button key={i} type="button" className={`spoiler${revealed.has(i) ? ' revealed' : ''}`} title={revealed.has(i) ? 'Hide spoiler' : 'Reveal spoiler'} aria-label={revealed.has(i) ? 'Hide spoiler' : 'Reveal spoiler'} onClick={() => setRevealed(prev => { const next = new Set(prev); next.has(i) ? next.delete(i) : next.add(i); return next; })}>{p.slice(2,-2)}</button>;
@@ -382,6 +382,11 @@ function MsgBody({ text, me }) {
         return <ProbableImage key={i} url={p} link={link} />;
       }
       return link;
+    }
+    if (/^:[a-z0-9_]{2,24}:$/.test(p)) {
+      const e = customEmoji(p.slice(1,-1));
+      if (e) return <span key={i} className="msg-custom-emoji">{customEmojiImg(e)}</span>;
+      return p;
     }
     if (/^@[\w-]+$/.test(p)) return <span key={i} className={p===`@${me?.username}`?'ping-me':'ping'}>{p}</span>;
     return p;
@@ -433,6 +438,21 @@ const EMOJI_GROUPS = [
   { id: 'symbols',   label: 'Symbols',   emojis: ['✅','✨','🔑','🔒','🔔','💬','⭐'] },
 ];
 const EMOJIS = EMOJI_GROUPS.flatMap(g => g.emojis);
+
+// ── Custom emojis (platform-wide, DB-backed) ──────────────────────────────────
+// Fetched once per session and refreshed on the custom_emojis_update socket
+// event. They render in chat as :name: and appear in the picker's Custom tab.
+let CUSTOM_EMOJIS = [];
+const customEmoji = name => CUSTOM_EMOJIS.find(e => e.name === name) || null;
+export async function refreshCustomEmojis() {
+  try {
+    const d = await api('/api/emojis');
+    if (!d.error && Array.isArray(d.emojis)) CUSTOM_EMOJIS = d.emojis;
+  } catch { /* keep the last good list */ }
+}
+function customEmojiImg(e, cls) {
+  return <img src={proxiedImgSrc(e.url)} alt={`:${e.name}:`} title={`:${e.name}:`} className={cls || 'custom-emoji'} onError={ev => { ev.currentTarget.style.display = 'none'; }} />;
+}
 // 🎲 DO SOMETHING RANDOM — prompt question + poll catalogs
 const RANDOM_PROMPTS = [
   "If your life had a theme song, what would it be and why?",
@@ -464,8 +484,15 @@ const RANDOM_POLLS = [
 function EmojiPicker({ onPick }) {
   const [tab, setTab] = useState('emoji');
   const [cat, setCat] = useState(EMOJI_GROUPS[0].id);
+  const [, force] = useState(0);
+  useEffect(() => { const t = setTimeout(() => refreshCustomEmojis().then(()=>force(n=>n+1)), 0); return () => clearTimeout(t); }, []);
   const group = EMOJI_GROUPS.find(g => g.id === cat) || EMOJI_GROUPS[0];
-  return <div className="emoji-picker"><div className="emoji-tabs"><button className={tab==='emoji'?'active':''} onClick={()=>setTab('emoji')}>Emoji</button><button className={tab==='gif'?'active':''} onClick={()=>setTab('gif')}>GIF</button><button className={tab==='sticker'?'active':''} onClick={()=>setTab('sticker')}>Stickers</button></div>{tab==='emoji' ? <><div className="emoji-cats" role="tablist" aria-label="Emoji category">{EMOJI_GROUPS.map(g => <button key={g.id} role="tab" aria-selected={g.id===cat} className={g.id===cat?'active':''} onClick={()=>setCat(g.id)}>{g.label}</button>)}</div><div className="emoji-grid" role="tabpanel">{group.emojis.map(e => <button key={e} onClick={()=>onPick(e)}>{e}</button>)}</div></> : tab==='gif' ? <div className="media-placeholder">GIF links are supported — paste a GIF URL into chat.</div> : <div className="media-placeholder">Sticker links and uploaded stickers are supported.</div>}</div>;
+  const customs = CUSTOM_EMOJIS;
+  return <div className="emoji-picker"><div className="emoji-tabs"><button className={tab==='emoji'?'active':''} onClick={()=>setTab('emoji')}>Emoji</button><button className={tab==='gif'?'active':''} onClick={()=>setTab('gif')}>GIF</button><button className={tab==='sticker'?'active':''} onClick={()=>setTab('sticker')}>Stickers</button></div>{tab==='emoji' ? <><div className="emoji-cats" role="tablist" aria-label="Emoji category">{EMOJI_GROUPS.map(g => <button key={g.id} role="tab" aria-selected={g.id===cat} className={g.id===cat?'active':''} onClick={()=>setCat(g.id)}>{g.label}</button>)}<button role="tab" aria-selected={cat==='custom'} className={cat==='custom'?'active':''} onClick={()=>setCat('custom')}>Custom{customs.length ? ` (${customs.length})` : ''}</button></div><div className="emoji-grid" role="tabpanel">{cat==='custom'
+    ? (customs.length === 0
+        ? <p className="media-placeholder">No custom emojis yet — add one from Settings → Appearance.</p>
+        : customs.map(e => <button key={e.id} onClick={()=>onPick(`:${e.name}:`)}>{customEmojiImg(e)}</button>))
+    : group.emojis.map(e => <button key={e} onClick={()=>onPick(e)}>{e}</button>)}</div></> : tab==='gif' ? <div className="media-placeholder">GIF links are supported — paste a GIF URL into chat.</div> : <div className="media-placeholder">Sticker links and uploaded stickers are supported.</div>}</div>;
 }
 
 // ── PII Warning modal ─────────────────────────────────────────────────────────
@@ -1252,10 +1279,19 @@ function ArgModal({ onClose, notify }) {
   });
   const [result, setResult] = useState(null);
 
-  function go(next) {
-    localStorage.ftdArgStep = next;
-    setStep(next);
-  }
+  // Report each step so admins can watch how far players have gotten.
+  useEffect(() => {
+    if (!['login','terminal','code'].includes(step)) return;
+    api('/api/arg/progress', { method:'POST', body: JSON.stringify({ step }) }).catch(() => {});
+  }, [step]);
+  // Resume from the server's record when the local marker is missing.
+  useEffect(() => {
+    if (localStorage.ftdArgStep) return;
+    api('/api/arg/status').then(d => {
+      if (d?.completed) { localStorage.ftdArgStep = 'done'; setStep('done'); }
+      else if (d?.step && FTD_STEPS.includes(d.step) && d.step !== 'login') setStep(d.step);
+    }).catch(() => {});
+  }, []);
 
   function close() {
     localStorage.ftdArgStep = 'login';
@@ -5450,6 +5486,87 @@ function fmtBytes(n) {
   return v+' B';
 }
 
+// ── Admin: ARG progress watch ─────────────────────────────────────────────────
+// Shows how far each player has gotten in the FTD ARG: current step, last
+// activity, and who finished. Steps: login → terminal → code (badge).
+const ARG_STEP_LABELS = { login: '🔑 Login puzzle', terminal: '💻 Basement shell', code: '🚪 The door (final word)' };
+function AdminArgProgress() {
+  const [rows, setRows] = useState([]);
+  const [doneOnly, setDoneOnly] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  const load = () => {
+    setLoading(true);
+    api('/api/admin/arg/progress').then(d => {
+      setRows(Array.isArray(d.progress) ? d.progress : []);
+      setDoneOnly(Array.isArray(d.doneOnly) ? d.doneOnly : []);
+    }).catch(() => {}).finally(() => setLoading(false));
+  };
+  useEffect(load, []);
+
+  const when = ts => { try { return ts ? new Date(String(ts).includes('T') ? ts : ts.replace(' ', 'T') + 'Z').toLocaleString() : '—'; } catch { return ts; } };
+  const total = rows.length + doneOnly.length;
+
+  return (
+    <div>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.5rem' }}>
+        <h2 style={{ margin: 0 }}>🕳 ARG Watch</h2>
+        <button className="ghost" onClick={load}>↻ Refresh</button>
+      </div>
+      <p className="muted-text" style={{ fontSize: '0.75rem', marginTop: 0 }}>
+        Player-by-player progress through the FTD easter egg. {total} player{total === 1 ? '' : 's'} so far.
+      </p>
+      {loading ? <p className="muted-text">Loading…</p> : (
+        <>
+          {rows.length === 0 && doneOnly.length === 0 && <p className="empty-text">Nobody has stumbled into the basement yet.</p>}
+          {rows.length > 0 && (
+            <table className="arg-watch-table" style={{ width: '100%', fontSize: '0.8rem', borderCollapse: 'collapse' }}>
+              <thead>
+                <tr style={{ textAlign: 'left', opacity: 0.7 }}>
+                  <th style={{ padding: '0.25rem 0.4rem' }}>Player</th>
+                  <th style={{ padding: '0.25rem 0.4rem' }}>Reached</th>
+                  <th style={{ padding: '0.25rem 0.4rem' }}>Last activity</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map(r => {
+                  const finished = Boolean(r.completed_at);
+                  const label = finished ? '🏆 Freed the devs!' : (ARG_STEP_LABELS[r.step] || r.step);
+                  return (
+                    <tr key={r.user_id} style={{ borderTop: '1px solid rgba(128,128,128,0.25)' }}>
+                      <td style={{ padding: '0.3rem 0.4rem' }}>
+                        <b>{r.nickname || r.username || r.user_id}</b>
+                        {r.username && r.nickname ? <span className="muted-text"> ({r.username})</span> : null}
+                        {r.rank ? <span className="muted-text"> · {r.rank}</span> : null}
+                      </td>
+                      <td style={{ padding: '0.3rem 0.4rem' }}>{label}{finished && r.completed_at ? <span className="muted-text"> · {when(r.completed_at)}</span> : null}</td>
+                      <td style={{ padding: '0.3rem 0.4rem' }} className="muted-text">{when(r.updated_at)}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          )}
+          {doneOnly.length > 0 && (
+            <>
+              <h3 style={{ margin: '0.75rem 0 0.25rem' }}>Completed (before progress tracking)</h3>
+              <p className="muted-text" style={{ fontSize: '0.75rem', margin: '0.15rem 0 0.4rem' }}>
+                These players finished before ARG Watch existed, so their step history is unknown.
+              </p>
+              {doneOnly.map(r => (
+                <div key={r.user_id} style={{ padding: '0.2rem 0', fontSize: '0.8rem' }}>
+                  🏆 <b>{r.nickname || r.username || r.user_id}</b>{r.rank ? <span className="muted-text"> · {r.rank}</span> : null}
+                  <span className="muted-text"> · {when(r.completed_at)}</span>
+                </div>
+              ))}
+            </>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
 function AdminPanel({ onNotice, boot, onBootRefresh, me }) {
   const [tab, setTab]     = useState('stats');
   const [rtcTick, setRtcTick] = useState(0); // bump to re-probe relay health after a save
@@ -5583,8 +5700,8 @@ function AdminPanel({ onNotice, boot, onBootRefresh, me }) {
   const [revealBans, setRevealBans] = useState([]);
   const [banForm, setBanForm]   = useState({userId:'', reason:''});
   const [revealMod, setRevealMod] = useState([]);
-  const TABS = ['stats','users','reports','events','bots','announce','reveal','logs','quests','create'];
-  const ADMIN_TAB_ICONS = { stats:'📊', users:'👥', reports:'🚨', events:'🗓️', bots:'🤖', announce:'📣', reveal:'🕵️', logs:'📜', quests:'⚔️', create:'🧑‍💼', roster:'🎖️' };
+  const TABS = ['stats','users','reports','events','bots','announce','reveal','logs','quests','arg', 'create'];
+  const ADMIN_TAB_ICONS = { stats:'📊', users:'👥', reports:'🚨', events:'🗓️', bots:'🤖', announce:'📣', reveal:'🕵️', logs:'📜', quests:'⚔️', arg:'🕳', create:'🧑‍💼', roster:'🎖️' };
   // The staff roster is a Founder-only view.
   const visibleTabs = me?.rank === 'Founder' ? [...TABS.slice(0, 2), 'roster', ...TABS.slice(2)] : TABS;
 
@@ -5893,6 +6010,7 @@ function AdminPanel({ onNotice, boot, onBootRefresh, me }) {
       {tab==='roster' && <StaffRoster me={me} onNotice={onNotice} />}
 
       {tab==='quests' && <AdminQuests />}
+      {tab==='arg' && <AdminArgProgress />}
 
       {tab==='create' && (
         <form onSubmit={createAdmin} className="mini">
@@ -6294,6 +6412,12 @@ function App() {
     socket.on('community_locked', onCommunityLocked);
     socket.on('presence_sync', onPresenceSync);
     socket.on('account_deleted', onAccountDeleted);
+    // Custom emoji list: fresh on boot and whenever anyone adds/removes one.
+    refreshCustomEmojis();
+    const onCustomEmojis = () => refreshCustomEmojis();
+    socket.on('custom_emojis_update', onCustomEmojis);
+    // Settings adds/removes emojis in the same window — refresh on its event too.
+    window.addEventListener('custom-emoji-changed', onCustomEmojis);
     // Presence heartbeat: periodically pull the DB-backed snapshot so statuses
     // apply even if a user_update event was missed or happened on another
     // instance. The server also pushes a snapshot on every (re)connect.
@@ -6307,6 +6431,8 @@ function App() {
       socket.off('challenge_roll', onChallengeRoll); socket.off('call_invite', onCallInvite); socket.off('community_locked', onCommunityLocked);
       socket.off('presence_sync', onPresenceSync);
       socket.off('account_deleted', onAccountDeleted);
+      socket.off('custom_emojis_update', onCustomEmojis);
+      window.removeEventListener('custom-emoji-changed', onCustomEmojis);
     };
   }, [socket, me, channelId, boot?.dms, boot?.groups]);
 
