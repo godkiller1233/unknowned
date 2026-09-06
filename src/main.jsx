@@ -6,7 +6,7 @@ const Settings = lazy(() => import('./Settings.jsx'));
 const Game = lazy(() => import('./Game.jsx'));
 import { Logo, Mascot } from './Logo.jsx';
 import { mediaConstraints, applySpeakerSink, loadMediaPrefs, isVirtualCamLabel, externalVideoConstraints } from './mediaPrefs.js';
-import { loadAvatarConfig, getAvatarFile, loadCalibration } from './avatar-store.js';
+import { loadAvatarConfig, getAvatarFile, loadCalibration, onCalibrationChanged, canUseVrmAvatar, isVrmAssetName } from './avatar-store.js';
 import { createAvatarEngine } from './avatar-engine.js';
 import { createVoiceMesh } from './mesh.js';
 import { createCallNegotiator } from './call-negotiation.js';
@@ -23,11 +23,15 @@ async function openAvatarTrack({ micStream } = {}) {
   const kind = cfg.mode === '2d' ? '2d' : '3d';
   const asset = await getAvatarFile(kind);
   if (!asset) return null; // nothing imported — callers fall back to the real camera
+  if (kind === '3d' && isVrmAssetName(asset.name) && !canUseVrmAvatar(currentAccountRank)) {
+    closeAvatarTrack();
+    return null; // VRM use is staff-tier — fall back to the real camera
+  }
   closeAvatarTrack();
   let cam = null;
   try { cam = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 640 }, height: { ideal: 480 } } }); } catch { cam = null; }
   const cal = await loadCalibration();
-  const eng = createAvatarEngine({ mode: cfg.mode, assetUrl: asset.url, hands: cfg.hands, cameraStream: cam, audioStream: micStream || null, calibration: cal, fit: asset.fit || null });
+  const eng = createAvatarEngine({ mode: cfg.mode, assetUrl: asset.url, hands: cfg.hands, body: cfg.body, cameraStream: cam, audioStream: micStream || null, calibration: cal, fit: asset.fit || null });
   liveAvatarEngine = eng;
   eng.start().catch(() => {});
   return eng.track;
@@ -42,6 +46,26 @@ function closeAvatarTrack() {
   liveAvatarEngine = null;
   if (eng) eng.destroy().catch(() => {});
 }
+
+// Re-calibrating in Settings must reach the LIVE call/room avatar engine too —
+// one tracker, every avatar — not just the Settings preview. Subscribe once;
+// openAvatarTrack replaces the engine object this callback closes over.
+let calSyncWired = false;
+function wireCalibrationSync() {
+  if (calSyncWired) return;
+  calSyncWired = true;
+  onCalibrationChanged(cal => {
+    const eng = liveAvatarEngine;
+    if (eng) { try { eng.setCalibration(cal); } catch {} }
+  });
+}
+wireCalibrationSync();
+
+// VRM rank gate for the LIVE call/room avatar engine: the module-level avatar
+// session needs the signed-in user's rank, which React state alone can't
+// provide here. Kept current by the bootstrap effect below.
+let currentAccountRank = 'Member';
+function setAccountRank(rank) { currentAccountRank = String(rank || 'Member'); }
 
 // “External app” avatar source: VTube Studio / OBS / Snap Camera etc. provide a
 // virtual camera that shows up as a normal webcam. We transmit that device's
@@ -285,12 +309,49 @@ function Avatar({ src, name, size='md', status, official, badge, onClick, anonMa
 
 // ── Attachment ────────────────────────────────────────────────────────────────
 function Attachment({ url, name, mime }) {
+  const [failed, setFailed] = useState(false);
   const type = fileType(url, mime);
   if (!url) return null;
-  if (type === 'image') return <div className="attach-wrap"><img src={url} alt={name||'image'} className="attach-image" onClick={() => window.open(url,'_blank')} /></div>;
-  if (type === 'video') return <div className="attach-wrap"><video src={url} controls className="attach-video" /></div>;
-  if (type === 'audio') return <div className="attach-wrap"><audio src={url} controls className="attach-audio" /></div>;
+  // Fallback: if the media can't load (removed file, dead origin), degrade to a
+  // plain link instead of a broken-image glyph.
+  if (failed || type === 'file') return <a href={url} target="_blank" rel="noopener noreferrer" className="attach-file">📎 {name || url.split('/').pop()}</a>;
+  if (type === 'image') return <div className="attach-wrap"><img src={proxiedImgSrc(url)} alt={name||'image'} className="attach-image" onError={() => setFailed(true)} onClick={() => window.open(url,'_blank')} /></div>;
+  if (type === 'video') return <div className="attach-wrap"><video src={proxiedImgSrc(url)} controls className="attach-video" onError={() => setFailed(true)} /></div>;
+  if (type === 'audio') return <div className="attach-wrap"><audio src={proxiedImgSrc(url)} controls className="attach-audio" onError={() => setFailed(true)} /></div>;
   return <a href={url} target="_blank" rel="noopener noreferrer" className="attach-file">📎 {name || url.split('/').pop()}</a>;
+}
+
+// External images (attachments or pasted links) render through the server's
+// img-proxy: the CSP only allows 'self' images, and proxying keeps rendering
+// working even when the source host blocks hotlinking or dies.
+function proxiedImgSrc(url) {
+  try {
+    const u = new URL(url, location.origin);
+    if (u.origin === location.origin) return url;            // same-origin: direct
+    return `/api/img-proxy?u=${encodeURIComponent(u.toString())}`;
+  } catch { return url; }
+}
+
+// Extensionless external links (e.g. YouTube thumbnails, CDN URLs without a
+// file extension) are probed via /api/img-probe: if the upstream Content-Type
+// is an image we render it through the proxy, otherwise we leave the plain link.
+function ProbableImage({ url, link }) {
+  const [state, setState] = useState('probing'); // probing | image | not
+  useEffect(() => {
+    let alive = true;
+    api(`/api/img-probe?u=${encodeURIComponent(url)}`)
+      .then(d => { if (alive) setState(d?.image ? 'image' : 'not'); })
+      .catch(() => { if (alive) setState('not'); });
+    return () => { alive = false; };
+  }, [url]);
+  if (state === 'probing') return <span key="probe" className="msg-embed-probing muted-text" style={{ fontSize: '.75rem' }}>🖼 checking link…</span>;
+  if (state !== 'image') return link;
+  return (
+    <span className="msg-embed">
+      {link}
+      <img src={proxiedImgSrc(url)} alt="" className="attach-image" loading="lazy" onError={e => { e.currentTarget.style.display = 'none'; }} />
+    </span>
+  );
 }
 
 // ── MsgBody (ping highlights + easter egg) ────────────────────────────────────
@@ -301,7 +362,26 @@ function MsgBody({ text, me }) {
   return <span>{tokens.map((p,i) => {
     if (p.startsWith('```')) return <code key={i} className="code-block">{p.slice(3,-3).replace(/^\w+\n/,'')}</code>;
     if (p.startsWith('||') && p.endsWith('||')) return <button key={i} type="button" className={`spoiler${revealed.has(i) ? ' revealed' : ''}`} title={revealed.has(i) ? 'Hide spoiler' : 'Reveal spoiler'} aria-label={revealed.has(i) ? 'Hide spoiler' : 'Reveal spoiler'} onClick={() => setRevealed(prev => { const next = new Set(prev); next.has(i) ? next.delete(i) : next.add(i); return next; })}>{p.slice(2,-2)}</button>;
-    if (/^https?:\/\//.test(p)) return <a key={i} href={p} target="_blank" rel="noopener noreferrer" className="message-link">{p}</a>;
+    if (/^https?:\/\//.test(p)) {
+      const link = <a key={i} href={p} target="_blank" rel="noopener noreferrer" className="message-link">{p}</a>;
+      // Same-origin upload links and image URLs on other hosts both render as
+      // images automatically (external ones through /api/img-proxy — the CSP
+      // only permits 'self' images, and the proxy survives hotlink blocks).
+      let imgUrl = null;
+      try {
+        const u = new URL(p, location.origin);
+        const path = u.pathname;
+        const looksImage = /\.(png|jpe?g|gif|webp|avif|bmp)$/i.test(path)
+          || (u.origin === location.origin && /^\/uploads\/[A-Za-z0-9._-]+$/.test(path));
+        if (looksImage) imgUrl = u.toString();
+      } catch { /* not a URL */ }
+      if (imgUrl) return <span key={i} className="msg-embed">{link}<img src={proxiedImgSrc(imgUrl)} alt="" className="attach-image" loading="lazy" onError={e => { e.currentTarget.style.display='none'; }} /></span>;
+      // Extensionless external links: probe Content-Type and embed when image.
+      if (/^https?:\/\//i.test(p) && !/\.[A-Za-z0-9]{1,5}$/i.test(new URL(p).pathname) && !new URL(p).pathname.endsWith('/')) {
+        return <ProbableImage key={i} url={p} link={link} />;
+      }
+      return link;
+    }
     if (/^@[\w-]+$/.test(p)) return <span key={i} className={p===`@${me?.username}`?'ping-me':'ping'}>{p}</span>;
     return p;
   })}</span>;
@@ -341,7 +421,17 @@ function PollRenderer({ poll: rawPoll, messageId, me }) {
 }
 
 // ── Emoji picker ──────────────────────────────────────────────────────────────
-const EMOJIS = ['👍','❤️','😂','😮','😢','😡','🔥','🎉','✅','💀','💯','🤔','😭','👀','🙌','🥳','😎','🤯','👏','🙏','✨','🚀','💜','🫶','🎮','🐱','🦊','🌈','☕','🍕','👤','🔑','🏆','🔒','🔔','🎙️','🎨','⭐','🎭','🕵️','💬'];  // + Settings rail icons
+// Emoji palette organized into small scannable categories. The flat EMOJIS
+// list is derived from the groups so callers that need the whole palette
+// (e.g. anonymous-mask fallback) keep working.
+const EMOJI_GROUPS = [
+  { id: 'reactions', label: 'Reactions', emojis: ['👍','❤️','😂','😮','😢','😡','🔥','🎉','💀','💯','🤔','😭','👀','🙌','🥳','😎','🤯','👏','🙏','💜','🫶'] },
+  { id: 'people',    label: 'People',    emojis: ['👤','🎭','🕵️'] },
+  { id: 'animals',   label: 'Animals',   emojis: ['🐱','🦊'] },
+  { id: 'objects',   label: 'Objects',   emojis: ['🚀','🎮','🌈','☕','🍕','🎙️','🎨','🏆'] },
+  { id: 'symbols',   label: 'Symbols',   emojis: ['✅','✨','🔑','🔒','🔔','💬','⭐'] },
+];
+const EMOJIS = EMOJI_GROUPS.flatMap(g => g.emojis);
 // 🎲 DO SOMETHING RANDOM — prompt question + poll catalogs
 const RANDOM_PROMPTS = [
   "If your life had a theme song, what would it be and why?",
@@ -372,7 +462,9 @@ const RANDOM_POLLS = [
 ];
 function EmojiPicker({ onPick }) {
   const [tab, setTab] = useState('emoji');
-  return <div className="emoji-picker"><div className="emoji-tabs"><button className={tab==='emoji'?'active':''} onClick={()=>setTab('emoji')}>Emoji</button><button className={tab==='gif'?'active':''} onClick={()=>setTab('gif')}>GIF</button><button className={tab==='sticker'?'active':''} onClick={()=>setTab('sticker')}>Stickers</button></div>{tab==='emoji' ? EMOJIS.map(e=><button key={e} onClick={()=>onPick(e)}>{e}</button>) : tab==='gif' ? <div className="media-placeholder">GIF links are supported — paste a GIF URL into chat.</div> : <div className="media-placeholder">Sticker links and uploaded stickers are supported.</div>}</div>;
+  const [cat, setCat] = useState(EMOJI_GROUPS[0].id);
+  const group = EMOJI_GROUPS.find(g => g.id === cat) || EMOJI_GROUPS[0];
+  return <div className="emoji-picker"><div className="emoji-tabs"><button className={tab==='emoji'?'active':''} onClick={()=>setTab('emoji')}>Emoji</button><button className={tab==='gif'?'active':''} onClick={()=>setTab('gif')}>GIF</button><button className={tab==='sticker'?'active':''} onClick={()=>setTab('sticker')}>Stickers</button></div>{tab==='emoji' ? <><div className="emoji-cats" role="tablist" aria-label="Emoji category">{EMOJI_GROUPS.map(g => <button key={g.id} role="tab" aria-selected={g.id===cat} className={g.id===cat?'active':''} onClick={()=>setCat(g.id)}>{g.label}</button>)}</div><div className="emoji-grid" role="tabpanel">{group.emojis.map(e => <button key={e} onClick={()=>onPick(e)}>{e}</button>)}</div></> : tab==='gif' ? <div className="media-placeholder">GIF links are supported — paste a GIF URL into chat.</div> : <div className="media-placeholder">Sticker links and uploaded stickers are supported.</div>}</div>;
 }
 
 // ── PII Warning modal ─────────────────────────────────────────────────────────
@@ -5251,6 +5343,53 @@ function RtcAdminEditor({ onSaved, notify }) {
   );
 }
 
+// ── Admin → Roster (Founder-only): who holds staff ranks, granted when/by ──────
+function StaffRoster({ onNotice }) {
+  const [rows, setRows] = useState(null);
+  const [err, setErr] = useState('');
+  useEffect(() => {
+    let alive = true;
+    api('/api/admin/staff-roster').then(d => {
+      if (!alive) return;
+      if (d.error) setErr(d.error);
+      else setRows(d.roster || []);
+    }).catch(() => { if (alive) setErr('Failed to load roster'); });
+    return () => { alive = false; };
+  }, []);
+  if (err) return <p className="muted-text">🔒 {err}</p>;
+  if (!rows) return <p className="muted-text">Loading roster…</p>;
+  if (!rows.length) return <p className="muted-text">No staff accounts yet.</p>;
+  return (
+    <>
+      <h3>🎖️ Staff roster</h3>
+      <p className="muted-text" style={{fontSize:'0.72rem'}}>Everyone holding a staff rank, most senior first. Grant time is recorded from when rank tracking began; system grants have no granter.</p>
+      {rows.map(u => (
+        <div key={u.id} className="log-item" style={{alignItems:'center'}}>
+          <span className="log-action">{u.rank}</span>
+          <span style={{minWidth:0}}>
+            <b>{u.nickname||u.username}</b> <small style={{color:'var(--muted)'}}>@{u.username}</small>
+            <small style={{display:'block',color:'var(--muted)'}}>
+              granted {u.rank_granted_at ? new Date(u.rank_granted_at).toLocaleString() : 'before tracking (system)'}
+              {u.granted_by_name ? <> by <b>{u.granted_by_name}</b>{u.granted_by_rank ? ` (${u.granted_by_rank})` : ''}</> : ' · system'}
+              {Number(u.banned) ? ' · 🚫 banned' : ''}
+            </small>
+          </span>
+          {u.rank === 'Founder' && <span className="badge-known" title="Founder">F</span>}
+        </div>
+      ))}
+    </>
+  );
+}
+
+// Human-readable byte size for admin stats (e.g. 4.2 MB).
+function fmtBytes(n) {
+  const v = Number(n) || 0;
+  if (v >= 1024*1024*1024) return (v/(1024*1024*1024)).toFixed(1)+' GB';
+  if (v >= 1024*1024) return (v/(1024*1024)).toFixed(1)+' MB';
+  if (v >= 1024) return (v/1024).toFixed(1)+' KB';
+  return v+' B';
+}
+
 function AdminPanel({ onNotice, boot, onBootRefresh, me }) {
   const [tab, setTab]     = useState('stats');
   const [rtcTick, setRtcTick] = useState(0); // bump to re-probe relay health after a save
@@ -5315,6 +5454,13 @@ function AdminPanel({ onNotice, boot, onBootRefresh, me }) {
     onNotice(d.ok?`Nuked ${c.name}`:(d.error||'Nuke failed'), d.ok?'ok':'err'); load(); onBootRefresh();
   }
 
+  async function purgeImgCache() {
+    if (!confirm('Purge the entire external-image proxy cache? Every instance will stop serving cached external images immediately (they re-fetch on next view).')) return;
+    const d = await api('/api/admin/img-cache', { method: 'DELETE' });
+    if (d.error) return onNotice(d.error, 'err');
+    onNotice(`Purged ${d.purged ?? 0} cached images`, 'ok');
+    load();
+  }
   async function toggleUser(u, field, val) {
     const body = { isAdmin:field==='isAdmin'?val:Boolean(Number(u.is_admin)), banned:field==='banned'?val:Boolean(Number(u.banned)), badge:field==='badge'?val:(u.badge||'') };
     await api(`/api/admin/users/${u.id}`,{method:'PATCH',body:JSON.stringify(body)});
@@ -5378,6 +5524,9 @@ function AdminPanel({ onNotice, boot, onBootRefresh, me }) {
   const [banForm, setBanForm]   = useState({userId:'', reason:''});
   const [revealMod, setRevealMod] = useState([]);
   const TABS = ['stats','users','reports','events','bots','announce','reveal','logs','quests','create'];
+  const ADMIN_TAB_ICONS = { stats:'📊', users:'👥', reports:'🚨', events:'🗓️', bots:'🤖', announce:'📣', reveal:'🕵️', logs:'📜', quests:'⚔️', create:'🧑‍💼', roster:'🎖️' };
+  // The staff roster is a Founder-only view.
+  const visibleTabs = me?.rank === 'Founder' ? [...TABS.slice(0, 2), 'roster', ...TABS.slice(2)] : TABS;
 
   async function loadRevealMod() {
     const d = await api('/api/reveal/moderation?status=open').catch(() => null);
@@ -5433,9 +5582,16 @@ function AdminPanel({ onNotice, boot, onBootRefresh, me }) {
         </div>
       )}
       <RtcAdminEditor onSaved={() => setRtcTick(t => t + 1)} notify={onNotice} />
-      <div className="admin-tabs">
-        {TABS.map(t => <button key={t} className={tab===t?'active':''} onClick={()=>setTab(t)}>{t.charAt(0).toUpperCase()+t.slice(1)}</button>)}
-      </div>
+      <div className="admin-nav">
+        <div className="server-nav-rail">
+          {visibleTabs.map(t => (
+            <button key={t} className={`server-nav-tab${tab===t?' active':''}`} onClick={()=>setTab(t)} aria-label={t}>
+              <span className="server-nav-emoji">{ADMIN_TAB_ICONS[t] || '▪️'}</span>
+              <span className="server-nav-label">{t.charAt(0).toUpperCase()+t.slice(1)}</span>
+            </button>
+          ))}
+        </div>
+        <div className="server-nav-body">
 
       {tab==='stats' && stats && (
         <>
@@ -5444,10 +5600,18 @@ function AdminPanel({ onNotice, boot, onBootRefresh, me }) {
             <div className="stat-card"><span>{stats.messages}</span><label>Messages</label></div>
             <div className="stat-card warn"><span>{stats.reports}</span><label>Reports</label></div>
             <div className="stat-card"><span>{stats.communities}</span><label>Servers</label></div>
+            <div className="stat-card" title="External images cached by the server-side proxy (they survive restarts and are shared by every instance)"><span>{stats.imgCacheCount ?? 0}</span><label>Img cache · {fmtBytes(stats.imgCacheBytes)}</label></div>
           </div>
           <div className="nuke-list" style={{marginTop:'0.75rem'}}>
             <b style={{color:'var(--danger,#ed4245)'}}>☢ Danger Zone — Nuke a server</b>
             <p className="muted-text" style={{fontSize:'0.72rem',margin:'0.25rem 0 0.5rem'}}>Permanently deletes a server and everything in it (messages, channels, roles, members).</p>
+            <div className="admin-user" style={{marginBottom:'0.5rem'}}>
+              <div className="admin-user-info">
+                <b>🖼 Purge image-proxy cache</b>
+                <small>Drops all cached external images immediately instead of waiting for the 6-hour expiry. They re-fetch on next view.</small>
+              </div>
+              <button className="danger" onClick={purgeImgCache}>🧹 Purge</button>
+            </div>
             {(boot?.communities||[]).map(c=>(
               <div key={c.id} className="admin-user">
                 <div className="admin-user-info"><b>{c.name}</b><small>{c.description||''}</small></div>
@@ -5666,6 +5830,8 @@ function AdminPanel({ onNotice, boot, onBootRefresh, me }) {
         </>
       )}
 
+      {tab==='roster' && <StaffRoster me={me} onNotice={onNotice} />}
+
       {tab==='quests' && <AdminQuests />}
 
       {tab==='create' && (
@@ -5676,6 +5842,8 @@ function AdminPanel({ onNotice, boot, onBootRefresh, me }) {
           {created?.temporaryPassword&&<div className="notice">Temp password: <code>{created.temporaryPassword}</code></div>}
         </form>
       )}
+      </div>
+      </div>
     </section>
   );
 }
@@ -5931,6 +6099,7 @@ function App() {
       }
       setMe(d.me);
       setBoot(d);
+      setAccountRank(d.me && d.me.rank);
       rememberRtcServers(d);
       // Only auto-open a community the user actually belongs to; otherwise land on
       // the guided start state (Discover / create / friends) instead of a denied server.
@@ -6698,12 +6867,21 @@ function ServerSettings({ comm, me, boot, onClose, onRefresh, notify }) {
   const TAB_LABELS = { overview:'👁 Overview', channels:'📁 Channels', roles:'🎖 Roles', members:'👥 Members', invites:'🔗 Invites', moderation:'🛡 Moderation' };
 
   return (
-    <div className="server-settings-full">
-      <div className="settings-inner-tabs">
-        {TABS.map(t=>(
-          <button key={t} className={`settings-inner-tab${tab===t?' active':''}`} onClick={()=>setTab(t)}>{TAB_LABELS[t]}</button>
-        ))}
+    <div className="server-settings-full server-nav">
+      <div className="server-nav-rail">
+        {TABS.map(t=>{
+          const parts = TAB_LABELS[t].split(' ');
+          const emoji = parts.shift();
+          const label = parts.join(' ');
+          return (
+          <button key={t} className={`server-nav-tab${tab===t?' active':''}`} onClick={()=>setTab(t)} aria-label={label || emoji}>
+            <span className="server-nav-emoji">{emoji}</span>
+            <span className="server-nav-label">{label}</span>
+          </button>
+          );
+        })}
       </div>
+      <div className="server-nav-body">
 
       {tab==='overview' && (
         <form onSubmit={saveOverview} className="mini">
@@ -6796,6 +6974,7 @@ function ServerSettings({ comm, me, boot, onClose, onRefresh, notify }) {
           {isOwner && <button type="button" className="danger-btn" onClick={del} style={{marginTop:'1rem'}}>Delete Server</button>}
         </div>
       )}
+      </div>
     </div>
   );
 }

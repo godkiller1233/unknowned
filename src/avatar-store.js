@@ -8,7 +8,7 @@ const DB_NAME = 'unknown_avatar_assets';
 const DB_STORE = 'files';
 
 export function defaultAvatarConfig() {
-  return { mode: 'camera', hands: true };
+  return { mode: 'camera', hands: true, body: true, gravity: 0.5 };
 }
 
 export function loadAvatarConfig() {
@@ -19,6 +19,8 @@ export function loadAvatarConfig() {
     return {
       mode: p.mode === '2d' || p.mode === '3d' || p.mode === 'external' ? p.mode : 'camera',
       hands: p.hands !== false,
+      body: p.body !== false,
+      gravity: typeof p.gravity === 'number' ? Math.min(1, Math.max(0, p.gravity)) : 0.5,
       externalId: typeof p.externalId === 'string' ? p.externalId : '',
     };
   } catch {
@@ -31,6 +33,8 @@ export function saveAvatarConfig(cfg) {
     localStorage.setItem(AVATAR_CFG_KEY, JSON.stringify({
       mode: cfg.mode === '2d' || cfg.mode === '3d' || cfg.mode === 'external' ? cfg.mode : 'camera',
       hands: cfg.hands !== false,
+      body: cfg.body !== false,
+      gravity: typeof cfg.gravity === 'number' ? Math.min(1, Math.max(0, cfg.gravity)) : 0.5,
       externalId: typeof cfg.externalId === 'string' ? cfg.externalId : '',
     }));
   } catch { /* storage unavailable — defaults apply this session */ }
@@ -61,6 +65,22 @@ async function tx(mode, fn) {
     t.onerror = () => reject(t.error || new Error('idb tx failed'));
     t.onabort = () => reject(t.error || new Error('idb tx aborted'));
   });
+}
+
+// ── VRM access policy ───────────────────────────────────────────────────────
+// VRM avatars are a staff-tier feature: only the platform's Founder, Owner and
+// official Administrator ranks may use them. Regular members stick to .glb /
+// 2D picture / external-app avatars. (Avatar art never leaves the device, so
+// this gate lives with the client at every path a VRM can enter: the file
+// picker, the live call engine, and the Settings preview.)
+export const VRM_ALLOWED_RANKS = ['founder', 'owner', 'administrator'];
+
+export function canUseVrmAvatar(rank) {
+  return VRM_ALLOWED_RANKS.includes(String(rank || '').trim().toLowerCase());
+}
+
+export function isVrmAssetName(name) {
+  return /\.vrm$/i.test(String(name || ''));
 }
 
 /** Persist an uploaded File/Blob under kind '2d' | '3d'. */
@@ -145,4 +165,19 @@ export async function avatarAssetKinds() {
 export function avatarModeActive() {
   const cfg = loadAvatarConfig();
   return cfg.mode === '2d' || cfg.mode === '3d';
+}
+
+// -- calibration live-sync ----------------------------------------------------
+// Calibration is measured once (Settings wizard) but consumed by every avatar
+// surface — Settings preview, DM/video-room engines. A tiny pub/sub lets the
+// wizard push the freshly saved (or cleared) calibration to every engine that
+// is currently running, so switching avatars or being mid-call never leaves a
+// stale tracker behind.
+let calSubs = [];
+export function onCalibrationChanged(cb) {
+  calSubs.push(cb);
+  return () => { calSubs = calSubs.filter(f => f !== cb); };
+}
+export function notifyCalibrationChanged(cal) {
+  calSubs.forEach(f => { try { f(cal); } catch { /* a dead subscriber must not break the rest */ } });
 }

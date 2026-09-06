@@ -6,3 +6,7 @@ uploads/*
 .env
 .env.*
 !.env.example
+
+# Personal VRM model binaries — kept locally only (see fixtures/vrm/README.md)
+fixtures/vrm/*
+!fixtures/vrm/README.md

@@ -73,6 +73,16 @@ test('blendValues maps MediaPipe ARKit categories to canonical channels', () => 
   assert.equal(blendValues([{ categoryName: 'bogus_thing', score: 1 }]).bogus_thing, undefined);
 });
 
+test('blendValues also accepts already-keyed channel maps (custom trackers, wizard samples)', () => {
+  const b = blendValues({ eyeBlinkRight: 0.8, jawOpen: 0.5, mouthSmileLeft: 0.6, bogusThing: 0.9 });
+  assert.equal(b.eyeBlinkR, 0.8);
+  assert.equal(b.jawOpen, 0.5);
+  assert.equal(b.mouthSmileL, 0.6);
+  assert.equal(b.bogusThing, 0.9); // keyed maps are trusted: unknown keys pass through clamped
+  assert.deepEqual(blendValues(null), {});
+  assert.deepEqual(blendValues(undefined), {});
+});
+
 test('faceChannels folds channels into renderer-friendly fields', () => {
   const ch = faceChannels({ eyeBlinkL: 0.9, eyeSquintL: 0.2, eyeBlinkR: 0.7, mouthSmileL: 0.4, mouthSmileR: 0.5, jawOpen: 0.6, mouthPucker: 0.4 });
   assert.equal(ch.blinkL, 0.9);

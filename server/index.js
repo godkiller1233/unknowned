@@ -236,6 +236,17 @@ async function initializeDb() {
       created_at TIMESTAMPTZ DEFAULT NOW(),
       payload BYTEA
     );
+    CREATE TABLE IF NOT EXISTS uploads (
+      name TEXT PRIMARY KEY,
+      content_type TEXT,
+      bytes BYTEA NOT NULL,
+      size INTEGER,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    -- The img-proxy cache also lives in the uploads table under namespaced rows
+    -- (name LIKE '\_\_imgproxy:%'), sharing the same bytes/content_type/size
+    -- columns so every instance serves cached external images from the DB.
+    CREATE INDEX IF NOT EXISTS uploads_imgproxy_idx ON uploads (name) WHERE name LIKE '\_\_imgproxy:%';
     CREATE TABLE IF NOT EXISTS auth_sessions (
       id TEXT PRIMARY KEY,
       user_id TEXT NOT NULL,
@@ -636,6 +647,8 @@ async function runMigrations() {
     ['users','anon_name_color','TEXT DEFAULT \'\''],
     ['communities','pinned_mask','TEXT DEFAULT \'\''],
     ['communities','is_default','INTEGER DEFAULT 0'],
+    ['users','rank_granted_at','TIMESTAMPTZ'],
+    ['users','rank_granted_by','TEXT'],
     // quest_logs earnedToday/cap queries SUM(reward); the column was missing on
     // PostgreSQL, which made /api/quests and claiming 500 on Postgres deployments.
     ['quest_logs','reward','INTEGER DEFAULT 0'],
@@ -677,6 +690,8 @@ function startCleanup() {
   setInterval(async () => {
     try {
       await store.run("DELETE FROM channels WHERE expires_at IS NOT NULL AND expires_at < CURRENT_TIMESTAMP");
+      // Expired img-proxy cache rows (namespaced `__imgproxy:*` in `uploads`).
+      await store.run("DELETE FROM uploads WHERE name LIKE '\_\_imgproxy:%' AND created_at < CURRENT_TIMESTAMP - INTERVAL '6 hours'");
       // Temp rooms: purge expired rooms and their children
       const expired = await store.all("SELECT id, community_id FROM temp_rooms WHERE expires_at IS NOT NULL AND expires_at < CURRENT_TIMESTAMP");
       for (const r of expired) {
@@ -697,9 +712,10 @@ async function ensureOfficialAccount() {
     const existing = await store.get('SELECT * FROM users WHERE username=$1', account.username);
     if (!existing) {
       const created = await createUser(account.username, 'real', account.password);
-      await store.run('UPDATE users SET rank=$1,nickname=$2,is_admin=1 WHERE id=$3', account.rank, `${account.rank} Account`, created.id);
+      await store.run('UPDATE users SET rank=$1,rank_granted_at=CURRENT_TIMESTAMP,nickname=$2,is_admin=1 WHERE id=$3', account.rank, `${account.rank} Account`, created.id);
     } else {
-      await store.run('UPDATE users SET tag=$1,nickname=$2,rank=$3,is_admin=1,password_hash=$4 WHERE username=$5',
+      // granted_at only moves when the rank itself changes — not on every boot.
+      await store.run('UPDATE users SET tag=$1,nickname=$2,rank=$3,is_admin=1,password_hash=$4,rank_granted_at=CASE WHEN rank IS DISTINCT FROM $3 THEN CURRENT_TIMESTAMP ELSE rank_granted_at END WHERE username=$5',
         'real', `${account.rank} Account`, account.rank, bcrypt.hashSync(account.password, 10), account.username);
     }
   }
@@ -708,10 +724,10 @@ async function ensureOfficialAccount() {
 async function seed() {
   const primary = configuredPrivilegedAccounts[0] || { rank:'Administrator', username:OFFICIAL_ACCOUNT_USERNAME, password:OFFICIAL_ACCOUNT_PASSWORD };
   const admin = await createUser(primary.username, 'real', primary.password);
-  await store.run('UPDATE users SET rank=$1 WHERE id=$2', primary.rank, admin.id);
+  await store.run('UPDATE users SET rank=$1,rank_granted_at=CURRENT_TIMESTAMP WHERE id=$2', primary.rank, admin.id);
   for (const account of configuredPrivilegedAccounts.slice(1)) {
     const created = await createUser(account.username, 'real', account.password);
-    await store.run('UPDATE users SET rank=$1 WHERE id=$2', account.rank, created.id);
+    await store.run('UPDATE users SET rank=$1,rank_granted_at=CURRENT_TIMESTAMP WHERE id=$2', account.rank, created.id);
   }
   const comm = nanoid(); const invCode = nanoid(8);
   await store.run(`INSERT INTO communities
@@ -776,12 +792,160 @@ app.use(cors({
 app.use(express.json({ limit: '8mb' }));
 app.use('/uploads', express.static(uploadDir, {
   dotfiles: 'deny',
-  fallthrough: false,
   setHeaders: (res) => {
     res.setHeader('Content-Disposition', 'inline');
     res.setHeader('X-Content-Type-Options', 'nosniff');
   },
 }));
+// Cross-instance fallback: the file was uploaded on a different server or
+// desktop instance and is not on this node's disk — serve it from the shared
+// database instead so images render everywhere.
+app.get('/uploads/:name', (req,res) => {
+  const name = String(req.params.name || '');
+  if (!UPLOAD_NAME_RE.test(name)) return res.status(404).end();
+  store.get('SELECT content_type, bytes FROM uploads WHERE name=$1', name).then(row => {
+    if (!row || !row.bytes) return res.status(404).end();
+    res.setHeader('Content-Type', row.content_type || mimeFromName(name));
+    res.setHeader('Content-Disposition', 'inline');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.end(row.bytes);
+  }).catch(() => res.status(404).end());
+});
+
+// ── External image proxy ──────────────────────────────────────────────────────
+// Message bodies and attachments can reference images on other hosts. Browsers
+// block those under our strict CSP (img-src 'self'), and hotlinked images break
+// when the source host is slow, rate-limits, or dies. The client routes every
+// external image through /api/img-proxy so rendering never depends on a third
+// party's CORS/CSP/runtime behavior.
+const IMG_PROXY_MAX_BYTES = 20 * 1024 * 1024;
+const IMG_PROXY_MIME = /^image\/(png|jpe?g|gif|webp|avif|bmp|svg\+xml)$/i;
+const IMG_PROXY_TTL_MS = 6 * 60 * 60 * 1000;
+// The proxy cache lives in the shared `uploads` table (namespaced `__imgproxy:*`)
+// so proxied images survive restarts and are served by ANY instance without
+// re-fetching upstream. A small write-through memory map keeps repeat hits off
+// the database entirely.
+const IMG_PROXY_MEM = new Map(); // url -> { bytes, contentType, fetchedAt }
+const IMG_PROXY_MEM_MAX = 50;
+const IMGPROXY_KEY_PREFIX = '__imgproxy:';
+const imgProxyKey = url => IMGPROXY_KEY_PREFIX + url;
+
+async function imgCacheGet(url) {
+  const mem = IMG_PROXY_MEM.get(url);
+  if (mem) return mem;
+  try {
+    const row = await store.get('SELECT content_type, bytes, EXTRACT(EPOCH FROM created_at)*1000 AS fetched_ms FROM uploads WHERE name=$1', imgProxyKey(url));
+    if (!row) return null;
+    const entry = { bytes: row.bytes, contentType: row.content_type || 'application/octet-stream', fetchedAt: Number(row.fetched_ms) || 0 };
+    if (IMG_PROXY_MEM.size >= IMG_PROXY_MEM_MAX) {
+      const oldest = [...IMG_PROXY_MEM.entries()].sort((a, b) => a[1].fetchedAt - b[1].fetchedAt)[0];
+      if (oldest) IMG_PROXY_MEM.delete(oldest[0]);
+    }
+    IMG_PROXY_MEM.set(url, entry);
+    return entry;
+  } catch { return null; }
+}
+
+async function imgCachePut(url, bytes, contentType) {
+  const entry = { bytes, contentType, fetchedAt: Date.now() };
+  if (IMG_PROXY_MEM.size >= IMG_PROXY_MEM_MAX) {
+    const oldest = [...IMG_PROXY_MEM.entries()].sort((a, b) => a[1].fetchedAt - b[1].fetchedAt)[0];
+    if (oldest) IMG_PROXY_MEM.delete(oldest[0]);
+  }
+  IMG_PROXY_MEM.set(url, entry);
+  try {
+    await store.run(
+      'INSERT INTO uploads (name, content_type, bytes, size, created_at) VALUES ($1,$2,$3,$4,CURRENT_TIMESTAMP) ' +
+      'ON CONFLICT (name) DO UPDATE SET content_type = EXCLUDED.content_type, bytes = EXCLUDED.bytes, size = EXCLUDED.size, created_at = CURRENT_TIMESTAMP',
+      imgProxyKey(url), contentType, bytes, bytes.length
+    );
+  } catch {}
+}
+
+function isPublicHttpUrl(value) {
+  let u;
+  try { u = new URL(String(value)); } catch { return null; }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+  // Never let the proxy be used to reach internal services (SSRF guard).
+  const host = u.hostname.toLowerCase();
+  if (host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '[::1]' || host === '0.0.0.0') return null;
+  if (/^10\./.test(host) || /^192\.168\./.test(host) || /^169\.254\./.test(host) || /^127\./.test(host)) return null;
+  if (/^172\.(1[6-9]|2\d|3[01])\./.test(host)) return null;
+  if (host.endsWith('.local') || host.endsWith('.internal')) return null;
+  return u;
+}
+
+// Content-Type probe for extensionless links (e.g. YouTube thumbnails):
+// returns { image, contentType, size } without streaming the body through.
+// A 1-byte range fetch keeps the check cheap; servers ignoring Range return
+// the full body but we discard it immediately.
+app.get('/api/img-probe', async (req,res) => {
+  try {
+    const u = isPublicHttpUrl(req.query.u);
+    if (!u) return res.status(400).json({ error: 'Invalid image URL' });
+    const key = u.toString();
+    const cached = await imgCacheGet(key);
+    if (cached && Date.now() - cached.fetchedAt < IMG_PROXY_TTL_MS) {
+      return res.json({ image: IMG_PROXY_MIME.test(cached.contentType), contentType: cached.contentType, size: cached.bytes.length });
+    }
+    let upstream;
+    try {
+      upstream = await fetch(key, {
+        method: 'GET',
+        headers: { 'User-Agent': 'UnknownChat-ImageProxy/1.0', Accept: 'image/*', Range: 'bytes=0-0' },
+        signal: AbortSignal.timeout(8000),
+        redirect: 'follow',
+      });
+    } catch { return res.json({ image: false, error: 'unreachable' }); }
+    // Drain whatever came back so the socket is released.
+    try { await upstream.arrayBuffer(); } catch {}
+    if (!upstream.ok && upstream.status !== 206) return res.json({ image: false, status: upstream.status });
+    const contentType = String(upstream.headers.get('content-type') || '').split(';')[0].trim();
+    const cr = String(upstream.headers.get('content-range') || '');
+    const size = Number(/\/(\d+)$/.exec(cr)?.[1] || upstream.headers.get('content-length') || 0);
+    res.json({ image: IMG_PROXY_MIME.test(contentType), contentType, size });
+  } catch { res.status(500).json({ error: 'probe failed' }); }
+});
+
+app.get('/api/img-proxy', async (req,res) => {
+  try {
+    const u = isPublicHttpUrl(req.query.u);
+    if (!u) return res.status(400).json({ error: 'Invalid image URL' });
+    const key = u.toString();
+
+    const cached = await imgCacheGet(key);
+    if (cached && Date.now() - cached.fetchedAt < IMG_PROXY_TTL_MS) {
+      res.setHeader('Content-Type', cached.contentType);
+      res.setHeader('Cache-Control', 'public, max-age=3600');
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      return res.end(cached.bytes);
+    }
+
+    let upstream;
+    try {
+      upstream = await fetch(key, {
+        signal: AbortSignal.timeout(12000),
+        headers: { 'User-Agent': 'UnknownChat-ImageProxy/1.0', Accept: 'image/*' },
+        redirect: 'follow',
+      });
+    } catch { return res.status(502).json({ error: 'Upstream image unreachable' }); }
+    if (!upstream.ok) return res.status(502).json({ error: 'Upstream image unreachable' });
+
+    const contentType = String(upstream.headers.get('content-type') || '').split(';')[0].trim();
+    if (!IMG_PROXY_MIME.test(contentType)) return res.status(415).json({ error: 'Not an image' });
+    const len = Number(upstream.headers.get('content-length') || 0);
+    if (len > IMG_PROXY_MAX_BYTES) return res.status(413).json({ error: 'Image too large' });
+
+    const buf = Buffer.from(await upstream.arrayBuffer());
+    if (buf.length > IMG_PROXY_MAX_BYTES) return res.status(413).json({ error: 'Image too large' });
+    await imgCachePut(key, buf, contentType);
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.end(buf);
+  } catch { res.status(502).json({ error: 'Image fetch failed' }); }
+});
 
 const upload = multer({
   dest: uploadDir,
@@ -1350,6 +1514,51 @@ function uploadFileNames(...values) {
 }
 const uploadAbsPath = name => path.join(uploadDir, name);
 
+// ── Shared upload storage (cross-instance images) ─────────────────────────────
+// Uploaded files historically lived only on each instance's local disk, so a
+// message containing an image 404'd on every other server/desktop app. Uploads
+// now mirror into the shared PostgreSQL database and /uploads serves
+// disk-first-then-database, so any instance renders any upload.
+const UPLOAD_MIME = {
+  '.png':'image/png', '.jpg':'image/jpeg', '.jpeg':'image/jpeg', '.gif':'image/gif',
+  '.webp':'image/webp', '.mp4':'video/mp4', '.webm':'video/webm', '.mov':'video/quicktime',
+  '.mp3':'audio/mpeg', '.ogg':'audio/ogg', '.wav':'audio/wav',
+};
+const mimeFromName = name => UPLOAD_MIME[path.extname(name).toLowerCase()] || 'application/octet-stream';
+const UPLOAD_NAME_RE = /^[A-Za-z0-9._-]{1,200}$/;
+
+async function mirrorUploadToDb(name, contentType, filePath) {
+  try {
+    if (!UPLOAD_NAME_RE.test(name)) return;
+    await store.run(
+      'INSERT INTO uploads (name, content_type, bytes, size) VALUES ($1,$2,$3,$4) ON CONFLICT (name) DO NOTHING',
+      name, contentType, fs.readFileSync(filePath), fs.statSync(filePath).size);
+  } catch (e) { console.warn('[uploads] database mirror failed:', String(e.message || e)); }
+}
+
+// One-time-per-boot: pull files that only exist on this node's disk (written
+// before the database mirror existed) into the shared database.
+async function importDiskUploadsToDb() {
+  try {
+    let names = [];
+    try { names = fs.readdirSync(uploadDir); } catch { return; }
+    let imported = 0;
+    for (const name of names) {
+      if (name === '.gitkeep' || !UPLOAD_NAME_RE.test(name)) continue;
+      const full = uploadAbsPath(name);
+      let stat; try { stat = fs.statSync(full); } catch { continue; }
+      if (!stat.isFile()) continue;
+      const exists = await store.get('SELECT name FROM uploads WHERE name=$1', name);
+      if (exists) continue;
+      await store.run(
+        'INSERT INTO uploads (name, content_type, bytes, size) VALUES ($1,$2,$3,$4) ON CONFLICT (name) DO NOTHING',
+        name, mimeFromName(name), fs.readFileSync(full), stat.size);
+      imported++;
+    }
+    if (imported) console.log(`[uploads] imported ${imported} existing file(s) into the shared database`);
+  } catch (e) { console.warn('[uploads] database import skipped:', String(e.message || e)); }
+}
+
 app.get('/api/me/export', auth, route(async (req,res) => {
   const uid = req.user.id;
   const u = await store.get('SELECT * FROM users WHERE id=$1', uid);
@@ -1552,6 +1761,9 @@ async function deleteUserAccount(userId, ownedFiles) {
       anonymousIdentities: Number(delAnon.rowCount || 0),
       uploadFiles: files.length,
     };
+    // Shared-database mirror: erase the bytes too (disk copies are removed by
+    // the caller only after this transaction committed).
+    if (files.length) await q('DELETE FROM uploads WHERE name = ANY($1::text[])', files);
     return { summary, files };
   } catch (error) {
     try { await client.query('ROLLBACK'); } catch {}
@@ -3641,6 +3853,9 @@ app.post('/api/upload', auth, upload.single('file'), (req,res) => {
   const ext = path.extname(req.file.originalname).toLowerCase().replace(/[^a-z0-9.]/g, '');
   const newName = `${req.file.filename}${ext}`;
   fs.renameSync(req.file.path, path.join(uploadDir, newName));
+  // Mirror into the shared database so every instance (web + desktop) can serve
+  // this file; the disk copy keeps same-node serving fast.
+  mirrorUploadToDb(newName, req.file.mimetype, path.join(uploadDir, newName));
   res.json({url:`/uploads/${newName}`, name:req.file.originalname.slice(0,255), type:req.file.mimetype, size:req.file.size});
 });
 
@@ -3986,6 +4201,21 @@ app.get('/api/admin/users', auth, adminOnly, route(async (_,res) => {
   res.json(await store.all('SELECT *,created_at FROM users ORDER BY created_at DESC'));
 }));
 
+// ── Staff roster (Founder only) ────────────────────────────────────────────────
+// Every account holding a staff rank plus when that rank was granted and by
+// whom (rank_granted_by NULL = system/bootstrap grant).
+app.get('/api/admin/staff-roster', auth, adminOnly, route(async (req,res) => {
+  if (req.user.rank !== 'Founder') return res.status(403).json({error:'Founder only — the staff roster is restricted.'});
+  const rows = await store.all(`
+    SELECT u.id, u.username, u.nickname, u.tag, u.rank, u.banned,
+           u.rank_granted_at, g.username AS granted_by_name, g.rank AS granted_by_rank
+    FROM users u LEFT JOIN users g ON g.id = u.rank_granted_by
+    WHERE COALESCE(u.is_admin,0)=1 AND COALESCE(u.is_bot,0)=0
+      AND u.rank IN ('Mod','Sr. Mod','Jr. admin','admin','Dev','Head Mod','Head admin','Manager','Administrator','Owner','Founder')`);
+  rows.sort((a,b) => (STAFF_RANK_LEVELS[b.rank]||0) - (STAFF_RANK_LEVELS[a.rank]||0) || String(a.username).localeCompare(String(b.username)));
+  res.json({ roster: rows });
+}));
+
 app.get('/api/admin/staff-ranks', auth, adminOnly, route(async (req,res) => {
   const actor = await store.get('SELECT id,rank,is_admin FROM users WHERE id=$1', req.user.id);
   const actorLevel = STAFF_RANK_LEVELS[actor?.rank] || 0;
@@ -4070,8 +4300,14 @@ app.patch('/api/admin/users/:id', auth, adminOnly, route(async (req,res) => {
   if (newRank && newRank !== req.user.rank && !canAssignRank(req.user, newRank)) {
     return res.status(403).json({error:'You may only assign ranks below your own tier.'});
   }
-  const sql = 'UPDATE users SET is_admin=$1,banned=$2,badge=$3' + (newRank ? ',rank=$5' : '') + ' WHERE id=$4';
-  const args = newRank ? [isAdmin?1:0, banned?1:0, badge||'', req.params.id, newRank] : [isAdmin?1:0, banned?1:0, badge||'', req.params.id];
+  // Track who granted the current rank and when (idempotent: re-saving the same
+  // rank must not reset the grant timestamp).
+  const prevRankRow = newRank ? await store.get('SELECT rank FROM users WHERE id=$1', req.params.id) : null;
+  const rankChanged = Boolean(newRank) && (prevRankRow?.rank||'') !== newRank;
+  const sql = 'UPDATE users SET is_admin=$1,banned=$2,badge=$3' + (newRank ? ',rank=$5' : '') + (rankChanged ? ',rank_granted_at=CURRENT_TIMESTAMP,rank_granted_by=$6' : '') + ' WHERE id=$4';
+  const args = rankChanged ? [isAdmin?1:0, banned?1:0, badge||'', req.params.id, newRank, req.user.id]
+    : newRank ? [isAdmin?1:0, banned?1:0, badge||'', req.params.id, newRank]
+    : [isAdmin?1:0, banned?1:0, badge||'', req.params.id];
   await store.run(sql, ...args);
   await store.run('INSERT INTO moderation_logs VALUES (?,?,?,?,?,CURRENT_TIMESTAMP)', nanoid(),req.user.id,banned?'ban':'update',req.params.id,JSON.stringify({isAdmin,banned,badge,rank:newRank}));
   const u = publicUser(await store.get('SELECT * FROM users WHERE id=$1', req.params.id));
@@ -4304,7 +4540,18 @@ app.get('/api/admin/stats', auth, adminOnly, route(async (_,res) => {
   const reports = (await store.get("SELECT COUNT(*) AS c FROM reports WHERE status='open'")).c;
   const communities = (await store.get('SELECT COUNT(*) AS c FROM communities')).c;
   const bots = (await store.get('SELECT COUNT(*) AS c FROM users WHERE is_bot=1')).c;
-  res.json({users,messages,reports,communities,bots});
+  // External-image proxy cache footprint (namespaced rows in the uploads table).
+  const imgCache = await store.get("SELECT COUNT(*) AS c, COALESCE(SUM(size),0) AS bytes FROM uploads WHERE name LIKE '\_\_imgproxy:%'");
+  res.json({users,messages,reports,communities,bots,imgCacheCount:Number(imgCache?.c||0),imgCacheBytes:Number(imgCache?.bytes||0)});
+}));
+
+// Purge the external-image proxy cache immediately (instead of waiting for the
+// 6-hour TTL): clears this instance's write-through memory map AND the shared
+// namespaced rows in the uploads table, so every instance stops serving them.
+app.delete('/api/admin/img-cache', auth, adminOnly, route(async (req,res) => {
+  IMG_PROXY_MEM.clear();
+  const del = await store.run("DELETE FROM uploads WHERE name LIKE '\_\_imgproxy:%'");
+  res.json({ ok:true, purged: Number(del.rowCount || 0) });
 }));
 
 app.get('/api/admin/logs', auth, adminOnly, route(async (_,res) => {
@@ -5522,6 +5769,10 @@ if (fs.existsSync(path.join(root, 'dist'))) {
   app.use(express.static(path.join(root, 'dist')));
   app.use((req,res,next) => { if(req.path.startsWith('/api/')) return next(); res.sendFile(path.join(root,'dist','index.html')); });
 }
+
+// After the schema and module state are ready, pull any disk-only uploads from
+// this node into the shared database (idempotent; safe across instances).
+importDiskUploadsToDb();
 
 server.listen(PORT, process.env.HOST || '0.0.0.0', () => console.log(`Unknown running on ${PORT}`));
 export { app, store };

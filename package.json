@@ -9,7 +9,11 @@
     "server:dev": "nodemon server/index.js",
     "build": "vite build",
     "start": "node server/index.js",
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "verify:body": "node scripts/body-rig-verify.mjs",
+    "verify:vrm": "node scripts/vrm-verify.mjs",
+    "desktop": "node scripts/package-desktop.mjs",
+    "desktop:fast": "node scripts/package-desktop.mjs --fast"
   },
   "engines": {
     "node": ">=20"
@@ -37,6 +41,7 @@
   },
   "devDependencies": {
     "concurrently": "^9.2.1",
-    "nodemon": "latest"
+    "nodemon": "latest",
+    "playwright": "^1.63.0"
   }
 }

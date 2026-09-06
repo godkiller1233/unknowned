@@ -80,7 +80,10 @@ export async function startDisposableServer({ adminUrl = ADMIN_URL, env: extraEn
   let child = null;
   let serverLog = '';
 
-  if (!reuse) await admin.query(`CREATE DATABASE ${dbName}`);
+  if (!reuse) await admin.query(
+    // Windows clusters often default to a legacy codepage (e.g. WIN1252) that
+    // cannot store the seed's emoji; force UTF8 so tests behave like CI.
+    `CREATE DATABASE ${dbName} ENCODING 'UTF8' TEMPLATE template0 LC_COLLATE 'C' LC_CTYPE 'C'`);
   const port = await getFreePort();
   const base = `http://127.0.0.1:${port}`;
   // With `reuse`, boot a second instance against an existing throwaway database

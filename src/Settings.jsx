@@ -1,7 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { loadMediaPrefs, saveMediaPrefs, isVirtualCamLabel, externalVideoConstraints } from './mediaPrefs.js';
-import { loadAvatarConfig, saveAvatarConfig, saveAvatarFile, removeAvatarFile, getAvatarFile, saveAvatarFit, loadCalibration, saveCalibration, clearCalibration } from './avatar-store.js';
+import { loadAvatarConfig, saveAvatarConfig, saveAvatarFile, removeAvatarFile, getAvatarFile, saveAvatarFit, loadCalibration, saveCalibration, clearCalibration, notifyCalibrationChanged, canUseVrmAvatar, isVrmAssetName, VRM_ALLOWED_RANKS } from './avatar-store.js';
 import { createAvatarEngine } from './avatar-engine.js';
+import { bodyMetrics } from './avatar-math.js';
 
 const getToken = () => sessionStorage.token || localStorage.rememberToken || '';
 const api = (path, opts = {}) =>
@@ -107,6 +108,15 @@ export default function Settings({ me, boot, onClose, onSave, currentTheme, onTh
   const [avatarCfg, setAvatarCfg] = useState(loadAvatarConfig);
   const [avatarAssets, setAvatarAssets] = useState({ '2d': null, '3d': null }); // {name} | null
   const [avatarStatus, setAvatarStatus] = useState('');
+  // Which avatar sources this account's rank unlocks (VRM models are staff-only;
+  // everything else is available to everyone).
+  const vrmUnlocked = canUseVrmAvatar(me?.rank);
+  const avatarUnlocks = [
+    { id: 'camera', label: 'Real camera', note: 'Always available' },
+    { id: '2d', label: '2D picture', note: 'Always available' },
+    { id: '3d', label: '3D model (.glb)', note: 'Always available' },
+    { id: 'vrm', label: '3D VRM model', note: vrmUnlocked ? `Unlocked by your ${me?.rank} rank` : `Founder / ${VRM_ALLOWED_RANKS.filter(r => r !== 'founder').map(r => r[0].toUpperCase() + r.slice(1)).join(' / ')} only` },
+  ];
   const [avatarPreviewOn, setAvatarPreviewOn] = useState(false);
   const avatarEngineRef = useRef(null);
   const avatarPrevRef = useRef(null);
@@ -157,6 +167,7 @@ export default function Settings({ me, boot, onClose, onSave, currentTheme, onTh
     const kind = cfg.mode === '2d' ? '2d' : '3d';
     const asset = await getAvatarFile(kind);
     if (!asset) { setAvatarStatus('Upload ' + (kind === '2d' ? 'a picture' : 'a 3D model') + ' first — then it will preview here.'); return; }
+    if (kind === '3d' && isVrmAssetName(asset.name) && !canUseVrmAvatar(me?.rank)) { setAvatarStatus('VRM avatars are limited to the Founder, Owner and Administrator ranks — pick a .glb model or switch to 2D.'); return; }
     // The webcam is optional: it only powers face/hand tracking and is never sent.
     let cam = null;
     try { cam = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 640 }, height: { ideal: 480 } } }); } catch { cam = null; }
@@ -164,7 +175,7 @@ export default function Settings({ me, boot, onClose, onSave, currentTheme, onTh
     setAvatarStatus('Starting…');
     const cal = await loadCalibration();
     const eng = createAvatarEngine({
-      mode: cfg.mode, assetUrl: asset.url, hands: cfg.hands, cameraStream: cam, calibration: cal, fit: asset.fit || null,
+      mode: cfg.mode, assetUrl: asset.url, hands: cfg.hands, body: cfg.body, cameraStream: cam, calibration: cal, fit: asset.fit || null,
       onStatus: st => { if (avatarEngineRef.current === eng) setAvatarStatus(st === 'tracking' ? '✅ Tracking your face — move to see the avatar react.' + (cal ? ' (calibrated)' : '') : st === 'tracking-or-idle' ? 'Tracking your face…' : st === 'no-camera-idle' ? 'No webcam needed — the avatar animates on its own. Allow the camera for face tracking.' : st === 'no-tracking-idle' ? 'Tracking unavailable — the avatar animates on its own.' : String(st)); },
     });
     avatarEngineRef.current = eng;
@@ -183,6 +194,7 @@ export default function Settings({ me, boot, onClose, onSave, currentTheme, onTh
     ev.target.value = '';
     if (!file) return;
     if (kind === '3d' && !/\.(glb|vrm)$/i.test(file.name)) { notify('3D avatars must be a .glb or .vrm model file.', 'err'); return; }
+    if (kind === '3d' && isVrmAssetName(file.name) && !canUseVrmAvatar(me?.rank)) { notify('VRM avatars are limited to the Founder, Owner and Administrator ranks. Use a .glb model instead.', 'err'); return; }
     if (kind === '2d' && !/\.(png|jpe?g|webp|gif)$/i.test(file.name)) { notify('2D avatars must be a picture (PNG/JPG/WebP/GIF).', 'err'); return; }
     if (file.size > 40 * 1024 * 1024) { notify('That file is too large (max 40 MB).', 'err'); return; }
     try {
@@ -257,20 +269,23 @@ export default function Settings({ me, boot, onClose, onSave, currentTheme, onTh
   // guided capture (neutral pose, then eyes-closed / open-mouth / smile /
   // brows-up, then a hands check) records min/max ranges that stretch the
   // user's real movement across the avatar's full range of motion.
-  const CAL_STAGES = ['pose', 'blink', 'mouth', 'smile', 'brows', 'hands'];
+  const CAL_STAGES = ['pose', 'body', 'blink', 'mouth', 'smile', 'brows', 'hands', 'arms'];
   const CAL_META = [
     { id: 'pose', icon: '🧍', label: 'Neutral pose', tip: 'Face the camera, head straight, relaxed face. We record where your eyes, nose and mouth sit so the avatar lines up with you.' },
+    { id: 'body', icon: '🚶', label: 'Stand up straight', tip: "Step back so your whole torso is in frame, arms relaxed at your sides. We record your shoulder span and arm length so the avatar's body matches your build." },
     { id: 'blink', icon: '😑', label: 'Close your eyes', tip: 'Squeeze both eyes shut for a moment, then relax.', channels: ['eyeBlinkL', 'eyeBlinkR', 'eyeSquintL', 'eyeSquintR'] },
     { id: 'mouth', icon: '😮', label: 'Open your mouth wide', tip: 'A big yawn-sized opening.', channels: ['jawOpen'] },
     { id: 'smile', icon: '😁', label: 'Big smile', tip: 'A wide grin — show teeth if you can.', channels: ['mouthSmileL', 'mouthSmileR'] },
     { id: 'brows', icon: '🤨', label: 'Raise your eyebrows', tip: 'Look surprised.', channels: ['browInnerUp', 'browOuterUpL', 'browOuterUpR'] },
     { id: 'hands', icon: '🖐️', label: 'Show your hands', tip: 'Raise both hands, palms facing the camera, fingers apart.', channels: [] },
+    { id: 'arms', icon: '🙆', label: 'Sweep your arms', tip: 'Slowly raise both arms STRAIGHT up overhead (no bent elbows — they shrink the top of your range), then lower them and spread out wide. Watch the meter fill as you sweep.', channels: [] },
   ];
   const [calOpen, setCalOpen] = useState(false);
   const [calBusy, setCalBusy] = useState(false);
   const [calMsg, setCalMsg] = useState('');
   const [calStream, setCalStream] = useState(null);
   const [calRecs, setCalRecs] = useState({});
+  const [armSweep, setArmSweep] = useState(null);   // { l, r } raise 0..1 during the arms capture
   const [calHas, setCalHas] = useState(false);
   const calEngRef = useRef(null);
   const calCamRef = useRef(null);
@@ -282,7 +297,7 @@ export default function Settings({ me, boot, onClose, onSave, currentTheme, onTh
     setCalBusy(false);
     setCalMsg('Starting your camera…');
     setCalRecs({});
-    calDataRef.current = { pose: null, base: {}, peaks: {} };
+    calDataRef.current = { pose: null, base: {}, peaks: {}, body: null, armRange: null };
     setCalHas(!!(await loadCalibration()));
     let cam = null;
     try { cam = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 640 }, height: { ideal: 480 } } }); } catch { cam = null; }
@@ -346,6 +361,91 @@ export default function Settings({ me, boot, onClose, onSave, currentTheme, onTh
     setCalMsg('Neutral pose saved — the avatar will face straight when you relax. Now capture each expression below.');
   }
 
+  async function captureBody() {
+    setCalBusy(true);
+    setCalMsg('Stand back from the camera, arms relaxed at your sides, facing straight on…');
+    const metrics = [];
+    await collectSamples(16, 110, snap => {
+      if (!snap || !snap.body || snap.body.length < 25) return;
+      const m = bodyMetrics(snap.body);
+      if (m) metrics.push(m);
+    });
+    setCalBusy(false);
+    if (metrics.length < 7) { setCalMsg('⚠️ We could not see your full body. Step back so your shoulders and torso are fully in frame, in decent light, then capture again.'); return; }
+    const avg = (arr, k) => arr.reduce((x, m) => x + (m[k] || 0), 0) / arr.length;
+    const body = {
+      midX: avg(metrics, 'midX'), midY: avg(metrics, 'midY'),
+      shoulderSpan: avg(metrics, 'shoulderSpan'),
+      armLenL: avg(metrics, 'armLenL'), armLenR: avg(metrics, 'armLenR'),
+    };
+    if (body.shoulderSpan < 0.02) { setCalMsg('⚠️ You look too close — step back until your whole torso fits in frame, then capture again.'); return; }
+    calDataRef.current.body = body;
+    setCalRecs(r => ({ ...r, body: '✓ Body measured' }));
+    setCalMsg("Body saved — the avatar's torso and arms now match your build. Next, the arm sweep.");
+  }
+
+  // Arms sweep: normalize each frame against a ROLLING neutral arm length —
+  // the elbow chain (shoulder→elbow + elbow→wrist) — instead of the static
+  // captured armLen. A user drifting toward the camera would otherwise have
+  // their range compressed (bigger limbs) or inflated (smaller limbs), which
+  // is exactly the distance-drift artifact seen in clip-based verification.
+  // Returns {dy, dx} or null when the frame lacks landmarks.
+  function armSweepSide(b, shIdx, elIdx, wrIdx) {
+    const sh = b[shIdx], el = b[elIdx], wr = b[wrIdx];
+    if (!sh || !el || !wr) return null;
+    const chain = Math.hypot(el.x - sh.x, el.y - sh.y) + Math.hypot(wr.x - el.x, wr.y - el.y);
+    if (!(chain > 1e-6)) return null;
+    return { dy: (sh.y - wr.y) / chain, dx: (wr.x - sh.x) / chain, chain };
+  }
+
+  async function captureArms() {
+    const body = calDataRef.current.body;
+    if (!body) { setCalMsg('Capture your standing body measurement first.'); return; }
+    setCalBusy(true);
+    setArmSweep(null);
+    setCalMsg('Slowly sweep: arms down → straight up overhead → out wide to your sides…');
+    const rng = { l: { dy: [9, -9], dx: [9, -9] }, r: { dy: [9, -9], dx: [9, -9] } };
+    let good = 0, bentTop = false;
+    const PAD = 0.06, TOP_WARN = 0.75;   // pads match applyBodyCalibration's expectations
+    const onSample = snap => {
+      if (!snap || !snap.body || snap.body.length < 25) return;
+      const b = snap.body;
+      const l = armSweepSide(b, 11, 13, 15);
+      const r = armSweepSide(b, 12, 14, 16);
+      if (!l && !r) return;
+      good++;
+      const acc = (sideKey, v) => {
+        if (!v) return;
+        const t = rng[sideKey];
+        t.dy[0] = Math.min(t.dy[0], v.dy); t.dy[1] = Math.max(t.dy[1], v.dy);
+        t.dx[0] = Math.min(t.dx[0], v.dx); t.dx[1] = Math.max(t.dx[1], v.dx);
+      };
+      acc('l', l); acc('r', r);
+      // Live raise meter: map the current dy into the running range so the user
+      // sees the calibration bar fill as they sweep (0 = arms down, 1 = top).
+      const norm = (v, t) => (v === null || t.dy[1] <= t.dy[0]) ? 0 : Math.min(1, Math.max(0, (v.dy - t.dy[0]) / (t.dy[1] - t.dy[0])));
+      setArmSweep({ l: norm(l, rng.l), r: norm(r, rng.r) });
+      // Straight-overhead arms give dy ≈ 1 (wrist above shoulder ≈ full chain
+      // length). Bent elbows at the top shrink dy well below 1 — flag it so
+      // users know to straighten before saving a squashed top of range.
+      const topCheck = v => { if (v && v.dy > 0.55 && v.dy < TOP_WARN) bentTop = true; };
+      topCheck(l); topCheck(r);
+    };
+    await collectSamples(18, 130, onSample);
+    setCalBusy(false);
+    setArmSweep(null);
+    if (good < 7) { setCalMsg('⚠️ We lost your body mid-sweep — keep your whole torso in frame and capture again.'); return; }
+    const span = Math.max(rng.l.dy[1] - rng.l.dy[0], rng.r.dy[1] - rng.r.dy[0]);
+    if (span < 0.25) { setCalMsg('⚠️ That sweep only raised your arms ' + Math.round(span * 100) + '% of your reach — raise them higher (straight overhead) and spread wider, then capture again.'); return; }
+    // Pad the captured band so resting positions don't sit exactly on the range edge.
+    const pad = (t) => ({ min: +(t[0] - PAD).toFixed(3), max: +(t[1] + PAD).toFixed(3) });
+    calDataRef.current.armRange = { l: { dy: pad(rng.l.dy), dx: pad(rng.l.dx) }, r: { dy: pad(rng.r.dy), dx: pad(rng.r.dx) } };
+    setCalRecs(r => ({ ...r, arms: '✓ Full reach learned' }));
+    setCalMsg(bentTop
+      ? 'Reach learned — tip: you bent your elbows at the top, which shrinks the overhead range. Redo the sweep with straight arms for a fuller reach.'
+      : 'Everything is captured — review the list, then hit "Save calibration".');
+  }
+
   async function captureExpr(id) {
     const meta = CAL_META.find(m => m.id === id);
     if (!meta) return;
@@ -382,7 +482,9 @@ export default function Settings({ me, boot, onClose, onSave, currentTheme, onTh
     if (saw < 7) { setCalMsg('⚠️ We could not see your hands. Raise them into the frame, palms open, fingers apart, then capture again.'); return; }
     calDataRef.current.hands = { seen: both / counts.length };
     setCalRecs(r => ({ ...r, hands: both >= 3 ? '✓ Both hands seen' : '✓ Hands seen' }));
-    setCalMsg('Everything is captured — review the list, then hit "Save calibration".');
+    const idx = CAL_STAGES.indexOf('hands');
+    if (idx >= 0 && idx < CAL_STAGES.length - 1) setCalMsg(CAL_META[idx + 1].tip + ' Capture it when ready.');
+    else setCalMsg('Everything is captured — review the list, then hit "Save calibration".');
   }
 
   const allCalCaptured = () => CAL_STAGES.every(id => calRecs[id]);
@@ -402,10 +504,14 @@ export default function Settings({ me, boot, onClose, onSave, currentTheme, onTh
         channels[ch] = { min: lo, max: hi };
       });
     });
-    const cal = { pose: d.pose, channels, hands: d.hands || { seen: 0 }, savedAt: Date.now() };
+    const body = d.body ? { ...d.body, armRange: d.armRange || null } : null;
+    const cal = { pose: d.pose, channels, hands: d.hands || { seen: 0 }, body, savedAt: Date.now() };
     try { await saveCalibration(cal); } catch { setCalBusy(false); setCalMsg('⚠️ Could not save the calibration on this device.'); return; }
     const eng = avatarEngineRef.current;
     if (eng) { try { eng.setCalibration(cal); } catch {} }
+    // Push to every other running avatar engine (live calls, other instances) —
+    // “one tracker, every avatar” stays true even mid-session.
+    notifyCalibrationChanged(cal);
     setCalBusy(false);
     setCalHas(true);
     setCalRecs(r => ({ ...r, saved: '✓ Calibration saved' }));
@@ -414,10 +520,11 @@ export default function Settings({ me, boot, onClose, onSave, currentTheme, onTh
   }
 
   async function resetCalibration() {
-    calDataRef.current = { pose: null, base: {}, peaks: {} };
+    calDataRef.current = { pose: null, base: {}, peaks: {}, body: null, armRange: null };
     await clearCalibration();
     const eng = avatarEngineRef.current;
     if (eng) { try { eng.setCalibration(null); } catch {} }
+    notifyCalibrationChanged(null);
     setCalRecs({});
     setCalHas(false);
     setCalMsg('Calibration cleared — start over whenever you are ready.');
@@ -1206,14 +1313,23 @@ export default function Settings({ me, boot, onClose, onSave, currentTheme, onTh
               <h3>🤖 Your avatar — use it instead of your face</h3>
               <p className="muted-text" style={{ fontSize: '.85rem', marginTop: '.35rem' }}>
                 In video rooms and when you turn the camera on in a call, you can send an animated avatar instead of your real face.
-                Your webcam (if you allow it) is used <b>only on this device</b> to track your face, eyes, mouth and hands — it is never transmitted.
+                Your webcam (if you allow it) is used <b>only on this device</b> to track your face, eyes, mouth, hands and body — it is never transmitted.
                 Without a camera the avatar still breathes, blinks and talks along with your microphone.
               </p>
+
+              <div className="avatar-unlocks" aria-label="Avatar types unlocked by your rank">
+                {avatarUnlocks.map(u => (
+                  <span key={u.id} className={`avatar-unlock${vrmUnlocked || u.id !== 'vrm' ? '' : ' locked'}`} title={u.note}>
+                    {u.label}{u.id === 'vrm' && vrmUnlocked && <b className="unlock-check"> ✓</b>}
+                    <small>{u.note}</small>
+                  </span>
+                ))}
+              </div>
 
               <div className="avatar-mode-row">
                 {[['camera', '📷', 'Real camera'], ['2d', '🖼️', '2D picture'], ['3d', '🧍', '3D model'], ['external', '🧪', 'External app']].map(([id, ic, label]) => (
                   <button key={id} className={`avatar-mode-btn${avatarCfg.mode === id ? ' active' : ''}`} onClick={() => setAvatarMode(id)}>
-                    {ic} {label}
+                    {ic} {label}{id === '3d' && !vrmUnlocked && <span className="mode-staff-dot" title="VRM models are staff-only (.glb available to all)" />}
                   </button>
                 ))}
               </div>
@@ -1227,8 +1343,8 @@ export default function Settings({ me, boot, onClose, onSave, currentTheme, onTh
                     : <button className="avatar-asset-add" onClick={() => pickAvatarFile('2d')}>⬆ Upload picture</button>}
                 </div>
                 <div className="avatar-asset-card">
-                  <div className="avatar-asset-title">🧍 3D model</div>
-                  <p className="muted-text" style={{ fontSize: '.8rem' }}>.glb / .vrm. Full face animation — blink, eyes, brows, mouth — drives the model's morph targets when names match (VRM, ARKit, common exports).</p>
+                  <div className="avatar-asset-title">🧍 3D model {!vrmUnlocked && <span className="staff-badge" title={`VRM models need the Founder, Owner or Administrator rank — your rank: ${me?.rank || 'Member'}`}>🔒 VRM staff-only</span>}</div>
+                  <p className="muted-text" style={{ fontSize: '.8rem' }}>.glb{vrmUnlocked ? ' / .vrm' : ''}. Full face animation — blink, eyes, brows, mouth — drives the model's morph targets when names match (VRM, ARKit, common exports).{!vrmUnlocked && ' VRM uploads need a staff rank — .glb works for everyone.'}</p>
                   {avatarAssets['3d']
                     ? <div className="avatar-asset-file"><span>📄 {avatarAssets['3d'].name}</span><button className="avatar-asset-remove" onClick={() => removeAvatarAsset('3d')}>Remove</button></div>
                     : <button className="avatar-asset-add" onClick={() => pickAvatarFile('3d')}>⬆ Upload model</button>}
@@ -1305,9 +1421,24 @@ export default function Settings({ me, boot, onClose, onSave, currentTheme, onTh
                     </button>
                     {avatarPreviewOn && <button onClick={() => stopAvatarPreview()}>⏹ Stop preview</button>}
                     {avatarCfg.mode !== 'external' && (
-                      <label className="avatar-hands-label">
-                        <input type="checkbox" checked={avatarCfg.hands} onChange={async (e) => { const next = { ...avatarCfg, hands: e.target.checked }; setAvatarCfg(next); saveAvatarConfig(next); const eng = avatarEngineRef.current; if (eng) { try { eng.setHands(next.hands); } catch {} } }} />
-                        <span>Show tracked hands 🖐️</span>
+                      <>
+                        <label className="avatar-hands-label">
+                          <input type="checkbox" checked={avatarCfg.hands} onChange={async (e) => { const next = { ...avatarCfg, hands: e.target.checked }; setAvatarCfg(next); saveAvatarConfig(next); const eng = avatarEngineRef.current; if (eng) { try { eng.setHands(next.hands); } catch {} } }} />
+                          <span>Show tracked hands 🖐️</span>
+                        </label>
+                        <label className="avatar-hands-label">
+                          <input type="checkbox" checked={avatarCfg.body !== false} onChange={async (e) => { const next = { ...avatarCfg, body: e.target.checked }; setAvatarCfg(next); saveAvatarConfig(next); const eng = avatarEngineRef.current; if (eng) { try { eng.setBody(next.body); } catch {} } }} />
+                          <span>Show tracked body 🦴</span>
+                        </label>
+                      </>
+                    )}
+                    {avatarCfg.mode === '3d' && (
+                      <label className="avatar-hands-label" style={{ width: '100%' }}>
+                        <span style={{ whiteSpace: 'nowrap' }}>Gravity for hair &amp; clothes 🪐</span>
+                        <input type="range" min="0" max="1" step="0.05" value={avatarCfg.gravity ?? 0.5}
+                          onChange={async (e) => { const next = { ...avatarCfg, gravity: parseFloat(e.target.value) }; setAvatarCfg(next); saveAvatarConfig(next); const eng = avatarEngineRef.current; if (eng) { try { eng.setGravityStrength(next.gravity); } catch {} } }}
+                          aria-label="Gravity strength for hair and clothes" style={{ flex: 1 }} />
+                        <small className="muted-text" style={{ minWidth: 34, textAlign: 'right' }}>{Math.round((avatarCfg.gravity ?? 0.5) * 100)}%</small>
                       </label>
                     )}
                   </div>
@@ -1316,7 +1447,7 @@ export default function Settings({ me, boot, onClose, onSave, currentTheme, onTh
                     <div className="settings-toggle-row" style={{ alignItems: 'center', flexWrap: 'wrap' }}>
                       <button onClick={openCalibration} disabled={calOpen}>📏 Calibrate tracking{calHas ? ' (calibrated ✓)' : ''}</button>
                       <span className="muted-text" style={{ fontSize: '.8rem' }}>
-                        A 30-second guided setup — neutral pose, eyes-closed, open mouth, smile, brows, hands — so the tracker stretches <i>your</i> real ranges across the avatar's full motion.
+                        A 30-second guided setup — neutral pose, standing body, eyes-closed, open mouth, smile, brows, hands, arm sweep — so the tracker stretches <i>your</i> real ranges across every avatar's full motion.
                       </span>
                     </div>
                   )}
@@ -1335,7 +1466,7 @@ export default function Settings({ me, boot, onClose, onSave, currentTheme, onTh
                       <button className="cal-close" onClick={closeCalibration} aria-label="Close">✕</button>
                     </div>
                     <p className="muted-text" style={{ fontSize: '.83rem', margin: '.35rem 0 .7rem' }}>
-                      The rings show where the tracker sees your <b>eyes, pupils, mouth and hands</b> — if they sit on the right spots, run the six captures below. Each capture only takes a second and you can redo any of them.
+                      The rings show where the tracker sees your <b>eyes, pupils, mouth, hands and body</b> — if they sit on the right spots, run the eight captures below. Each capture only takes a second and you can redo any of them.
                     </p>
                     <div className="cal-body">
                       <div className="cal-stage">
@@ -1352,10 +1483,16 @@ export default function Settings({ me, boot, onClose, onSave, currentTheme, onTh
                               <p>{m.tip}</p>
                             </div>
                             <button className="cal-capture" disabled={calBusy}
-                              onClick={() => { m.id === 'pose' ? capturePose() : m.id === 'hands' ? captureHands() : captureExpr(m.id); }}>
+                              onClick={() => { m.id === 'pose' ? capturePose() : m.id === 'body' ? captureBody() : m.id === 'hands' ? captureHands() : m.id === 'arms' ? captureArms() : captureExpr(m.id); }}>
                               {calBusy ? '…' : calRecs[m.id] ? 'Redo' : 'Capture'}
                             </button>
                             {calRecs[m.id] && <span className="cal-step-done">{calRecs[m.id]}</span>}
+                            {m.id === 'arms' && armSweep && !calRecs[m.id] && (
+                              <span className="arm-meter" role="meter" aria-label="Arm raise coverage" aria-valuemin={0} aria-valuemax={1} aria-valuenow={Math.round(Math.max(armSweep.l, armSweep.r) * 100) / 100}>
+                                <span className="arm-meter-bar"><span className="arm-meter-fill" style={{ width: Math.round(Math.max(armSweep.l, armSweep.r) * 100) + '%' }} /></span>
+                                <small>{Math.round(Math.max(armSweep.l, armSweep.r) * 100)}% raised</small>
+                              </span>
+                            )}
                           </div>
                         ))}
                       </div>
