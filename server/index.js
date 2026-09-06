@@ -5559,12 +5559,11 @@ io.on('connection', socket => {
 
   // Live roster for a voice room: every connected socket (any instance) with the
   // profile + socket id a new joiner needs to start the peer connections.
-  async function voiceRoomUsers(roomName, exceptSocketId, exceptUserId) {
+  async function voiceRoomUsers(roomName, exceptSocketId) {
     try {
       const socks = await io.in(roomName).fetchSockets();
       return socks
         .filter(s => s.id !== exceptSocketId && s.data?.user)
-        .filter(s => !exceptUserId || s.data.user.id !== exceptUserId)
         .map(s => ({ ...voicePeerPayload(s.data.user), socketId: s.id }))
         .filter(u => u.userId);
     } catch { return []; }
@@ -5578,31 +5577,19 @@ io.on('connection', socket => {
       member = await store.get('SELECT 1 FROM room_members WHERE room_id=$1 AND user_id=$2 AND waiting=0', channelId, userId).catch(() => null);
     }
     if (!member && !socket.data.user.is_admin) return;
-    // One call per account: if another live socket of this user (any device,
-    // any instance) is already in a voice room, refuse the join instead of
-    // letting a user call themselves across their own devices.
-    try {
-      const all = await io.fetchSockets();
-      const busy = all.some(s => s.id !== socket.id
-        && s.data?.user?.id === userId
-        && [...s.rooms].some(r => r.startsWith('voice:')));
-      if (busy) {
-        socket.emit('voice_join_rejected', { channelId, reason: 'already-in-call' });
-        return;
-      }
-    } catch {}
+    // Multiple sessions of the same account may be in the call at once —
+    // each device is its own participant, keyed by socket id.
     const roomName = `voice:${channelId}`;
     socket.join(roomName);
     try {
-      await store.run('DELETE FROM voice_sessions WHERE channel_id=$1 AND user_id=$2', channelId, userId);
-      await store.run('INSERT INTO voice_sessions VALUES (?,?,?,CURRENT_TIMESTAMP)', nanoid(), channelId, userId);
+      await store.run('DELETE FROM voice_sessions WHERE id=$1', socket.id);
+      await store.run('INSERT INTO voice_sessions VALUES (?,?,?,CURRENT_TIMESTAMP)', socket.id, channelId, userId);
     } catch {}
     const profile = voicePeerPayload(socket.data.user) || { userId };
     // Existing members: a new socket joined (id + profile) so they can connect to it.
     socket.to(roomName).emit('voice_user_joined', { channelId, ...profile, socketId: socket.id });
-    // The joiner: the full current roster (cross-instance via the shared adapter),
-    // minus any session of their own account.
-    const users = await voiceRoomUsers(roomName, socket.id, userId);
+    // The joiner: the full current roster (cross-instance via the shared adapter).
+    const users = await voiceRoomUsers(roomName, socket.id);
     socket.emit('voice_roster', { channelId, users });
     io.to(roomName).emit('voice_state', { channelId, userId, joined: true });
   });
@@ -5612,7 +5599,7 @@ io.on('connection', socket => {
     if (typeof channelId !== 'string' || channelId.length > 128 || !socket.rooms.has(`voice:${channelId}`)) return;
     const roomName = `voice:${channelId}`;
     socket.leave(roomName);
-    try { await store.run('DELETE FROM voice_sessions WHERE channel_id=$1 AND user_id=$2', channelId, userId); } catch {}
+    try { await store.run('DELETE FROM voice_sessions WHERE id=$1', socket.id); } catch {}
     socket.to(roomName).emit('voice_user_left', { channelId, userId, socketId: socket.id });
     io.to(roomName).emit('voice_state', { channelId, userId, joined: false });
   });

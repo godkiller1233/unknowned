@@ -4125,7 +4125,6 @@ function VoiceChannel({ channel, me, socket, notify }) {
   const [sharing, setSharing] = useState(false);
   // Server refused the voice_join (this account is already in a call on another
   // device or instance). Blocks re-joining until the other device hangs up.
-  const [joinBlocked, setJoinBlocked] = useState(false);
   // Roster rows carry profile + a `live` flag (real audio flowing) per peer.
   const [roster, setRoster] = useState([]);
   const [streamTick, setStreamTick] = useState(0);
@@ -4143,14 +4142,7 @@ function VoiceChannel({ channel, me, socket, notify }) {
       onRemoteEnd: () => setStreamTick(t => t + 1),
     });
     meshRef.current = mesh;
-    const onRejected = d => {
-      if (d?.channelId !== channel.id) return;
-      setInCall(false);
-      setJoinBlocked(true);
-      notify?.('This account is already in a call on another device. Leave that call to join here.', 'err');
-    };
-    socket.on('voice_join_rejected', onRejected);
-    return () => { socket.off('voice_join_rejected', onRejected); mesh.destroy(); meshRef.current = null; };
+    return () => { mesh.destroy(); meshRef.current = null; };
   }, [socket, channel.id, me?.id]);
 
   // Attach remote audio when a stream arrives and route it to the chosen
@@ -4170,7 +4162,6 @@ function VoiceChannel({ channel, me, socket, notify }) {
   }, [roster, streamTick, inCall]);
 
   async function joinCall() {
-    if (joinBlocked) { notify?.('This account is already in a call on another device. Leave it there first.', 'err'); return; }
     try {
       const stream = await navigator.mediaDevices.getUserMedia(mediaConstraints('mic'));
       streamRef.current = stream;
@@ -4225,11 +4216,10 @@ function VoiceChannel({ channel, me, socket, notify }) {
             </div>
             {roster.map(u => {
               const hasMedia = Boolean(meshRef.current?.streamFor(u.socketId));
-              const isMyOtherDevice = u.userId === me?.id;
               return (
-                <div key={u.socketId} className={`voice-tile${hasMedia?' live':' connecting'}${isMyOtherDevice?' self-other':''}`}>
+                <div key={u.socketId} className={`voice-tile${hasMedia?' live':' connecting'}`}>
                   <Avatar src={u.avatar} name={displayName(u)} size="lg" badge={u.badge} />
-                  <span>{displayName(u)}{isMyOtherDevice ? ' (you — other device)' : ''}</span>
+                  <span>{displayName(u)}</span>
                   <audio ref={el => { audioRefs.current[u.socketId] = el; }} autoPlay playsInline style={{display:'none'}} />
                   {hasMedia
                     ? <span className="voice-live-dot" title="Audio live" />
@@ -4341,7 +4331,6 @@ function RoomView({ roomId, me, socket, notify, onLaunchGame }) {
   const [raises, setRaises] = useState([]);
   const [voiceRoster, setVoiceRoster] = useState([]);   // peers actually live in voice (mesh)
   // Server refused the voice_join (this account is already in a call elsewhere).
-  const [voiceBlocked, setVoiceBlocked] = useState(false);
   const [streamTick, setStreamTick] = useState(0);
   const [cameraOn, setCameraOn] = useState(true);       // local camera state (video rooms)
   const meshRef = useRef(null);
@@ -4416,14 +4405,7 @@ function RoomView({ roomId, me, socket, notify, onLaunchGame }) {
       onRemoteEnd: () => setStreamTick(t => t + 1),
     });
     meshRef.current = mesh;
-    const onRejected = d => {
-      if (d?.channelId !== roomId) return;
-      leaveVoice();
-      setVoiceBlocked(true);
-      notify('This account is already in a call on another device. Leave that call to join here.', 'err');
-    };
-    socket.on('voice_join_rejected', onRejected);
-    return () => { socket.off('voice_join_rejected', onRejected); mesh.destroy(); meshRef.current = null; };
+    return () => { mesh.destroy(); meshRef.current = null; };
   }, [roomId, room?.type, me?.id]);
 
   // Attach remote audio/video as streams arrive; honor the saved speaker.
@@ -4484,7 +4466,6 @@ function RoomView({ roomId, me, socket, notify, onLaunchGame }) {
 
   // ── Voice/video: real peer media via the mesh ──
   async function joinVoice() {
-    if (voiceBlocked) { notify('This account is already in a call on another device. Leave it there first.', 'err'); return; }
     try {
       const wantsVideo = room?.type==='video';
       const cfg = loadAvatarConfig();
@@ -4674,8 +4655,7 @@ function RoomView({ roomId, me, socket, notify, onLaunchGame }) {
                 {voiceRoster.map(u => {
                   const hasMedia = Boolean(meshRef.current?.streamFor(u.socketId));
                   const peerCamOn = u.camera !== false;
-                  const isMyOtherDevice = u.userId === me?.id;
-                  const peerName = (u.nickname || u.username || 'Unknown') + (isMyOtherDevice ? ' (you — other device)' : '');
+                  const peerName = u.nickname || u.username || 'Unknown';
                   return room.type==='video' ? (
                     <div key={u.socketId} className={`room-peer-tile${hasMedia?' live':' connecting'}${peerCamOn?'':' cam-off'}`}>
                       {/* The video element stays mounted even when the peer's camera
