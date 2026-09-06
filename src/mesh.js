@@ -217,12 +217,13 @@ export function createVoiceMesh({ socket, channelId, me, onRoster, onRemoteStrea
     if (!isOurs(d)) return;
     roster = (d.users || [])
       .filter(u => u.userId && u.socketId && !isSelf(u.socketId))
+      .filter(u => u.userId !== me?.id) // never a participant on our own account
       .map(u => ({ ...u, camera: u.camera !== false }));
     publish();
     roster.forEach(u => ensurePeer(u));
   };
   const onJoined = d => {
-    if (!isOurs(d) || isSelf(d.socketId)) return;
+    if (!isOurs(d) || isSelf(d.socketId) || d.userId === me?.id) return;
     const u = {
       userId: d.userId, socketId: d.socketId,
       username: d.username || '', nickname: d.nickname || '', avatar: d.avatar || '', badge: d.badge || '',

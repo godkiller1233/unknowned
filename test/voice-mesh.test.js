@@ -216,7 +216,7 @@ test('voice mesh: abrupt disconnect drops the peer (disconnecting broadcast)', {
 });
 
 
-test('voice mesh: same account on two devices appears as two participants', { timeout: 120000 }, async t => {
+test('voice mesh: one call per account — second device refused, never paired', { timeout: 120000 }, async t => {
   if (!(await isPgReachable())) {
     t.skip('PostgreSQL not reachable — set TEST_PG_ADMIN_URL (e.g. a CI postgres service container) to run integration tests');
     return;
@@ -231,7 +231,7 @@ test('voice mesh: same account on two devices appears as two participants', { ti
     const stamp = Date.now().toString(36).slice(-6);
 
     // ONE account, TWO devices (two independent sockets, same user token).
-    const u = await api('/api/register', null, { method: 'POST', body: { username: `vm2_${stamp}`, password: 'mesh-pass-1' } });
+    const u = await api('/api/register', null, { method: 'POST', body: { username: `vm3_${stamp}`, password: 'mesh-pass-1' } });
     assert.equal(u.status, 200, 'register: ' + JSON.stringify(u));
     const boot = await api('/api/bootstrap', u.token);
     const voiceCh = boot.channels.find(ch => ch.type === 'voice');
@@ -241,11 +241,10 @@ test('voice mesh: same account on two devices appears as two participants', { ti
     const sockDesktop = createSocket(base, { auth: { token: u.token }, transports: ['websocket'], reconnection: false });
     sockets.push(sockPhone, sockDesktop);
     await Promise.all([sockPhone, sockDesktop].map(s => new Promise((res, rej) => { s.once('connect', res); s.once('connect_error', rej); })));
-    assert.notEqual(sockPhone.id, sockDesktop.id, 'two devices must have distinct socket ids');
 
-    const state = { phoneRoster: [], desktopRoster: [] };
-    // fakePCs is file-global and earlier tests already created PCs — only PCs
-    // created from here on belong to this self-pair.
+    const state = { phoneRoster: [], desktopRoster: [], phoneRejected: null, desktopRejected: null };
+    sockPhone.on('voice_join_rejected', d => { state.phoneRejected = d; });
+    sockDesktop.on('voice_join_rejected', d => { state.desktopRejected = d; });
     const pcStart = fakePCs.length;
     const meshPhone = createVoiceMesh({
       socket: sockPhone, channelId: voiceCh.id, me: { id: u.user.id },
@@ -256,37 +255,37 @@ test('voice mesh: same account on two devices appears as two participants', { ti
       onRoster: r => { state.desktopRoster = r; }, onRemoteStream: () => {}, onRemoteEnd: () => {},
     });
 
-    // Phone joins first (empty roster), then desktop joins. The desktop is the
-    // SAME user — with session-keyed peers it must still appear as a peer.
+    // 1. Phone joins first — succeeds, alone.
     meshPhone.join(fakeStream());
-    await sleep(300);
+    await sleep(600);
+    assert.equal(state.phoneRejected, null, 'first device must not be rejected');
+    assert.equal(state.phoneRoster.length, 0, 'phone is alone — empty roster');
+
+    // 2. Desktop (same account) tries to join — server refuses it and the phone
+    //    never learns about the second device. No self-pair, no signaling.
     meshDesktop.join(fakeStream());
+    await waitFor(() => state.desktopRejected, 8000);
+    assert.equal(state.desktopRejected.reason, 'already-in-call');
+    assert.equal(state.desktopRejected.channelId, voiceCh.id);
+    await sleep(500);
+    assert.equal(state.desktopRoster.length, 0, 'refused device has no roster');
+    assert.equal(state.phoneRoster.length, 0, 'in-call device never sees its own account');
+    assert.equal(fakePCs.slice(pcStart).length, 0, 'no peer connection may exist for a self-pair');
 
-    await waitFor(() => state.phoneRoster.length === 1, 8000);
-    assert.equal(state.phoneRoster.length, 1, 'phone must see exactly one other participant');
-    assert.equal(state.phoneRoster[0].userId, u.user.id, 'that participant is the same account...');
-    assert.equal(state.phoneRoster[0].socketId, sockDesktop.id, '...on the second device (distinct socket session)');
-    assert.equal(state.desktopRoster.length, 1, 'desktop must see the phone as a participant');
-    assert.equal(state.desktopRoster[0].socketId, sockPhone.id);
+    // 3. Phone leaves — the busy flag clears with its live socket state.
+    meshPhone.leave();
+    await sleep(400);
 
-    // The smaller SOCKET id offered; exactly one offer for the self-pair and it
-    // was answered — the old userId-keyed engine deadlocked here (no offer).
-    const newPCs = fakePCs.slice(pcStart);
-    await waitFor(() => newPCs.reduce((n, p) => n + p.offerCount, 0) === 1, 8000);
-    const live = newPCs.filter(p => !p.closed);
-    assert.equal(live.length, 2, 'one peer connection per device');
-    await waitFor(() => live.every(p => p.remoteDescription), 8000);
-    assert.ok(live.every(p => p.remoteDescription), 'self-pair must fully negotiate (offer + answer)');
+    // 4. Desktop can now join (no rejection).
+    state.desktopRejected = null;
+    meshDesktop.join(fakeStream());
+    await sleep(700);
+    assert.equal(state.desktopRejected, null, 'join succeeds once the other device left');
 
-    // Camera off on the phone → the desktop row for that session flips too.
-    meshPhone.setCamera(false);
-    await waitFor(() => state.desktopRoster.find(x => x.socketId === sockPhone.id)?.camera === false, 5000);
-    assert.equal(state.desktopRoster.find(x => x.socketId === sockPhone.id)?.camera, false, 'camera state reaches the other device');
-
-    // Desktop leaves → the phone roster empties (that session is gone).
-    meshDesktop.leave();
-    await waitFor(() => state.phoneRoster.length === 0, 8000);
-    assert.equal(state.phoneRoster.length, 0, 'phone must drop the desktop session after it leaves');
+    // 5. …and now the PHONE is the refused one.
+    meshPhone.join(fakeStream());
+    await waitFor(() => state.phoneRejected, 8000);
+    assert.equal(state.phoneRejected.reason, 'already-in-call');
 
     meshPhone.destroy();
     meshDesktop.destroy();

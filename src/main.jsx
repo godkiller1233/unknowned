@@ -3784,7 +3784,7 @@ function DmChat({ me, dm, socket, notify, onViewProfile, onCall, jumpToMessageId
           <h2>{other.name}</h2>
         </div>
         <div style={{display:'flex',gap:4}}>
-          <button className="icon-btn" title="Call" onClick={()=>onCall(other)}>📞</button>
+          {other.id !== me?.id && <button className="icon-btn" title="Call" onClick={()=>onCall(other)}>📞</button>}
           <button className="icon-btn" title="Nickname" onClick={()=>setShowNick(v=>!v)}>✏️</button>
           <button className="icon-btn" title="Report" onClick={()=>api('/api/reports',{method:'POST',body:JSON.stringify({targetType:'dm',targetId:dm.id,reason:'DM report',category:'other'})}).then(()=>notify('Report submitted.'))}>🚩</button>
           <button className="icon-btn" title="Block user" onClick={async()=>{ if(!confirm(`Block ${other.name}? You won't see their messages.`)) return; await api('/api/blocks',{method:'POST',body:JSON.stringify({userId:other.id})}); notify(`${other.name} blocked`,'ok'); }}>🚫</button>
@@ -4063,10 +4063,13 @@ function GroupChat({ me, group, socket, notify, onViewProfile, jumpToMessageId, 
 }
 
 // ── Voice Channel ─────────────────────────────────────────────────────────────
-function VoiceChannel({ channel, me, socket }) {
+function VoiceChannel({ channel, me, socket, notify }) {
   const [inCall, setInCall] = useState(false);
   const [muted, setMuted]   = useState(false);
   const [sharing, setSharing] = useState(false);
+  // Server refused the voice_join (this account is already in a call on another
+  // device or instance). Blocks re-joining until the other device hangs up.
+  const [joinBlocked, setJoinBlocked] = useState(false);
   // Roster rows carry profile + a `live` flag (real audio flowing) per peer.
   const [roster, setRoster] = useState([]);
   const [streamTick, setStreamTick] = useState(0);
@@ -4084,7 +4087,14 @@ function VoiceChannel({ channel, me, socket }) {
       onRemoteEnd: () => setStreamTick(t => t + 1),
     });
     meshRef.current = mesh;
-    return () => { mesh.destroy(); meshRef.current = null; };
+    const onRejected = d => {
+      if (d?.channelId !== channel.id) return;
+      setInCall(false);
+      setJoinBlocked(true);
+      notify?.('This account is already in a call on another device. Leave that call to join here.', 'err');
+    };
+    socket.on('voice_join_rejected', onRejected);
+    return () => { socket.off('voice_join_rejected', onRejected); mesh.destroy(); meshRef.current = null; };
   }, [socket, channel.id, me?.id]);
 
   // Attach remote audio when a stream arrives and route it to the chosen
@@ -4104,6 +4114,7 @@ function VoiceChannel({ channel, me, socket }) {
   }, [roster, streamTick, inCall]);
 
   async function joinCall() {
+    if (joinBlocked) { notify?.('This account is already in a call on another device. Leave it there first.', 'err'); return; }
     try {
       const stream = await navigator.mediaDevices.getUserMedia(mediaConstraints('mic'));
       streamRef.current = stream;
@@ -4273,6 +4284,8 @@ function RoomView({ roomId, me, socket, notify, onLaunchGame }) {
   const videoRef = useRef(null);
   const [raises, setRaises] = useState([]);
   const [voiceRoster, setVoiceRoster] = useState([]);   // peers actually live in voice (mesh)
+  // Server refused the voice_join (this account is already in a call elsewhere).
+  const [voiceBlocked, setVoiceBlocked] = useState(false);
   const [streamTick, setStreamTick] = useState(0);
   const [cameraOn, setCameraOn] = useState(true);       // local camera state (video rooms)
   const meshRef = useRef(null);
@@ -4347,7 +4360,14 @@ function RoomView({ roomId, me, socket, notify, onLaunchGame }) {
       onRemoteEnd: () => setStreamTick(t => t + 1),
     });
     meshRef.current = mesh;
-    return () => { mesh.destroy(); meshRef.current = null; };
+    const onRejected = d => {
+      if (d?.channelId !== roomId) return;
+      leaveVoice();
+      setVoiceBlocked(true);
+      notify('This account is already in a call on another device. Leave that call to join here.', 'err');
+    };
+    socket.on('voice_join_rejected', onRejected);
+    return () => { socket.off('voice_join_rejected', onRejected); mesh.destroy(); meshRef.current = null; };
   }, [roomId, room?.type, me?.id]);
 
   // Attach remote audio/video as streams arrive; honor the saved speaker.
@@ -4408,6 +4428,7 @@ function RoomView({ roomId, me, socket, notify, onLaunchGame }) {
 
   // ── Voice/video: real peer media via the mesh ──
   async function joinVoice() {
+    if (voiceBlocked) { notify('This account is already in a call on another device. Leave it there first.', 'err'); return; }
     try {
       const wantsVideo = room?.type==='video';
       const cfg = loadAvatarConfig();
@@ -6675,7 +6696,7 @@ function App() {
             onLaunchGame={g=>{ setGamePick(g); setShowGame(true); }} />
         ) : view==='server' && activeCh ? (
           activeCh.type==='voice'
-            ? <VoiceChannel key={channelId} channel={activeCh} me={me} socket={socket} boot={boot} />
+            ? <VoiceChannel key={channelId} channel={activeCh} me={me} socket={socket} boot={boot} notify={notify} />
             : <ChannelChat key={channelId} me={me} channel={activeCh} comm={comm} socket={socket} notify={notify} onViewProfile={setViewingProfile} boot={boot} jumpToMessageId={jumpToMessageId} onJumpDone={() => setJumpToMessageId(null)} />
         ) : (
           <div className="empty-state">

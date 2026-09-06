@@ -95,11 +95,28 @@ async function rtcIceServers() {
     .split(',')
     .map(s => s.trim())
     .filter(s => /^turns?:(?:\/\/)?/i.test(s));
-  const servers = [{ urls: ['stun:stun.l.google.com:19302'] }];
+  const servers = [
+    { urls: ['stun:stun.l.google.com:19302'] },
+    { urls: ['stun:global.stun.twilio.com:3478'] },
+  ];
   if (turnUrls.length) {
     servers.push(username && credential
       ? { urls: turnUrls, username, credential }
       : { urls: turnUrls });
+  } else {
+    // No operator relay configured: fall back to free public TURN relays so
+    // calls still connect across restrictive networks (cellular carriers run
+    // CGNAT; home routers are often symmetric). Operators can override these
+    // by setting their own TURN in Admin → Settings.
+    servers.push({
+      urls: [
+        'turn:openrelay.metered.ca:80',
+        'turn:openrelay.metered.ca:443',
+        'turn:openrelay.metered.ca:443?transport=tcp',
+      ],
+      username: 'openrelayproject',
+      credential: 'openrelayproject',
+    });
   }
   return servers;
 }
@@ -184,15 +201,20 @@ async function probeTurnUrl(url) {
 }
 
 async function rtcHealthReport() {
-  const servers = await rtcIceServers();
-  const turnUrls = [];
-  for (const s of servers) for (const u of s.urls || []) if (/^turns?:/i.test(String(u))) turnUrls.push(String(u));
+  // Report the OPERATOR's relay config (env/db), not the built-in public
+  // fallback that bootstrap hands clients when no operator relay exists.
+  const { turnUrls: raw } = await effectiveRtcValues();
+  const turnUrls = String(raw || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(s => /^turns?:(?:\/\/)?/i.test(s));
   const urls = await Promise.all(turnUrls.map(probeTurnUrl));
   const configured = turnUrls.length > 0;
   const reachable = configured ? urls.every(u => u.reachable === true) : null;
   return {
     ok: configured && reachable,   // fully healthy only with an answering relay
-    degraded: !configured,         // STUN-only: works for most, fails behind symmetric NAT
+    degraded: !configured,         // no operator relay: clients use the public fallback
+    fallbackRelay: !configured,    // built-in public relay is being served to clients
     stun: { configured: true },
     turn: { configured, reachable, urls },
   };
@@ -5534,11 +5556,12 @@ io.on('connection', socket => {
 
   // Live roster for a voice room: every connected socket (any instance) with the
   // profile + socket id a new joiner needs to start the peer connections.
-  async function voiceRoomUsers(roomName, exceptSocketId) {
+  async function voiceRoomUsers(roomName, exceptSocketId, exceptUserId) {
     try {
       const socks = await io.in(roomName).fetchSockets();
       return socks
         .filter(s => s.id !== exceptSocketId && s.data?.user)
+        .filter(s => !exceptUserId || s.data.user.id !== exceptUserId)
         .map(s => ({ ...voicePeerPayload(s.data.user), socketId: s.id }))
         .filter(u => u.userId);
     } catch { return []; }
@@ -5552,6 +5575,19 @@ io.on('connection', socket => {
       member = await store.get('SELECT 1 FROM room_members WHERE room_id=$1 AND user_id=$2 AND waiting=0', channelId, userId).catch(() => null);
     }
     if (!member && !socket.data.user.is_admin) return;
+    // One call per account: if another live socket of this user (any device,
+    // any instance) is already in a voice room, refuse the join instead of
+    // letting a user call themselves across their own devices.
+    try {
+      const all = await io.fetchSockets();
+      const busy = all.some(s => s.id !== socket.id
+        && s.data?.user?.id === userId
+        && [...s.rooms].some(r => r.startsWith('voice:')));
+      if (busy) {
+        socket.emit('voice_join_rejected', { channelId, reason: 'already-in-call' });
+        return;
+      }
+    } catch {}
     const roomName = `voice:${channelId}`;
     socket.join(roomName);
     try {
@@ -5561,8 +5597,9 @@ io.on('connection', socket => {
     const profile = voicePeerPayload(socket.data.user) || { userId };
     // Existing members: a new socket joined (id + profile) so they can connect to it.
     socket.to(roomName).emit('voice_user_joined', { channelId, ...profile, socketId: socket.id });
-    // The joiner: the full current roster (cross-instance via the shared adapter).
-    const users = await voiceRoomUsers(roomName, socket.id);
+    // The joiner: the full current roster (cross-instance via the shared adapter),
+    // minus any session of their own account.
+    const users = await voiceRoomUsers(roomName, socket.id, userId);
     socket.emit('voice_roster', { channelId, users });
     io.to(roomName).emit('voice_state', { channelId, userId, joined: true });
   });
@@ -5593,6 +5630,7 @@ io.on('connection', socket => {
     const toSocketId = data?.toSocketId;
     if (typeof channelId !== 'string' || channelId.length > 128 || !socket.rooms.has(`voice:${channelId}`)) return;
     if (typeof toSocketId !== 'string' || toSocketId.length > 64) return;
+    if (toSocketId === socket.id) return; // never relay a session to itself
     const payload = { channelId, fromUserId: userId, fromSocketId: socket.id };
     if (event === 'voice_rtc_ice') {
       if (!data.candidate || typeof data.candidate !== 'object') return;

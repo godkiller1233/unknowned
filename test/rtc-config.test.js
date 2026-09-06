@@ -66,11 +66,12 @@ test('bootstrap publishes the operator TURN config to authenticated clients', { 
   assert.ok(boot.rtc, 'bootstrap must carry an rtc block');
   assert.deepEqual(boot.rtc.iceServers, [
     { urls: ['stun:stun.l.google.com:19302'] },
+    { urls: ['stun:global.stun.twilio.com:3478'] },
     { urls: TURN_ENV.TURN_URLS.split(','), username: TURN_ENV.TURN_USERNAME, credential: TURN_ENV.TURN_CREDENTIAL },
   ]);
 });
 
-test('bootstrap falls back to public STUN when no TURN is configured', { timeout: 90000 }, async t => {
+test('bootstrap falls back to STUN + public TURN relay when no TURN is configured', { timeout: 90000 }, async t => {
   if (!(await isPgReachable())) {
     t.skip('PostgreSQL not reachable — set TEST_PG_ADMIN_URL to run integration tests');
     return;
@@ -84,7 +85,11 @@ test('bootstrap falls back to public STUN when no TURN is configured', { timeout
   assert.equal(u.status, 200, JSON.stringify(u));
 
   const boot = await api('/api/bootstrap', u.token);
-  assert.deepEqual(boot.rtc.iceServers, [{ urls: ['stun:stun.l.google.com:19302'] }]);
+  const ice = boot.rtc.iceServers;
+  assert.ok(ice.some(s => s.urls.includes('stun:stun.l.google.com:19302')), 'STUN default still present');
+  const relay = ice.find(s => (s.urls || []).some(u => /^turns?:/i.test(u)));
+  assert.ok(relay, 'public TURN fallback must be present when no operator relay is configured');
+  assert.ok(relay.username && relay.credential, 'fallback relay needs credentials');
 });
 
 test('voice mesh builds peer connections with the configured ICE servers', { timeout: 30000 }, async () => {

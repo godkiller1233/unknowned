@@ -62,9 +62,9 @@ test('rtc admin: save applies immediately — bootstrap carries relay + credenti
   const token = await login(srv);
   const urls = `turn:127.0.0.1:${echo.port}?transport=udp`;
 
-  // Fresh DB, no env → STUN-only
+  // Fresh DB, no env → no operator relay (clients get the public fallback).
   const before = await srv.api('/api/health/rtc');
-  assert.equal(before.degraded, true);
+  assert.equal(before.turn.configured, false);
 
   const put = await srv.api('/api/admin/rtc', token, { method: 'PUT', body: { turnUrls: urls, username: 'relay-user', credential: 'super-secret-pass' } });
   assert.equal(put.status, 200, JSON.stringify(put));
@@ -113,9 +113,12 @@ test('rtc admin: cross-instance sync — save on instance A is served by instanc
   const srvB = await startDisposableServer({ reuse: { dbName: srvA.dbName, dbUrl: srvA.dbUrl }, env: { TURN_URLS: '' } });
   t.after(async () => { await srvB.stop(); await srvA.stop(); await echo.close(); });
 
-  // Instance B starts STUN-only even though it shares A's DB.
+  // Instance B starts with no operator relay even though it shares A's DB
+  // (bootstrap carries the STUN pair + the public fallback relay entry).
   const bootB0 = await srvB.api('/api/bootstrap', await login(srvB));
-  assert.equal((bootB0.rtc?.iceServers || []).length, 1, 'instance B starts with STUN only');
+  const iceB0 = bootB0.rtc?.iceServers || [];
+  assert.ok(!iceB0.some(s => (s.urls || []).some(u => /127\.0\.0\.1/.test(u))), 'no operator relay before the save');
+  assert.ok(iceB0.some(s => (s.urls || []).some(u => /^turns?:/i.test(u))), 'public fallback relay present');
 
   // Admin on instance A saves the relay.
   const tokenA = await login(srvA);
