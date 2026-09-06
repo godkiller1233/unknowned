@@ -10,6 +10,7 @@ import { loadAvatarConfig, getAvatarFile, loadCalibration, onCalibrationChanged,
 import { createAvatarEngine } from './avatar-engine.js';
 import { createVoiceMesh } from './mesh.js';
 import { createCallNegotiator } from './call-negotiation.js';
+import { createAudioRelaySender, createAudioRelayReceiver } from './audio-relay.js';
 
 // ── Avatar virtual camera (one live session at a time) ───────────────────────
 // When avatar mode is on, video surfaces send this engine's canvas stream — a
@@ -529,6 +530,12 @@ function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClo
   const [camWarn, setCamWarn] = useState('');
   // null (never told) | true | false — peer's signaled camera state (call_camera).
   const [remoteCam, setRemoteCam] = useState(null);
+  // Phone-call fallback: when the direct WebRTC link fails (strict NAT), audio
+  // rides the socket connection through the server instead. Video stays P2P-only.
+  const [audioRelay, setAudioRelay] = useState(false);
+  const relaySenderRef = useRef(null);
+  const relayReceiverRef = useRef(null);
+  const relaySeqRef = useRef(0);
   const [remoteVid, setRemoteVid] = useState(false);
   // True when the avatar canvas (not the real camera) is what we send.
   const [avatarLive, setAvatarLive] = useState(false);
@@ -545,6 +552,32 @@ function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClo
   const peerCtx = useRef(null);
   const peerAnalyser = useRef(null);
   const peerStream = useRef(null);
+
+  // Start/stop the socket-relayed audio path. Idempotent; safe to call twice.
+  function startAudioRelay() {
+    if (relaySenderRef.current) return;
+    const local = streamRef.current;
+    if (!local) return;
+    const seq = () => ++relaySeqRef.current;
+    relaySenderRef.current = createAudioRelaySender({
+      stream: local,
+      emit: data => {
+        if (!socket.connected) return;
+        socket.emit('audio_chunk', { toUserId: targetUser?.id, dmId, seq: seq(), first: relaySeqRef.current === 1, data });
+      },
+    });
+    relayReceiverRef.current = createAudioRelayReceiver();
+    if (relayReceiverRef.current.stream && remoteRef.current && !remoteRef.current.srcObject) {
+      remoteRef.current.srcObject = relayReceiverRef.current.stream;
+      startPeerMonitor(relayReceiverRef.current.stream);
+    }
+    setAudioRelay(true);
+  }
+  function stopAudioRelay() {
+    relaySenderRef.current?.stop(); relaySenderRef.current = null;
+    relayReceiverRef.current?.stop(); relayReceiverRef.current = null;
+    setAudioRelay(false);
+  }
 
   useEffect(() => {
     const isThisCall = d => !d?.dmId || d.dmId === dmId;
@@ -577,6 +610,11 @@ function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClo
       if (ng) ng.handleRemoteCandidate(d.candidate).catch(()=>{});
       else if (pcRef.current) pcRef.current.addIceCandidate(new RTCIceCandidate(d.candidate)).catch(()=>{});
     };
+    const onChunk = d => {
+      if (!isThisCall(d)) return;
+      const rx = relayReceiverRef.current;
+      if (rx && d?.data) rx.absorb(d.data).catch(() => {});
+    };
     const onMute    = d => { if (!isThisCall(d) || (d.from && d.from !== targetUser?.id)) return; setRemoteMuted(d.muted === true); };
     const onCam     = d => {
       if (!isThisCall(d) || (d.from && d.from !== targetUser?.id)) return;
@@ -592,6 +630,7 @@ function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClo
     socket.on('rtc_ice',      onIce);
     socket.on('call_mute',    onMute);
     socket.on('call_camera',  onCam);
+    socket.on('audio_chunk',  onChunk);
 
     if (!incoming) startCall(true);
 
@@ -604,6 +643,8 @@ function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClo
       socket.off('rtc_ice', onIce);
       socket.off('call_mute', onMute);
       socket.off('call_camera', onCam);
+      socket.off('audio_chunk', onChunk);
+      stopAudioRelay();
       cleanup();
     };
   }, []);
@@ -634,6 +675,20 @@ function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClo
       const pc = new RTCPeerConnection({ iceServers: rtcIceServers() });
       pcRef.current = pc;
       stream.getTracks().forEach(t => pc.addTrack(t, stream));
+
+      // If the direct link is not connectable, degrade to the phone-call path
+      // instead of leaving both sides staring at "connecting…" forever.
+      const relayTimer = setTimeout(() => {
+        if (pcRef.current === pc && pc.connectionState !== 'connected' && !audioRelay) startAudioRelay();
+      }, 12000);
+      pc.addEventListener('connectionstatechange', () => {
+        clearTimeout(relayTimer);
+        if (pc.connectionState === 'connected') {
+          stopAudioRelay(); // real link came up (or recovered) — P2P wins
+        } else if (pc.connectionState === 'failed') {
+          startAudioRelay();
+        }
+      });
 
       pc.ontrack = e => {
         if (remoteRef.current) remoteRef.current.srcObject = e.streams[0];
@@ -675,7 +730,7 @@ function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClo
   // Route the caller's audio to the speaker the user picked in Settings, and
   // start watching their mic if a stream is already attached when we connect.
   useEffect(() => {
-    if (status === 'connected') {
+    if (status === 'connected' || audioRelay) {
       const s = remoteRef.current?.srcObject;
       if (s) startPeerMonitor(s);
     } else if (status === 'micblocked') {
@@ -683,7 +738,7 @@ function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClo
     }
     if (remoteRef.current) applySpeakerSink(remoteRef.current, loadMediaPrefs().speaker);
     if (remoteVidRef.current) applySpeakerSink(remoteVidRef.current, loadMediaPrefs().speaker);
-  }, [status]);
+  }, [status, audioRelay]);
 
   // Watch the remote audio track and flip the indicator when they actually speak.
   function startPeerMonitor(stream) {
@@ -941,7 +996,8 @@ function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClo
         </div>
         <h3>{targetUser?.nickname || targetUser?.username}</h3>
         <p className="call-status">
-          {status === 'calling'    ? '📞 Calling…'
+          {audioRelay             ? '📞 Connected via server (phone-call mode — direct link blocked)'
+          : status === 'calling'    ? '📞 Calling…'
           : status === 'micblocked' ? '🎙️ Microphone needed'
           : status === 'incoming'  ? '📲 Incoming call…'
           : status === 'connected' ? '🟢 Connected'

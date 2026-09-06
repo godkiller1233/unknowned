@@ -294,3 +294,66 @@ test('voice mesh: one call per account — second device refused, never paired',
     sockets.forEach(s => { try { s.close?.(); s.destroy?.(); } catch {} });
   }
 });
+
+
+test('voice mesh: relay fallback delivers chunks peer-to-peer through the server', { timeout: 120000 }, async t => {
+  if (!(await isPgReachable())) {
+    t.skip('PostgreSQL not reachable — set TEST_PG_ADMIN_URL (e.g. a CI postgres service container) to run integration tests');
+    return;
+  }
+
+  const srv = await startDisposableServer();
+  t.after(() => srv.stop());
+  const sockets = [];
+
+  try {
+    const { base, api } = srv;
+    const stamp = Date.now().toString(36).slice(-6);
+    const a = await api('/api/register', null, { method: 'POST', body: { username: `vma_${stamp}`, password: 'mesh-pass-1' } });
+    const b = await api('/api/register', null, { method: 'POST', body: { username: `vmb_${stamp}`, password: 'mesh-pass-1' } });
+    assert.equal(a.status, 200) ; assert.equal(b.status, 200);
+    const boot = await api('/api/bootstrap', a.token);
+    const voiceCh = boot.channels.find(ch => ch.type === 'voice');
+    assert.ok(voiceCh, 'seeded voice channel must exist');
+
+    const sockA = createSocket(base, { auth: { token: a.token }, transports: ['websocket'], reconnection: false });
+    const sockB = createSocket(base, { auth: { token: b.token }, transports: ['websocket'], reconnection: false });
+    sockets.push(sockA, sockB);
+    await Promise.all([sockA, sockB].map(s => new Promise((res, rej) => { s.once('connect', res); s.once('connect_error', rej); })));
+
+    const chunksAtB = [];
+    sockB.on('audio_chunk', d => { if (d?.channelId === voiceCh.id) chunksAtB.push(d); });
+
+    // Both meshes join for real (the server relays only to sockets inside
+    // the voice room, so the receiver must actually be a member).
+    const meshA = createVoiceMesh({
+      socket: sockA, channelId: voiceCh.id, me: { id: a.user.id },
+      onRoster: () => {}, onRemoteStream: () => {}, onRemoteEnd: () => {},
+    });
+    const meshB = createVoiceMesh({
+      socket: sockB, channelId: voiceCh.id, me: { id: b.user.id },
+      onRoster: () => {}, onRemoteStream: () => {}, onRemoteEnd: () => {},
+    });
+    meshA.join(fakeStream());
+    meshB.join(fakeStream());
+    await sleep(700);
+    // Simulate the sender's emit path exactly as audio-relay.js would
+    // (base64 chunks inside the server's size cap; oversized must be dropped).
+    sockA.emit('audio_chunk', { channelId: voiceCh.id, seq: 1, first: true, data: Buffer.from('fake-header-bytes').toString('base64') });
+    sockA.emit('audio_chunk', { channelId: voiceCh.id, seq: 2, first: false, data: Buffer.from('fake-opus-cluster').toString('base64') });
+    sockA.emit('audio_chunk', { channelId: voiceCh.id, seq: 3, first: false, data: 'x'.repeat(20000) });
+    await sleep(800);
+
+    assert.equal(chunksAtB.length, 2, 'both valid chunks must reach the other member through the server');
+    assert.equal(chunksAtB[0].first, true);
+    assert.equal(Buffer.from(chunksAtB[0].data, 'base64').toString(), 'fake-header-bytes');
+    assert.equal(chunksAtB[1].first, false);
+    assert.ok(chunksAtB.every(c => c.fromUserId === a.user.id && c.fromSocketId === sockA.id), 'chunks carry sender identity');
+
+    meshA.destroy();
+    meshB.destroy();
+    await sleep(200);
+  } finally {
+    sockets.forEach(s => { try { s.close?.(); s.destroy?.(); } catch {} });
+  }
+});

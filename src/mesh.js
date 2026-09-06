@@ -22,6 +22,7 @@
 // adapter and socket ids are unique cluster-wide).
 
 import { getIceServers } from './rtc.js';
+import { createAudioRelaySender, createAudioRelayReceiver } from './audio-relay.js';
 
 const MAX_OFFER_RETRIES = 2;
 
@@ -33,6 +34,40 @@ export function createVoiceMesh({ socket, channelId, me, onRoster, onRemoteStrea
   let roster = [];                    // [{ userId, socketId, username, nickname, avatar, badge, camera }]
   let destroyed = false;
   let myCameraOn = true;
+  // Phone-call fallback: when a direct link to a peer can't connect, audio
+  // flows through the server instead. One sender (our mic → everyone) and one
+  // receiver per peer session.
+  let relaySender = null;
+  const relayReceivers = new Map();  // socketId -> receiver
+  let relaySeq = 0;
+
+  function startRelay() {
+    if (relaySender || !localStream) return;
+    relaySender = createAudioRelaySender({
+      stream: localStream,
+      emit: data => {
+        if (!socket.connected) return;
+        socket.emit('audio_chunk', { channelId, seq: ++relaySeq, first: relaySeq === 1, data });
+      },
+    });
+    // Every currently-known peer session gets a relay receiver immediately.
+    roster.forEach(u => peerRelayReceiver(u.socketId));
+    publish();
+  }
+  function stopRelay() {
+    relaySender?.stop(); relaySender = null;
+    for (const rx of relayReceivers.values()) rx.stop();
+    relayReceivers.clear();
+  }
+  function peerRelayReceiver(socketId) {
+    let rx = relayReceivers.get(socketId);
+    if (!rx) {
+      rx = createAudioRelayReceiver();
+      if (rx.stream) onRemoteStream?.(socketId); // tile can go live
+      relayReceivers.set(socketId, rx);
+    }
+    return rx;
+  }
 
   // Identity of THIS session, read live: after a reconnect the socket id
   // changes and every self-comparison must use the current one.
@@ -63,6 +98,9 @@ export function createVoiceMesh({ socket, channelId, me, onRoster, onRemoteStrea
     if (!entry) return;
     peers.delete(peerId);
     pendingIce.delete(peerId);
+    clearTimeout(entry.relayTimer);
+    const rx = relayReceivers.get(peerId);
+    if (rx) { rx.stop(); relayReceivers.delete(peerId); }
     try { entry.pc.close(); } catch {}
     if (entry.live || entry.remoteStream) onRemoteEnd?.(peerId);
     publish();
@@ -93,6 +131,14 @@ export function createVoiceMesh({ socket, channelId, me, onRoster, onRemoteStrea
     };
     peers.set(user.socketId, entry);
     addLocalTracks(pc);
+    // Phone-call fallback watchdog: if this pair is not connected after 12s
+    // (and never connects), start relaying audio through the server for it.
+    entry.relayTimer = setTimeout(() => {
+      if (peers.get(user.socketId) === entry && !entry.live && !destroyed && joined) {
+        startRelay();
+        peerRelayReceiver(user.socketId);
+      }
+    }, 12000);
     pc.ontrack = e => {
       entry.remoteStream = (e.streams && e.streams[0]) || entry.remoteStream;
       if (!entry.live) { entry.live = true; onRemoteStream?.(entry.socketId); publish(); }
@@ -106,6 +152,11 @@ export function createVoiceMesh({ socket, channelId, me, onRoster, onRemoteStrea
     pc.onconnectionstatechange = () => {
       const state = pc.connectionState;
       if (state === 'connected') {
+        clearTimeout(entry.relayTimer);
+        // Direct link works — the server-relayed audio for this session is no
+        // longer needed (P2P wins; streamFor prefers the live stream anyway).
+        const rx = relayReceivers.get(entry.socketId);
+        if (rx) { rx.stop(); relayReceivers.delete(entry.socketId); }
         if (!entry.live) { entry.live = true; onRemoteStream?.(entry.socketId); }
         publish();
       } else if ((state === 'failed' || state === 'closed') && !entry.live) {
@@ -233,6 +284,8 @@ export function createVoiceMesh({ socket, channelId, me, onRoster, onRemoteStrea
     if (i >= 0) roster[i] = u; else roster.push(u);
     publish();
     ensurePeer(u);
+    // If the room already fell back to relay mode, serve the new session too.
+    if (relaySender) peerRelayReceiver(u.socketId);
     // A fresh joiner has no idea our camera is off (the server roster has no
     // per-client state) — tell them right away.
     if (!myCameraOn && socket.connected) socket.emit('voice_camera', { channelId, on: false });
@@ -268,6 +321,11 @@ export function createVoiceMesh({ socket, channelId, me, onRoster, onRemoteStrea
     if (joined && localStream && !destroyed && socket.connected) {
       socket.emit('voice_join', { channelId });
       if (!myCameraOn) socket.emit('voice_camera', { channelId, on: false });
+      if (relaySender) {
+        // The socket id changed and receivers re-anchor on a fresh header.
+        stopRelay();
+        startRelay();
+      }
     }
   };
 
@@ -275,9 +333,14 @@ export function createVoiceMesh({ socket, channelId, me, onRoster, onRemoteStrea
   socket.on('voice_user_joined', onJoined);
   socket.on('voice_user_left', onLeft);
   socket.on('voice_camera', onCameraEv);
+  const onChunk = d => {
+    if (!isOurs(d) || isSelf(d.fromSocketId) || !d?.data) return;
+    peerRelayReceiver(d.fromSocketId).absorb(d.data).catch(() => {});
+  };
   socket.on('voice_rtc_offer', onOfferEv);
   socket.on('voice_rtc_answer', onAnswerEv);
   socket.on('voice_rtc_ice', onIceEv);
+  socket.on('audio_chunk', onChunk);
   socket.on('connect', onReconnect);
 
   return {
@@ -293,15 +356,23 @@ export function createVoiceMesh({ socket, channelId, me, onRoster, onRemoteStrea
     leave() {
       joined = false;
       for (const sid of [...peers.keys()]) closePeer(sid);
+      stopRelay();
       roster = [];
       pendingIce.clear();
       if (socket.connected) socket.emit('voice_leave', { channelId });
       localStream = null;
       publish();
     },
-    /** Media stream received from a peer session, or null while connecting. */
+    /** Media stream for a peer session: live P2P if connected, else the
+     *  server-relayed audio stream, or null while connecting. */
     streamFor(socketId) {
-      return peers.get(socketId)?.remoteStream || null;
+      return peers.get(socketId)?.remoteStream
+        || relayReceivers.get(socketId)?.stream
+        || null;
+    },
+    /** True while at least one peer is served via the phone-call fallback. */
+    relayActive() {
+      return relayReceivers.size > 0;
     },
     /** Turn the local camera on/off: disables the video track (stops sending)
      *  and tells every peer so they swap the frozen video for a placeholder. */
@@ -330,6 +401,7 @@ export function createVoiceMesh({ socket, channelId, me, onRoster, onRemoteStrea
       socket.off('voice_rtc_offer', onOfferEv);
       socket.off('voice_rtc_answer', onAnswerEv);
       socket.off('voice_rtc_ice', onIceEv);
+      socket.off('audio_chunk', onChunk);
       socket.off('connect', onReconnect);
     },
   };

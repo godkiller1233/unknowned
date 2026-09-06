@@ -5641,6 +5641,17 @@ io.on('connection', socket => {
     }
     io.to(toSocketId).emit(event, payload);
   };
+  // Audio relay fallback for voice channels / temp rooms (same "phone call"
+  // mode as DM calls): chunks go to everyone else in the voice room.
+  socket.on('audio_chunk', d => {
+    const channelId = d?.channelId;
+    if (typeof channelId !== 'string' || channelId.length > 128 || !socket.rooms.has(`voice:${channelId}`)) return;
+    if (typeof d.data !== 'string' || d.data.length > 16384) return;
+    socket.to(`voice:${channelId}`).emit('audio_chunk', {
+      channelId, fromUserId: userId, fromSocketId: socket.id,
+      seq: d.seq, first: d.first === true, data: d.data,
+    });
+  });
   socket.on('voice_rtc_offer',  d => relayVoiceSignal('voice_rtc_offer', d));
   socket.on('voice_rtc_answer', d => relayVoiceSignal('voice_rtc_answer', d));
   socket.on('voice_rtc_ice',    d => relayVoiceSignal('voice_rtc_ice', d));
@@ -5705,6 +5716,14 @@ io.on('connection', socket => {
     if (!(await callPeerIsAuthorized(data))) return;
     socket.to(`user:${data.toUserId}`).emit(event, { ...data, from:userId });
   };
+  // Audio relay fallback ("phone call" mode): when the direct WebRTC link
+  // cannot connect (symmetric NAT / CGNAT), mic audio rides the authenticated
+  // socket connection through the server in small opus chunks. Same DM
+  // authorization as every other call signal; chunks are capped in size.
+  socket.on('audio_chunk', d => {
+    if (!d || typeof d.data !== 'string' || d.data.length > 16384) return;
+    relayToUser('audio_chunk', { toUserId: d.toUserId, dmId: d.dmId, seq: d.seq, first: d.first === true, data: d.data });
+  });
   socket.on('rtc_offer',  d => relayToUser('rtc_offer', d));
   socket.on('rtc_answer', d => relayToUser('rtc_answer', d));
   socket.on('rtc_ice',    d => relayToUser('rtc_ice', d));
