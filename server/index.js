@@ -1288,7 +1288,10 @@ async function addCredits(userId, amount) {
 // ── Health ────────────────────────────────────────────────────────────────────
 app.get('/api/health', route(async (_,res) => {
   await store.exec('SELECT 1');
-  res.json({ok:true,database:'postgres',service:'unknown-chat-platform'});
+  // Which commit this running instance was built from. Render injects
+  // RENDER_GIT_COMMIT on every deploy — if this changes after a push, the
+  // deploy actually happened; if it doesn't, auto-deploy is broken.
+  res.json({ok:true,database:'postgres',service:'unknown-chat-platform',commit:process.env.RENDER_GIT_COMMIT||null});
 }));
 
 // Operator-facing WebRTC/TURN diagnostics. Returns 200 even when degraded so
