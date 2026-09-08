@@ -42,6 +42,12 @@ function liveAvatarStream() {
   return liveAvatarEngine ? liveAvatarEngine.stream : null;
 }
 
+// Test/diagnostic seam: lets a live session (or an automated check) inspect the
+// active avatar engine's tracker state without touching module internals.
+if (typeof window !== 'undefined') {
+  window.__avatarEngine = () => liveAvatarEngine;
+}
+
 function closeAvatarTrack() {
   const eng = liveAvatarEngine;
   liveAvatarEngine = null;

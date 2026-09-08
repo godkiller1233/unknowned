@@ -147,6 +147,46 @@ function assess(name, r) {
   add('hand rig meshes built', (rep.handParts | 0) > 0, rep.handParts);
   add('no page errors', (r.pageErrors || []).length === 0, (r.pageErrors || []).join(' | ').slice(0, 200));
 
+  // Arms: the model's OWN arm bones must rotate with tracked body motion —
+  // the snapshot quaternions between the rest (arms down) and spread (T-pose)
+  // phases must differ decisively for every discovered upper-arm bone.
+  const snaps = rep.armSnap || {};
+  const quatAngle = (a, b) => {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== 4 || b.length !== 4) return 0;
+    let dot = 0; for (let i = 0; i < 4; i++) dot += a[i] * b[i];
+    return Math.acos(Math.min(1, Math.abs(dot))) * 2;
+  };
+  const driven = ['L-upper', 'R-upper'].filter(k => Array.isArray(snaps.rest?.[k]) && Array.isArray(snaps.spread?.[k]));
+  const minAng = driven.length ? Math.min(...driven.map(k => quatAngle(snaps.rest[k], snaps.spread[k]))) : 0;
+  add('arm bones discovered', !!(rep.armBones && (rep.armBones.L || rep.armBones.R)),
+    [rep.armBones && rep.armBones.L, rep.armBones && rep.armBones.R].filter(Boolean).join(', ') || '-');
+  add('arm bones rotate with tracked pose', driven.length > 0 && minAng > 0.35,
+    driven.length ? driven.map(k => k + ' ' + minAng.toFixed(2) + 'rad').join(' / ') : 'no phase snapshots');
+  // Outward convention: on a facing model the L-upper bind direction points
+  // +x (canvas-right) and R-upper -x — the hard-coded same-side driver aims
+  // tracked-left toward +x, so a violated sign would cross the arms over the
+  // chest instead of spreading them.
+  const bind = rep.armBind || {};
+  const bindBad = ['L-upper', 'R-upper'].filter(k => bind[k] && Math.abs(bind[k].x) > 0.2 &&
+    (k[0] === 'L' ? bind[k].x < 0 : bind[k].x > 0));
+  add('arm outward convention (L bind +x / R bind -x)', driven.length === 0 || bindBad.length === 0,
+    (Object.entries(bind).map(([k, d]) => `${k}:(${d.x.toFixed(2)},${d.y.toFixed(2)})`).join(' ') || 'no bind data') +
+    ' | facing: ' + JSON.stringify(rep.facing || null));
+
+  // Elbow bend: in the 'bent' phase the tracked-bent side's MODEL elbow must
+  // fold (interior angle well below straight) while the straight side stays
+  // near-straight — per-segment driving proven on the real model, not just in
+  // the math module.
+  const seg = rep.armSeg || {};
+  const straight = v => v == null || v > 2.4;                 // >= ~140 deg
+  const bentSide = seg.bent && seg.bent.L != null && seg.bent.R != null
+    ? (seg.bent.L <= seg.bent.R ? 'L' : 'R') : null;
+  const otherSide = bentSide ? (bentSide === 'L' ? 'R' : 'L') : null;
+  const bentOK = bentSide && seg.bent[bentSide] < 2.2 && straight(seg.bent[otherSide]);
+  add('elbow bend splits the chain (bent phase)', driven.length === 0 || !!bentOK,
+    bentSide ? `L ${seg.bent.L.toFixed(2)}rad R ${seg.bent.R.toFixed(2)}rad (bent=${bentSide})`
+             : 'no per-segment snapshots');
+
   const warns = [];
   if (!(rep.morphs > 0)) warns.push('no morph targets mapped (expressions will not drive this model)');
   if (!(rep.hairChains > 0)) warns.push('no hair/cloth spring chains (no hair-classified bones)');

@@ -511,6 +511,29 @@ async function setup3D(three, GLTFLoader, assetUrl, onStatus) {
     new GLTFLoader().load(assetUrl, resolve, undefined, reject);
   });
   const root = gltf.scene || gltf.scenes[0];
+  // Facing normalization: VRM 0.x-era exports face -Z (their EYE bones sit
+  // BEHIND the head bone in world space) and render back-first in three.js —
+  // every tracked driver then works against a backwards model (arms swing
+  // across the chest, head yaw reads inverted). VRM 1.0 / plain glb face +Z.
+  // Rotate back-facing models 180° BEFORE centering so exactly one bind
+  // convention exists downstream: model faces +Z, its left side at +x.
+  root.updateMatrixWorld(true);
+  {
+    const probeHead = [], probeEyes = [];
+    root.traverse(obj => {
+      if (!obj.isBone) return;
+      const cls = math.classifyRigBone(obj.name || obj.userData?.name || '');
+      if (!cls) return;
+      if (cls.role === 'head' && !probeHead.length) probeHead.push(obj);
+      else if (cls.role === 'eye' && probeEyes.length < 2) probeEyes.push(obj);
+    });
+    if (probeHead.length && probeEyes.length) {
+      const wz = o => { const v = new three.Vector3(); o.getWorldPosition(v); return v.z; };
+      const headZ = wz(probeHead[0]);
+      const eyeZ = probeEyes.reduce((sum, o) => sum + wz(o), 0) / probeEyes.length;
+      if (eyeZ < headZ) root.rotation.y += Math.PI;   // back to the camera -> turn around
+    }
+  }
   const bbox = new three.Box3().setFromObject(root);
   const size = new three.Vector3();
   bbox.getSize(size);
@@ -545,7 +568,7 @@ async function setup3D(three, GLTFLoader, assetUrl, onStatus) {
   // glance, the jaw opens — instead of rotating the whole model like a
   // billboard. Plain .glb characters without a rig fall back to the
   // whole-model path below.
-  const rig = { has: {}, bone: {}, base: {}, fingers: {}, fingerBase: {}, hairBones: [], sm: { hY: 0, hP: 0, hR: 0, nY: 0, nP: 0, eY: 0, eP: 0, jaw: 0 } };
+  const rig = { has: {}, bone: {}, base: {}, fingers: {}, fingerBase: {}, hairBones: [], arms: {}, armBindDir: {}, armBindQuat: {}, armInit: {}, sm: { hY: 0, hP: 0, hR: 0, nY: 0, nP: 0, eY: 0, eP: 0, jaw: 0 } };
   const rigEuler = new three.Euler(0, 0, 0, 'YXZ');
   const rigQuat = new three.Quaternion();
   const MORPHISH = /morph|blend|shape|offset/i;   // guard: never rig a morph-target dummy
@@ -564,6 +587,19 @@ async function setup3D(three, GLTFLoader, assetUrl, onStatus) {
     }
     const cls = math.classifyRigBone(obj.name || obj.userData?.name || '');
     if (!cls) return;
+    if (cls.role === 'arm') {
+      // Arms: drive ONLY the upper/lower chain. Shoulder would triple-stack
+      // the arm rotation (it inherits the upper arm's rotation already) and
+      // the wrist is carried by the finger curl driver. Capture each bone's
+      // bind WORLD direction (bone -> first bone child) and bind WORLD
+      // quaternion so the driver can rotate "bind direction -> tracked
+      // direction" exactly, regardless of the model's root rotation or scale.
+      if (cls.side && (cls.part === 'upper' || cls.part === 'lower')) {
+        const key = cls.side + '-' + cls.part;
+        if (!rig.arms[key]) rig.arms[key] = obj;
+      }
+      return;
+    }
     if (cls.role === 'finger') {
       // fingers: 3 phalanges x 5 fingers x 2 sides, keyed L-index-2 etc.
       const key = cls.side + '-' + cls.finger + '-' + cls.ph;
@@ -588,6 +624,8 @@ async function setup3D(three, GLTFLoader, assetUrl, onStatus) {
     eyeL: rig.bone.eyeL ? (rig.bone.eyeL.name || 'LeftEye') : null,
     eyeR: rig.bone.eyeR ? (rig.bone.eyeR.name || 'RightEye') : null,
     jaw:  rig.bone.jaw  ? (rig.bone.jaw.name || 'Jaw') : null,
+    armLU: rig.arms['L-upper'] ? (rig.arms['L-upper'].name || 'LeftUpperArm') : null,
+    armRU: rig.arms['R-upper'] ? (rig.arms['R-upper'].name || 'RightUpperArm') : null,
   };
   const rigHas = !!(rig.bone.head || rig.bone.neck || rig.bone.eyeL || rig.bone.eyeR || rig.bone.jaw);
   // ── Secondary motion (hair / cloth): one spring chain per top-level ──────
@@ -609,6 +647,37 @@ async function setup3D(three, GLTFLoader, assetUrl, onStatus) {
       seen.add(bone);
     }
   }
+  // Arm bind capture runs AFTER root normalization (center/scale applied, so
+  // world matrices are final here): bind WORLD direction (bone -> first bone
+  // child) and bind WORLD quaternion, exactly what the driver rotates from.
+  // Updated matrices mean the captured direction is exact even for GLTFs
+  // whose bind pose world matrices were stale during traverse.
+  root.updateMatrixWorld(true);
+  // Bind direction must follow the SKELETON chain (upper->lower, lower->hand),
+  // not "first bone child": clothed VRoid exports hang J_Sec sleeve physics
+  // bones off the upper arm, and measuring to one of those points the bind
+  // direction across the chest — every driven rotation would then start from
+  // a ~180-degree-wrong reference.
+  const chainChild = (key) => {
+    const i = key.indexOf('-');
+    const side = key.slice(0, i), part = key.slice(i + 1);
+    const next = part === 'upper' ? 'lower' : part === 'lower' ? 'hand' : part === 'shoulder' ? 'upper' : null;
+    return next ? rig.arms[side + '-' + next] || null : null;
+  };
+  for (const [key, bone] of Object.entries(rig.arms)) {
+    const a = new three.Vector3(), b = new three.Vector3();
+    bone.getWorldPosition(a);
+    const chain = chainChild(key);
+    if (chain) chain.getWorldPosition(b);
+    else {
+      const child = bone.children.find(c => c.isBone);
+      (child || bone).getWorldPosition(b);
+    }
+    const dir = b.sub(a);
+    rig.armBindDir[key] = dir.lengthSq() > 1e-10 ? dir.normalize().clone() : new three.Vector3(0, -1, 0);
+    rig.armBindQuat[key] = bone.getWorldQuaternion(new three.Quaternion());
+  }
+
   let gravityStrength = 0.5;   // setup3D-local copy of the user slider (synced via setGravity)
   let lastRigTime = 0;
   const rigWorld = new three.Vector3();
@@ -627,7 +696,11 @@ async function setup3D(three, GLTFLoader, assetUrl, onStatus) {
   // Apply the smoothed pose + canonical channels onto the discovered bones.
   // Gains mirror the whole-model fallback so rigged and unrigged models feel
   // the same; each bone rotates around its own bind-pose rest (base quat).
-  function driveRig(pose, channels, k) {
+  const armTmpQ1 = new three.Quaternion(), armTmpQ2 = new three.Quaternion();
+  const armTmpQ3 = new three.Quaternion(), armTmpQ4 = new three.Quaternion();
+  const armTmpU = new three.Vector3(), armTmpL = new three.Vector3();
+
+  function driveRig(pose, channels, k, bodyPose) {
     const sm = rig.sm;
     const tYaw = -pose.yaw * RIG_DEG * 0.85;     // wearer turns right -> +Y (screen-right, same as fallback)
     const tPitch = pose.pitch * RIG_DEG * 0.7;
@@ -724,11 +797,45 @@ async function setup3D(three, GLTFLoader, assetUrl, onStatus) {
         }
       }
     }
+    // Arms: rotate the model's own upper/lower arm bones from their bind
+    // direction toward the tracked wrist direction (calibrated raise/out, or
+    // the raw span-normalized fallback when the user never calibrated). The
+    // world->local conversion uses the parent's CURRENT world quaternion, so
+    // the drive stays exact under the whole-model sway rotation. First frame
+    // snaps (no slerp from an unset state); later frames smooth with the same
+    // k the other drivers use. Nothing here moves without a Pose frame.
+    rig.armDriven = false;
+    if (bodyPose && bodyPose.armL && bodyPose.armR) {
+      // SAME-side mapping (the finger driver's convention): the canvas is a
+      // non-mirrored "person facing you" — the wearer's left arm, the raw
+      // landmark and the facing model's own left bones all sit canvas-right,
+      // so tracked 'L' drives the model's L bones directly.
+      for (const boneSide of ['L', 'R']) {
+        // Per-segment targets: the chord (shoulder->wrist) keeps the tracked
+        // endpoint; the tracked ELBOW BEND splits the chain around it so bent
+        // arms look bent instead of both segments pointing at the wrist.
+        math.armChainTargets(bodyPose[boneSide === 'L' ? 'armL' : 'armR'], boneSide, armTmpU, armTmpL);
+        for (const part of ['upper', 'lower']) {
+          const key = boneSide + '-' + part;
+          const bone = rig.arms[key];
+          if (!bone) continue;
+          const target = part === 'upper' ? armTmpU : armTmpL;
+          armTmpQ1.setFromUnitVectors(rig.armBindDir[key], target);
+          armTmpQ2.copy(armTmpQ1).multiply(rig.armBindQuat[key]);   // desired world rotation
+          bone.parent.getWorldQuaternion(armTmpQ3);
+          armTmpQ4.copy(armTmpQ3).invert().multiply(armTmpQ2);      // -> parent-local
+          if (!rig.armInit[key]) { bone.quaternion.copy(armTmpQ4); rig.armInit[key] = true; }
+          else bone.quaternion.slerp(armTmpQ4, Math.min(1, k * 1.5));
+          rig.armDriven = true;
+        }
+      }
+    }
     rig.last = {
       yaw: sm.hY, pitch: sm.hP, roll: sm.hR,
       eyeYaw: sm.eY, eyePitch: sm.eP, jaw: sm.jaw,
       eyeL: driveEyes, jawBone: driveJaw,
       fingers: !!rig.lastHands,
+      arms: rig.armDriven,
     };
     // Spring chains (hair/cloth): pin the root to the bone's world position,
     // integrate gravity*strength, then convert the tip's lateral sag into a
@@ -807,6 +914,45 @@ async function setup3D(three, GLTFLoader, assetUrl, onStatus) {
   return {
     renderer, scene, camera, group, morphs, hasMorphs, handGroup, handParts, bodyGroup, bodyParts,
     rig, rigHas, rigInfo, driveRig,
+    /** Verify harness probe: current world quaternion of each driven arm bone. */
+    armWorld() {
+      const out2 = {};
+      for (const [key, bone] of Object.entries(rig.arms)) out2[key] = bone.getWorldQuaternion(new three.Quaternion()).toArray();
+      return out2;
+    },
+    /** Verify harness probe: captured bind WORLD direction per arm bone —
+      * proves which canvas side each model's own arms are on, locking the
+      * outward-spread convention (L bind dir x > 0 on a facing model). */
+    armBindInfo() {
+      const out2 = {};
+      for (const [key, dir] of Object.entries(rig.armBindDir)) out2[key] = { x: dir.x, y: dir.y, z: dir.z };
+      return out2;
+    },
+    /** Verify harness probe: eye/head world positions — which way the model
+      * faces (eyes on the +z side of the head = facing the camera) and where
+      * its left eye sits on x (facing model: left eye at +x). */
+    facingInfo() {
+      const gp = b => { if (!b) return null; const v = new three.Vector3(); b.getWorldPosition(v); return { x: +v.x.toFixed(3), y: +v.y.toFixed(3), z: +v.z.toFixed(3) }; };
+      return { head: gp(rig.bone.head), eyeL: gp(rig.bone.eyeL), eyeR: gp(rig.bone.eyeR) };
+    },
+    /** Harness probe: interior angle at each side's ELBOW, measured from the
+      * driven bones' world positions (upper->elbow vs elbow->wrist-chain end).
+      * Returns { L: rad, R: rad }; a side with missing chain bones is absent. */
+    armSegmentAngle() {
+      const angle = (side) => {
+        const upper = rig.arms[side + '-upper'], lower = rig.arms[side + '-lower'], hand = rig.arms[side + '-hand'];
+        if (!upper || !lower) return null;
+        const pU = new three.Vector3(), pL = new three.Vector3(), pH = new three.Vector3();
+        upper.getWorldPosition(pU);
+        lower.getWorldPosition(pL);
+        (hand || lower.children.find(c => c.isBone) || lower).getWorldPosition(pH);
+        const a = pL.clone().sub(pU), b = pH.clone().sub(pL);
+        if (a.lengthSq() < 1e-10 || b.lengthSq() < 1e-10) return null;
+        const cosT = Math.max(-1, Math.min(1, a.dot(b) / (a.length() * b.length())));
+        return Math.acos(-cosT);   // interior angle at the elbow vertex
+      };
+      return { L: angle('L'), R: angle('R') };
+    },
     hairChains: springChains.length,
     /** Sync the user's gravity slider into this model's spring simulation. */
     setGravity(v) { gravityStrength = Math.min(1, Math.max(0, Number(v) || 0)); },
@@ -857,6 +1003,7 @@ function updateHandRig3D(rig, hands) {
 const BODY_SLOT_INDICES = [11, 12, 13, 14, 15, 16, 23, 24];
 const BODY_SLOT_BONES = [[0, 2], [2, 4], [1, 3], [3, 5], [0, 1], [0, 6], [1, 7], [6, 7]];
 function updateBodyRig3D(rig, body, bodyCal) {
+  // (elbow slots come from the real tracked landmarks — see armSlot below)
   const halfH = Math.tan((42 * Math.PI / 180) / 2) * (CAM_Z - BODY_Z);
   const halfW = halfH * (AV_OUT_W / AV_OUT_H);
   const up = rig.yAxis, dir = rig.dir, a = rig.v1, b = rig.v2;
@@ -868,6 +1015,10 @@ function updateBodyRig3D(rig, body, bodyCal) {
     return;
   }
   part.visible = true;
+  // NON-mirrored canvas (a person facing you, like the 2D sprite): raw
+  // landmark x maps straight through — the wearer's left shoulder (image
+  // RIGHT on an unmirrored camera frame) lands canvas-right, exactly where
+  // the facing model's own left shoulder appears to the viewer.
   const world = (pt, out) => {
     out.set((pt.x - 0.5) * 2 * halfW, (0.5 - pt.y) * 2 * halfH, BODY_Z);
     return out;
@@ -884,17 +1035,28 @@ function updateBodyRig3D(rig, body, bodyCal) {
       part.joints[slot].visible = true;
     });
     const lenWorld = len => len * 2 * halfH * (bodyCal.torsoScale || 1);
-    const armSlot = (shoulderSlot, elbowSlot, wristSlot, arm, side) => {
+    const armSlot = (shoulderSlot, elbowSlot, wristSlot, arm, side, elb) => {
       const sh = part.joints[shoulderSlot].position;
       const len = lenWorld(arm.len);
-      const L = side === 'l' ? -1 : 1;
+      // Spread direction for REAL MediaPipe frames (unmirrored): the left
+      // arm's shoulder sits canvas-RIGHT, so outward = +x; the right arm
+      // mirrors. The old -1/+1 spread the wrists INWARD across the chest —
+      // it was written against mirrored-camera data and never verified
+      // laterally with a real clip.
+      const L = side === 'l' ? 1 : -1;
       part.joints[wristSlot].position.set(sh.x + arm.out * len * L, sh.y + arm.raise * len, BODY_Z);
       part.joints[wristSlot].visible = true;
-      part.joints[elbowSlot].position.set(sh.x + arm.out * len * 0.55 * L, sh.y + arm.raise * len * 0.55, BODY_Z);
+      // Elbow: the REAL tracked elbow landmark when visible (bent arms bend),
+      // falling back to the 55% chord lerp only when the tracker drops it.
+      if (elb && elb.x != null) {
+        part.joints[elbowSlot].position.set((elb.x - 0.5) * 2 * halfW, (0.5 - elb.y) * 2 * halfH, BODY_Z);
+      } else {
+        part.joints[elbowSlot].position.set(sh.x + arm.out * len * 0.55 * L, sh.y + arm.raise * len * 0.55, BODY_Z);
+      }
       part.joints[elbowSlot].visible = true;
     };
-    armSlot(0, 2, 4, { out: bodyCal.armL.out, raise: bodyCal.armL.raise, len: bodyCal.lenL }, 'l');
-    armSlot(1, 3, 5, { out: bodyCal.armR.out, raise: bodyCal.armR.raise, len: bodyCal.lenR }, 'r');
+    armSlot(0, 2, 4, { out: bodyCal.armL.out, raise: bodyCal.armL.raise, len: bodyCal.lenL }, 'l', pts[13]);
+    armSlot(1, 3, 5, { out: bodyCal.armR.out, raise: bodyCal.armR.raise, len: bodyCal.lenR }, 'r', pts[14]);
   } else {
     BODY_SLOT_INDICES.forEach((lmIdx, slot) => {
       world(pts[lmIdx], a);
@@ -971,6 +1133,8 @@ export function createAvatarEngine(opts = {}) {
   let lastHandRig = null;   // observability mirror of the 3D hand rig (harness tests)
   let lastBody = null;      // 33 normalized MediaPipe Pose landmarks (body)
   let bodyState = { last: null, seenAt: 0 };  // dropout-grace state (see smoothBodyNow)
+  let bendMs = 0; let bendStateL = { v: null, at: 0 };   // elbow-bend smoothing state (see smoothBend)
+  let bendStateR = { v: null, at: 0 };
   let lastBodyRig = null;   // observability mirror of the 3D body rig (harness tests)
   let lastBodyPose = null;
   // Air-pointer gesture state (zoom window summoned by pointing at the camera).
@@ -1210,7 +1374,20 @@ export function createAvatarEngine(opts = {}) {
     // hold the hand rig gets) so arms/torso don't flicker on MediaPipe hiccups.
     const freshBody = (faceRes && faceRes.body) ? faceRes.body : null;
     const bodyNow = cfg.body ? smoothBodyNow(now, freshBody, bodyState) : null;
-    const bodyPose = bodyNow ? math.applyBodyCalibration(bodyNow, cfg.calibration) : null;
+    // Rig driver pose: the user's calibration when it exists, otherwise the
+    // raw span-normalized fallback — so model arms follow the body out of
+    // the box, before the user ever runs the calibration wizard.
+    const bodyPose = bodyNow ? (math.applyBodyCalibration(bodyNow, cfg.calibration) || math.rawBodyPose(bodyNow)) : null;
+    if (bodyPose && bodyPose.armL && bodyPose.armR) {
+      // Elbow-bend smoothing: the per-frame elbow angle is exact but jittery
+      // (fast swings can snap straight<->bent on one noisy frame). Time-based
+      // EMA + slew cap keeps the motion continuous; a long tracker gap
+      // re-snaps so real pose changes never lag behind.
+      const prevBendMs = bendMs;
+      bendMs = now;
+      bodyPose.armL.bend = math.smoothBend(bodyPose.armL.bend, bendStateL, now, now - prevBendMs);
+      bodyPose.armR.bend = math.smoothBend(bodyPose.armR.bend, bendStateR, now, now - prevBendMs);
+    } else { bendStateL.v = null; bendStateR.v = null; }
     lastBodyPose = bodyPose;
 
     // Air-pointer gesture: point at the camera to summon the floating control
@@ -1272,7 +1449,7 @@ export function createAvatarEngine(opts = {}) {
         g3.rig.lastHands = cfg.hands ? handsNow : null;
         // Rigged model: the head / eyes / jaw bones carry the tracked motion;
         // the whole model only sways subtly so the body reads as alive.
-        g3.driveRig(pose, channels, k);
+        g3.driveRig(pose, channels, k, bodyPose);
         g3.group.rotation.y = -pose.yaw * Math.PI / 180 * 0.10;
         g3.group.rotation.x = pose.pitch * Math.PI / 180 * 0.06;
         g3.group.rotation.z = -pose.roll * Math.PI / 180 * 0.14;
@@ -1325,6 +1502,19 @@ export function createAvatarEngine(opts = {}) {
     get rigged() { return !!(g3 && g3.rigHas); },
     get rigInfo() { return g3 ? g3.rigInfo : null; },
     get rigPose() { return (g3 && g3.rig && g3.rig.last) ? { ...g3.rig.last } : null; },
+    /** Arm rig evidence: driven bone keys + their live world quaternions. */
+    get armRig() { return g3 && g3.armWorld ? g3.armWorld() : null; },
+    /** Arm bind-direction evidence for the verify harness. */
+    armBindInfo() { return g3 && g3.armBindInfo ? g3.armBindInfo() : null; },
+    /** Harness probe: world-space angle between each side's upper and lower
+      * arm segments (measured from the bone world positions) — ~0 when both
+      * segments share the chord (straight arm), grows with tracked bend. */
+    armSegmentAngle() {
+      if (!g3 || !g3.armSegmentAngle) return null;
+      return g3.armSegmentAngle();
+    },
+    /** Facing evidence (eye/head positions) for the verify harness. */
+    facingInfo() { return g3 && g3.facingInfo ? g3.facingInfo() : null; },
     /** Counts for the VRM regression harness: mapped morph targets and hair/cloth spring chains. */
     get morphCount() { return g3 && g3.morphs ? g3.morphs.length : 0; },
     get hairChainCount() { return g3 ? (g3.hairChains != null ? g3.hairChains : 0) : 0; },
@@ -1395,6 +1585,7 @@ export function createAvatarEngine(opts = {}) {
       destroyed = true;
       running = false;
       handEMA.clear();
+      bendStateL.v = null; bendStateR.v = null; bendMs = 0;
       if (raf) cancelAnimationFrame(raf);
       raf = 0;
       try { sensor && sensor.close(); } catch {}

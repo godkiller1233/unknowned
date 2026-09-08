@@ -48,21 +48,27 @@ test('calibrated arms raise to full reach above the shoulders, mirrored sides', 
   // Arms straight overhead: wrists above shoulders by a full arm length.
   assert.ok(rig[4].y < shY - lenPx * 0.9, `L wrist y ${rig[4].y}`);
   assert.ok(rig[5].y < shY - lenPx * 0.9, `R wrist y ${rig[5].y}`);
-  // Elbows sit at 55% of the raise, between shoulder and wrist.
-  assert.ok(Math.abs(rig[2].y - (shY - lenPx * 0.55)) < 1e-6, `L elbow y ${rig[2].y}`);
+  // Elbow: the REAL tracked elbow landmark (mkBody puts it at y = sy + 0.6*wDyL
+  // = 0.58 -> 278.4px), not the old synthesized 55% lerp — bent arms bend now.
+  assert.ok(Math.abs(rig[2].y - 0.58 * H) < 1e-6, `L elbow y ${rig[2].y}`);
   // Shoulders stay at their raw tracked pixels (torso follows the tracker).
   assert.deepEqual(rig[0], { x: 288, y: 192 });
 });
 
 test('calibrated lateral spread goes outward on each side', () => {
+  // Real MediaPipe frames are UNMIRRORED: the wearer's LEFT shoulder
+  // (landmark 11) sits image-RIGHT, so outward for the left arm is +x and
+  // for the right arm -x. The old fixture mirrored the layout, which made
+  // the old -1/+1 spread look plausible while spreading real wrists INWARD
+  // across the chest.
   const cal = {
     lenL: 0.3, lenR: 0.3, torsoScale: 1,
     armL: { raise: 0, out: 1 }, armR: { raise: 0, out: 1 },
   };
-  const rig = bodyRigPoints2D(mkBody(), cal, W, H);
+  const rig = bodyRigPoints2D(mkBody({ sxL: 0.58, sxR: 0.42 }), cal, W, H);
   const lenPx = 0.3 * 480; // 144px
-  assert.ok(rig[4].x < rig[0].x - lenPx * 0.9, `L wrist x ${rig[4].x} (should be left of shoulder ${rig[0].x})`);
-  assert.ok(rig[5].x > rig[1].x + lenPx * 0.9, `R wrist x ${rig[5].x} (should be right of shoulder ${rig[1].x})`);
+  assert.ok(rig[4].x > rig[0].x + lenPx * 0.9, `L wrist x ${rig[4].x} (should be right of its image-right shoulder ${rig[0].x})`);
+  assert.ok(rig[5].x < rig[1].x - lenPx * 0.9, `R wrist x ${rig[5].x} (should be left of its image-left shoulder ${rig[1].x})`);
 });
 
 test('torso scale stretches calibrated arm length', () => {

@@ -210,6 +210,40 @@ export function classifyRigBone(name) {
     else if (next === 'proximal' || next === 'metacarpal') ph = 1;
     return { role: 'finger', side, finger: t === 'little' ? 'pinky' : t, ph };
   }
+  // Arms: shoulder / upper arm / forearm / hand chains, per side. MUST run
+  // AFTER the finger rules — 'RightHandMiddle3' contains the 'hand' token but
+  // is a finger phalange. Driven roles are upper+lower; shoulder and hand
+  // bones are classified (so they never match anything else) but stay at
+  // rest: the shoulder would triple-stack the arm rotation, and the wrist is
+  // carried by the finger driver.
+  const ARM_SPECS = [
+    ['shoulder', 'shoulder'], ['upperarm', 'upper'], ['lowerarm', 'lower'],
+    ['forearm', 'lower'], ['arm', 'upper'], ['hand', 'hand'],
+  ];
+  // Fused spellings: LeftArm / LeftForeArm / upperarm_r / handL — and
+  // colon-prefixed exports (mixamorig:LeftArm) whose side+part land in one
+  // token after splitting. Prefix rules are exact-anchored so accessories
+  // (armband, armor, handcuffs) never match.
+  const FUSED_A = /^(left|l|right|r)(shoulder|upperarm|lowerarm|forearm|arm|hand)$/;
+  const FUSED_B = /^(shoulder|upperarm|lowerarm|forearm|arm|hand)(left|l|right|r)$/;
+  const partOf = tok => { for (const [t, part] of ARM_SPECS) if (t === tok) return part; return null; };
+  for (let i = 0; i < tokens.length; i++) {
+    for (const [tok, part] of ARM_SPECS) {
+      if (tokens[i] !== tok) continue;
+      const side = SIDE_FROM(tokens[i - 1]) || SIDE_FROM(tokens[i + 1]);
+      return { role: 'arm', side, part };
+    }
+    // Namespace-qualified exports keep the prefix INSIDE the token (the
+    // colon is not a split char): mixamorig:leftarm. Strip a leading
+    // `word:` namespace, then match the fused side+part forms. The strip is
+    // anchored to one token boundary, so accessories (armband, handcuffs)
+    // still fail every pattern.
+    const bare = /^[a-z0-9]+:/.test(tokens[i]) ? tokens[i].replace(/^[a-z0-9]+:/, '') : tokens[i];
+    const fa = FUSED_A.exec(bare);
+    if (fa) return { role: 'arm', side: SIDE_FROM(fa[1]), part: partOf(fa[2]) };
+    const fb = FUSED_B.exec(bare);
+    if (fb) return { role: 'arm', side: SIDE_FROM(fb[2]), part: partOf(fb[1]) };
+  }
   return null;
 }
 
@@ -785,6 +819,9 @@ export function applyBodyCalibration(body, cal) {
     return { dx: (wr.x - sh.x) / L, dy: (sh.y - wr.y) / L };   // dy + = wrist above shoulder
   };
   const l = armPose(sL, wL, n.armLenL), r = armPose(sR, wR, n.armLenR);
+  // Elbow bend from the same frame's elbow landmarks (13/14) — dimensionless,
+  // so it rides along free with no extra calibration step.
+  const bendL = elbowBend(sL, at(13), wL), bendR = elbowBend(sR, at(14), wR);
   const rng = side => (n.armRange && n.armRange[side]) || null;
   return {
     midX: clamp(sMid.x - (n.midX || 0.5) + 0.5),
@@ -792,9 +829,161 @@ export function applyBodyCalibration(body, cal) {
     torsoScale: clamp(span / (n.shoulderSpan || span), 0.6, 1.6),
     lean: clamp((sMid.x - (n.midX || 0.5)) * 3, -1, 1),
     lenL: n.armLenL || 0.3, lenR: n.armLenR || 0.3,
-    armL: { raise: range(l.dy, rng('l') && rng('l').dy), out: range(l.dx, rng('l') && rng('l').dx) },
-    armR: { raise: range(r.dy, rng('r') && rng('r').dy), out: range(r.dx, rng('r') && rng('r').dx) },
+    armL: { raise: range(l.dy, rng('l') && rng('l').dy), out: range(l.dx, rng('l') && rng('l').dx), bend: bendL },
+    armR: { raise: range(r.dy, rng('r') && rng('r').dy), out: range(r.dx, rng('r') && rng('r').dx), bend: bendR },
   };
+}
+
+/**
+ * Body frame WITHOUT a calibration: wrist direction from each shoulder,
+ * normalized by shoulder span (not raw pixels), so a user far from the
+ * camera produces the same arm vector as a close one. Shape mirrors
+ * applyBodyCalibration (armL/armR {dx, raise}) but needs no stored data —
+ * the rig driver falls back to this when the user never calibrated, so
+ * arms still follow the body out of the box. Returns null without a Pose
+ * frame.
+ */
+export function rawBodyPose(body) {
+  if (!body || body.length < 17) return null;
+  const at = i => body[i];
+  const sL = at(11), sR = at(12), wL = at(15), wR = at(16);
+  if (!sL || !sR || !wL || !wR) return null;
+  const span = bodyDist(sL, sR) || 1e-6;
+  // Raw fallback mapped onto the SAME 0..1 semantics the calibrated path
+  // produces: raise 0 = arms down, 0.5 = horizontal, 1 = overhead. `out`
+  // is a 0..1 spread MAGNITUDE per side — the camera is unmirrored, so the
+  // wearer's LEFT arm spreads toward +x (landmark 11/15) and the RIGHT arm
+  // toward -x; the per-side sign flip makes both sides produce a positive
+  // magnitude when spread. (The calibrated path gets this for free from its
+  // captured per-side range.)
+  const armPose = (sh, wr, spreadSign, el) => ({
+    raise: clamp(((sh.y - wr.y) / span + 1) / 2),   // dy + = wrist above shoulder
+    out: clamp(((wr.x - sh.x) / span) * spreadSign),
+    bend: elbowBend(sh, el, wr),
+  });
+  const l = armPose(sL, wL, 1, at(13)), r = armPose(sR, wR, -1, at(14));
+  const sMid = bodyMid(sL, sR);
+  return {
+    midX: sMid.x, midY: sMid.y,
+    torsoScale: 1, lean: 0,
+    lenL: span, lenR: span,
+    armL: l, armR: r,
+  };
+}
+
+/**
+ * Interior elbow angle from one side's Pose landmarks (shoulder/elbow/wrist),
+ * normalized to a 0..1 bend: 0 = straight arm, 1 = fully folded (interior
+ * angle collapsed to ~0.5 rad). Pure dimensionless geometry — identical for
+ * every body size and distance, so it needs NO calibration capture. Missing
+ * or degenerate landmarks fall back to 0 (straight), preserving the old
+ * shared-target behavior exactly.
+ */
+/**
+ * Time smoothing for the tracked elbow bend (0..1). MediaPipe's elbow angle
+ * estimate is geometrically exact per frame but jittery: during a fast arm
+ * swing a single noisy frame can snap the rig between straight and folded.
+ * Two-stage filter, both time-based so behavior is identical at 30 or 60 fps:
+ *   1. EMA (exponential moving average) — damps jitter, half-life
+ *      `BEND_EMA_HALF_LIFE_MS` of measured elapsed time.
+ *   2. Slew cap — the value may move at most `BEND_SLEW_PER_SEC` units per
+ *      second toward the EMA target, so even a real snap becomes a fast,
+ *      natural unfold rather than a cut.
+ * `state` is `{ v, at }` owned by the caller (null value = never seen a
+ * bend). A gap longer than `BEND_GAP_RESNAP_MS` (tracker dropout, camera
+ * toggle) re-snaps instantly instead of easing across a stale gap.
+ */
+export const BEND_EMA_HALF_LIFE_MS = 90;
+export const BEND_SLEW_PER_SEC = 3.0;   // bend units per second
+export const BEND_GAP_RESNAP_MS = 400;
+
+export function smoothBend(raw, state, now, dtMs) {
+  const v = clamp(Number(raw) || 0);
+  if (!state) state = { v: null, at: 0 };
+  if (state.v == null) { state.v = v; state.at = now; return v; }   // first frame snaps
+  const gap = dtMs != null ? dtMs : now - state.at;
+  if (gap >= BEND_GAP_RESNAP_MS || gap < 0) { state.v = v; state.at = now; return v; }
+  // Stage 1: EMA toward the fresh sample over the elapsed time.
+  const alpha = 1 - Math.pow(0.5, gap / BEND_EMA_HALF_LIFE_MS);
+  const target = state.v + (v - state.v) * alpha;
+  // Stage 2: slew cap toward the EMA target.
+  const maxStep = BEND_SLEW_PER_SEC * (gap / 1000);
+  const next = Math.abs(target - state.v) <= maxStep ? target : state.v + Math.sign(target - state.v) * maxStep;
+  state.v = clamp(next);
+  state.at = now;
+  return state.v;
+}
+
+export function elbowBend(sh, el, wr) {
+  if (!sh || !el || !wr) return 0;
+  const ux = el.x - sh.x, uy = el.y - sh.y;
+  const vx = wr.x - el.x, vy = wr.y - el.y;
+  const ul = Math.hypot(ux, uy), vl = Math.hypot(vx, vy);
+  if (ul < 1e-6 || vl < 1e-6) return 0;
+  const cosT = Math.max(-1, Math.min(1, (ux * vx + uy * vy) / (ul * vl)));
+  // Interior angle at the elbow vertex is between (sh-el) and (wr-el); with
+  // u = el-sh that flips the dot's sign. Straight arm -> pi, folded -> 0.
+  const theta = Math.acos(-cosT);
+  return clamp((Math.PI - theta) / (Math.PI - 0.5));
+}
+
+/**
+ * Arm target direction in three.js WORLD space for the 3D rig driver, from
+ * one side's tracked raise/out (calibrated or raw). Canvas conventions:
+ * `out` is measured in canvas space where LEFT of the wearer is -x; the
+ * wearer's right side mirrors (+x). `raise` is +1 straight up. The result
+ * points where the arm chain should aim: the driver rotates each arm bone
+ * from its bind orientation so the segment points along it. Degenerate
+ * (zero-length) input rests the arm at its side instead of producing NaN.
+ */
+export function armTargetVec(armPose, side, out) {
+  const arm = side === 'L' ? (armPose && armPose.armL) : (armPose && armPose.armR);
+  return armChordVec(arm, side, out);
+}
+
+/** Chord direction (shoulder -> wrist) for ONE side's arm pose object. */
+function armChordVec(arm, side, out) {
+  const o = clamp((arm && arm.out) || 0);
+  const r = clamp((arm && arm.raise) || 0);
+  // raise is 0..1 (0 = arms down, 1 = overhead) -> y component -1..+1.
+  // out is 0..1 (0 = crossed, 1 = full spread) -> outward x component.
+  // Signs match the body overlay's armSlot for REAL unmirrored frames:
+  // tracked-left spreads toward canvas +x (its shoulder sits canvas-right).
+  const x = (side === 'L' ? 1 : -1) * o;
+  const y = r * 2 - 1;
+  const v = out || { x: 0, y: 0, z: 0 };
+  const len = Math.hypot(x, y);
+  if (len < 1e-6) { v.x = 0; v.y = -1; v.z = 0; return v; }   // rest: straight down
+  v.x = x / len; v.y = y / len; v.z = 0;
+  return v;
+}
+
+/**
+ * Per-segment arm directions for the 3D rig driver: splits the shoulder->wrist
+ * chord around the tracked ELBOW BEND so bent arms look bent. The upper arm
+ * rotates +halfBend and the forearm -halfBend off the chord, toward the elbow's
+ * natural outward bow — the two off-chord components cancel, so the WRIST
+ * STAYS EXACTLY on the tracked chord endpoint (the most visible anchor) while
+ * the elbow swings sideways. bend 0 (straight arm) degenerates to both
+ * segments pointing along the chord — identical to the old shared-target
+ * behavior. Results are unit vectors in world space (y up).
+ */
+export function armChainTargets(arm, side, outUpper, outLower) {
+  const chord = armChordVec(arm, side, { x: 0, y: 0, z: 0 });
+  const bend = clamp((arm && arm.bend) || 0);
+  const half = bend * (Math.PI / 2) * 0.9;       // cap: never fold fully onto itself
+  // In-plane perpendicular; pick the orientation that bows the elbow OUTWARD
+  // (away from the body center): left side outward is +x, right side -x. When
+  // the chord is vertical the perpendicular is horizontal — exactly the bow
+  // direction; when horizontal (T-pose) the arm is straight anyway (bend ~0).
+  let px = -chord.y, py = chord.x;
+  if (px * (side === 'L' ? 1 : -1) < 0) { px = -px; py = -py; }
+  const c = Math.cos(half), sn = Math.sin(half);
+  const u = outUpper || { x: 0, y: 0, z: 0 };
+  const l = outLower || { x: 0, y: 0, z: 0 };
+  u.x = chord.x * c + px * sn; u.y = chord.y * c + py * sn; u.z = 0;
+  l.x = chord.x * c - px * sn; l.y = chord.y * c - py * sn; l.z = 0;
+  return { upper: u, lower: l };
 }
 
 /**
@@ -810,20 +999,31 @@ export function applyBodyCalibration(body, cal) {
 export function bodyRigPoints2D(body, bodyCal, W, H) {
   if (!body || body.length < 25) return null;
   const at = i => body[i];
+  // NON-mirrored canvas: raw landmark x maps straight through (the wearer's
+  // left shoulder is image-right on an unmirrored camera frame and lands
+  // canvas-right, matching the facing 2D sprite).
   const px = (pt) => ({ x: (pt && pt.x != null ? pt.x : 0.5) * W, y: (pt && pt.y != null ? pt.y : 0.5) * H });
   const j = { 0: px(at(11)), 1: px(at(12)), 2: px(at(13)), 3: px(at(14)), 4: px(at(15)), 5: px(at(16)), 6: px(at(23)), 7: px(at(24)) };
   if (bodyCal && bodyCal.armL && bodyCal.armR) {
     const lenPx = side => (side === 'l' ? bodyCal.lenL || 0.3 : bodyCal.lenR || 0.3) * H * (bodyCal.torsoScale || 1);
-    const armSlot = (shIdx, elbIdx, wriIdx, arm, side) => {
-      const sh = j[shIdx], len = lenPx(side), L = side === 'l' ? -1 : 1;
+    const armSlot = (shIdx, elbIdx, wriIdx, arm, side, body) => {
+      const sh = j[shIdx], len = lenPx(side);
+      // Outward spread for REAL unmirrored frames: left arm (canvas-right
+      // shoulder) spreads +x, right arm mirrors. Old -1/+1 spread inward.
+      const L = side === 'l' ? 1 : -1;
       // Canvas Y grows downward (three.js world Y grows up): raise must flip
       // sign so a positive raise puts the wrist ABOVE the shoulder, mirroring
       // the 3D rig's placement exactly.
       j[wriIdx] = { x: sh.x + arm.out * len * L, y: sh.y - arm.raise * len };
-      j[elbIdx] = { x: sh.x + arm.out * len * 0.55 * L, y: sh.y - arm.raise * len * 0.55 };
+      // Elbow: the REAL tracked elbow landmark when visible (bent arms bend),
+      // falling back to the 55% chord lerp only when the tracker drops it.
+      const elb = body && body[side === 'l' ? 13 : 14];
+      j[elbIdx] = (elb && elb.x != null)
+        ? { x: elb.x * W, y: elb.y * H }   // raw landmark px, unmirrored canvas
+        : { x: sh.x + arm.out * len * 0.55 * L, y: sh.y - arm.raise * len * 0.55 };
     };
-    armSlot(0, 2, 4, bodyCal.armL, 'l');
-    armSlot(1, 3, 5, bodyCal.armR, 'r');
+    armSlot(0, 2, 4, bodyCal.armL, 'l', body);
+    armSlot(1, 3, 5, bodyCal.armR, 'r', body);
   }
   return j;
 }
