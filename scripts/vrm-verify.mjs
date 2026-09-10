@@ -187,9 +187,19 @@ function assess(name, r) {
     bentSide ? `L ${seg.bent.L.toFixed(2)}rad R ${seg.bent.R.toFixed(2)}rad (bent=${bentSide})`
              : 'no per-segment snapshots');
 
+  // Hair/cloth inertia: with the synthetic face oscillating through quiet /
+  // slow-turn / fast-turn regimes, the fast turn must swing the chains
+  // decisively more than the quiet phase (lag proportional to head motion).
+  const hs = rep.hairSway || {};
+  const hasHair = rep.hairChains > 0 && hs.fastTurn != null && hs.quiet != null && hs.slowTurn != null;
+  const hairOK = hasHair && hs.fastTurn > hs.quiet * 2 && hs.fastTurn > hs.slowTurn * 1.5;
+  add('hair/cloth swings with head motion (fast > slow > quiet)', !hasHair || hairOK,
+    hasHair ? `quiet ${hs.quiet} slow ${hs.slowTurn} fast ${hs.fastTurn}` : 'no hair chains or no sway data');
+
   const warns = [];
   if (!(rep.morphs > 0)) warns.push('no morph targets mapped (expressions will not drive this model)');
   if (!(rep.hairChains > 0)) warns.push('no hair/cloth spring chains (no hair-classified bones)');
+  if (hasHair && !hairOK) warns.push(`hair inertia weak: quiet ${hs.quiet} slow ${hs.slowTurn} fast ${hs.fastTurn}`);
   return { checks, warns };
 }
 

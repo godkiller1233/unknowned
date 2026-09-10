@@ -99,3 +99,50 @@ test('spring chain: lateral root acceleration swings the tip (deterministic)', (
   // sway pushes the tip +x
   assert.ok(a.pts[3].x > 0.01, `tip x ${a.pts[3].x} should swing right under sustained +x sway`);
 });
+
+test('spring chain: head-turn inertia — fast swings lag more than slow ones, eye darts kick', async () => {
+  const { headDriveAccel, HEAD_SWING_GAIN, HEAD_PIVOT_RADIUS, SWING_MAX_ACCEL } = await import('../src/avatar-math.js');
+
+  // headDriveAccel: lag points OPPOSITE the motion; velocity term scales with
+  // turn rate so a fast turn drives more accel than a slow one.
+  const fast = headDriveAccel({ velY: 4, alphaY: 0 });
+  const slow = headDriveAccel({ velY: 1, alphaY: 0 });
+  assert.ok(fast.ax < 0, `lag opposes yaw (got ${fast.ax})`);
+  assert.ok(Math.abs(fast.ax) > Math.abs(slow.ax) * 3, `fast turn ${fast.ax} must lag >> slow ${slow.ax}`);
+  assert.ok(Math.abs(fast.ax) < SWING_MAX_ACCEL + 1e-9, 'clamped to sane range');
+  assert.deepEqual(headDriveAccel(null), { ax: 0, ay: 0, az: 0 }, 'no drive -> no accel');
+  // Pitch drives the z axis (forward/back swing), not x.
+  const pitch = headDriveAccel({ velP: 4 });
+  assert.ok(Math.abs(pitch.az) > 0 && Math.abs(pitch.ax) < 1e-12, 'pitch swings z, not x');
+
+  // Full-chain behavior: identical chains, fast vs slow sustained turn — the
+  // fast one must swing decisively further.
+  const swing = (velY) => {
+    const c = createSpringChain(4, 0.05);
+    stepSpringChain(c, 0, 0, 0, 1 / 60, 1);   // init
+    for (let i = 0; i < 60; i++) stepSpringChain(c, 0, 0, 0, 1 / 60, 1, 0, { velY, alphaY: 0 });
+    return c.pts[3].x;
+  };
+  const fastTip = swing(4), slowTip = swing(1);
+  assert.ok(Math.abs(fastTip) > Math.abs(slowTip) * 2.5, `fast ${fastTip} vs slow ${slowTip}`);
+  assert.ok(Math.abs(fastTip) > 0.002, `fast turn visibly swings (got ${fastTip})`);
+  // With NO drive the chain behaves EXACTLY as before the drive parameter
+  // existed: a chain run with drive=null and one with an explicit zero drive
+  // settle identically.
+  const restA = createSpringChain(4, 0.05), restB = createSpringChain(4, 0.05);
+  stepSpringChain(restA, 0, 0, 0, 1 / 60, 1);
+  stepSpringChain(restB, 0, 0, 0, 1 / 60, 1);
+  for (let i = 0; i < 240; i++) {
+    stepSpringChain(restA, 0, 0, 0, 1 / 60, 1);
+    stepSpringChain(restB, 0, 0, 0, 1 / 60, 1, 0, {});
+  }
+  for (let i = 0; i < restA.pts.length; i++) {
+    assert.ok(Math.abs(restA.pts[i].x - restB.pts[i].x) < 1e-12 && Math.abs(restA.pts[i].y - restB.pts[i].y) < 1e-12,
+      `point ${i} identical with/without drive`);
+  }
+  // Eye-dart kick is small but real, and much smaller than a head turn.
+  const kick = headDriveAccel({ eyeVX: 20 });
+  const turn = headDriveAccel({ velY: 4 });
+  assert.ok(Math.abs(kick.ax) > 0.01, `eye kick present (${kick.ax})`);
+  assert.ok(Math.abs(kick.ax) < Math.abs(turn.ax) * 0.3, 'kick stays subtle vs a turn');
+});

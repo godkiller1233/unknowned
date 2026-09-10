@@ -680,6 +680,12 @@ async function setup3D(three, GLTFLoader, assetUrl, onStatus) {
 
   let gravityStrength = 0.5;   // setup3D-local copy of the user slider (synced via setGravity)
   let lastRigTime = 0;
+  // Head/eye angular motion history for hair/cloth inertia (see headDriveAccel):
+  // velocity = d(smoothed pose)/dt, acceleration = d(velocity)/dt, computed
+  // per driveRig frame and fed to every spring chain as a lag drive.
+  let hairSwayMirror = [];
+  let headPrev = { y: 0, p: 0 }, eyePrev = { x: 0, y: 0 };
+  let headVelPrev = { y: 0, p: 0 };
   const rigWorld = new three.Vector3();
   const rigRootInv = new three.Quaternion();
   const rigRootMat = new three.Matrix4();
@@ -843,6 +849,20 @@ async function setup3D(three, GLTFLoader, assetUrl, onStatus) {
     const nowMs = performance.now();
     const dt = Math.min(0.05, Math.max(0.001, (nowMs - (lastRigTime || nowMs - 42)) / 1000));
     lastRigTime = nowMs;
+    // Head-motion inertia: differentiate the smoothed head/eye pose into
+    // angular velocity + acceleration so the chains LAG fast turns (hair
+    // whips) and get a small flick from quick eye darts. headDriveAccel
+    // clamps the result, so tracker spikes can't explode the sim.
+    const velY = (sm.hY - headPrev.y) / dt, velP = (sm.hP - headPrev.p) / dt;
+    const drive = {
+      velY, velP,
+      alphaY: (velY - headVelPrev.y) / dt, alphaP: (velP - headVelPrev.p) / dt,
+      eyeVX: (sm.eY - eyePrev.x) / dt, eyeVY: (sm.eP - eyePrev.y) / dt,
+    };
+    headPrev.y = sm.hY; headPrev.p = sm.hP;
+    eyePrev.x = sm.eY; eyePrev.y = sm.eP;
+    headVelPrev.y = velY; headVelPrev.p = velP;
+    hairSwayMirror = [];
     for (const sc of springChains) {
       if (gravityStrength <= 0) {
         sc.bone.quaternion.copy(sc.base);   // slider at 0: rest pose
@@ -851,11 +871,12 @@ async function setup3D(three, GLTFLoader, assetUrl, onStatus) {
       sc.bone.getWorldPosition(rigWorld);
       const rootInv = rigRootInv.setFromRotationMatrix(rigRootMat.copy(sc.bone.parent.matrixWorld).invert());
       const lx = rigWorld.x, ly = rigWorld.y, lz = rigWorld.z;
-      math.stepSpringChain(sc.chain, lx, ly, lz, dt, gravityStrength, -sm.hY * 0.02);
+      math.stepSpringChain(sc.chain, lx, ly, lz, dt, gravityStrength, -sm.hY * 0.02, drive);
       // tip offset (world) -> local sway direction
       const tip = sc.chain.pts[sc.chain.pts.length - 1];
       const swayX = Math.max(-1, Math.min(1, (tip.x - lx) * 8));
       const swayZ = Math.max(-1, Math.min(1, (tip.z - lz) * 8));
+      hairSwayMirror.push({ x: +swayX.toFixed(4), z: +swayZ.toFixed(4) });
       rigEuler.set(swayZ * 0.3, 0, -swayX * 0.3, 'YXZ');
       sc.bone.quaternion.copy(sc.base).multiply(rigQuat.setFromEuler(rigEuler));
     }
@@ -938,6 +959,8 @@ async function setup3D(three, GLTFLoader, assetUrl, onStatus) {
     /** Harness probe: interior angle at each side's ELBOW, measured from the
       * driven bones' world positions (upper->elbow vs elbow->wrist-chain end).
       * Returns { L: rad, R: rad }; a side with missing chain bones is absent. */
+    /** Latest per-chain hair/cloth sway ([-1..1] render units) — test mirror. */
+    hairSway() { return hairSwayMirror; },
     armSegmentAngle() {
       const angle = (side) => {
         const upper = rig.arms[side + '-upper'], lower = rig.arms[side + '-lower'], hand = rig.arms[side + '-hand'];
@@ -1512,6 +1535,11 @@ export function createAvatarEngine(opts = {}) {
     armSegmentAngle() {
       if (!g3 || !g3.armSegmentAngle) return null;
       return g3.armSegmentAngle();
+    },
+    /** Latest per-chain hair/cloth sway ([-1..1] render units) — test mirror. */
+    hairSway() {
+      if (!g3 || !g3.hairSway) return [];
+      return g3.hairSway();
     },
     /** Facing evidence (eye/head positions) for the verify harness. */
     facingInfo() { return g3 && g3.facingInfo ? g3.facingInfo() : null; },

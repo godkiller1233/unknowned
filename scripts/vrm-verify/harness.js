@@ -22,11 +22,25 @@ const log = (...a) => { out.textContent += a.join(' ') + '\n'; console.log(...a)
 // Deterministic synthetic tracker: a frontal face + open mouth + one hand.
 // Feeds the exact shape the real MediaPipe tracker produces so every morph /
 // rig consumer downstream is exercised.
-function mkFace() {
+// Head-motion regimes for the hair-inertia check: the face fixture's nose is
+// offset over time to simulate head yaw — 'quiet' (static), 'slowTurn' (small
+// slow oscillation), 'fastTurn' (large rapid oscillation). The hair/cloth
+// chains must lag fast turns decisively more than slow ones and stay near
+// still when the head is quiet.
+const FACE_MOTION = {
+  quiet:    { amp: 0,     period: Infinity },
+  slowTurn: { amp: 0.010, period: 60 },
+  fastTurn: { amp: 0.050, period: 12 },
+};
+const faceMotionKeys = Object.keys(FACE_MOTION);
+const hairSnap = {};   // phase -> { maxX, minX, maxAbs }
+function facePhaseOf(frame) { return faceMotionKeys[Math.floor(frame / 20) % faceMotionKeys.length]; }
+
+function mkFace(noseDx = 0) {
   const pts = Array.from({ length: 478 }, () => ({ x: 0.5, y: 0.6, z: 0 }));
   pts[33] = { x: 0.435, y: 0.4, z: 0 };
   pts[263] = { x: 0.565, y: 0.4, z: 0 };
-  pts[1] = { x: 0.5, y: 0.4968, z: 0 };
+  pts[1] = { x: 0.5 + noseDx, y: 0.4968, z: 0 };
   pts[152] = { x: 0.5, y: 0.62, z: 0 };
   return pts;
 }
@@ -77,10 +91,11 @@ const syntheticTracker = {
     const phase = ['rest', 'spread', 'bent'][Math.floor(trackerFrame / 15) % 3];
     // Sample 15 frames into each phase: the driver's smoothing has settled
     // and the snapshot reflects THAT phase's pose deterministically.
-    // Sample late in each phase (12 of 15 frames in): the elbow-bend EMA/slew
-    // smoother needs ~200ms to converge, and sampling is time-based so this
-    // holds at any render fps.
-    if (trackerFrame % 15 === 13 && engRef) {
+    // Sample the LATE third of each body phase (frames 10-14 of 15): the
+    // elbow-bend EMA/slew smoother needs ~200ms to converge, and sampling
+    // every late frame (first capture wins) stays robust when software-GL
+    // rendering is slow and a fixed frame index might never be hit.
+    if (trackerFrame % 15 >= 10 && engRef) {
       const w = engRef.armRig;            // getter -> { 'L-upper': [x,y,z,w], ... } | null
       if (w && Object.keys(w).length && !armSnap[phase]) armSnap[phase] = w;
       // Per-segment evidence: the angle BETWEEN the upper and lower world
@@ -89,8 +104,22 @@ const syntheticTracker = {
       const seg = engRef.armSegmentAngle ? engRef.armSegmentAngle() : null;
       if (seg && !armSegSnap[phase]) armSegSnap[phase] = seg;
     }
+    // Head-yaw modulation: nose offset oscillates per the face phase (yaw is
+    // driven by nose-vs-eye-midpoint, so a nose offset reads as a head turn).
+    const fm = FACE_MOTION[facePhaseOf(trackerFrame)];
+    const noseDx = fm.period === Infinity ? 0 : fm.amp * Math.sin(2 * Math.PI * trackerFrame / fm.period);
+    // Hair-sway snapshot across the LATE HALF of each face phase (max-abs
+    // accumulates), robust to slow rendering.
+    if (trackerFrame % 20 >= 12 && engRef && engRef.hairSway) {
+      const sway = engRef.hairSway();
+      if (sway.length) {
+        const maxX = Math.max(...sway.map(v => Math.abs(v.x)));
+        if (!hairSnap[facePhaseOf(trackerFrame)]) hairSnap[facePhaseOf(trackerFrame)] = maxX;
+        else hairSnap[facePhaseOf(trackerFrame)] = Math.max(hairSnap[facePhaseOf(trackerFrame)], maxX);
+      }
+    }
     return {
-      landmarks: mkFace(),
+      landmarks: mkFace(noseDx),
       blends: { jawOpen: 0.6, eyeBlinkL: 0.1, eyeBlinkR: 0.1, mouthSmileL: 0.3, mouthSmileR: 0.3, browInnerUp: 0.4 },
       hands: [{ label: 'Right', landmarks: mkHand() }],
       body: BODY_PHASES[phase],
@@ -127,8 +156,16 @@ async function run() {
     // target frame count, with a time cap so slow software-GL machines still
     // finish (throughput varies; the assertion checks rendering, not speed).
     {
+      // Wait until every sampled phase actually captured data (body rest +
+      // spread + bent, and all three face-motion phases when the model has
+      // hair chains) — NOT a fixed frame count, so slow software-GL machines
+      // still produce complete evidence. Time-capped as a stall backstop.
       const t0 = Date.now();
-      while (eng.framesRendered < 60 && Date.now() - t0 < 12000) await new Promise(r => setTimeout(r, 100));
+      const wantsHair = eng.hairChainCount > 0;
+      const complete = () =>
+        armSnap.rest && armSnap.spread && armSegSnap.bent &&
+        (!wantsHair || (hairSnap.quiet != null && hairSnap.slowTurn != null && hairSnap.fastTurn != null));
+      while (!complete() && Date.now() - t0 < 20000) await new Promise(r => setTimeout(r, 100));
     }
 
     const info = eng.rigInfo || {};
@@ -154,6 +191,7 @@ async function run() {
       facing: eng.facingInfo ? eng.facingInfo() : null,
       armSeg: armSegSnap,
       armSnap,
+      hairSway: hairSnap,
       bodyRig: eng.bodyRig ? eng.bodyRig.map(p => ({ visible: !!p.visible })) : null,
       frames: eng.framesRendered,
     };

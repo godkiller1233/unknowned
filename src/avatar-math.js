@@ -460,9 +460,38 @@ export function createSpringChain(n, segLen) {
   return { pts, segLen, init: false };
 }
 
+// Tuning constants for head-driven hair/cloth swing (see headDriveAccel).
+// Gains convert head ANGULAR motion (rad/s, rad/s^2) into lateral chain
+// acceleration (m/s^2) at the hair root's distance from the head pivot.
+export const HEAD_SWING_GAIN = 0.12;    // angular accel -> lag accel
+export const HEAD_VEL_DAMP = 0.9;       // angular vel -> drag accel
+export const EYE_KICK_GAIN = 0.05;      // eye angular vel -> small kick
+export const HEAD_PIVOT_RADIUS = 0.12;  // hair root ~12cm from head pivot
+export const SWING_MAX_ACCEL = 60;      // clamp so a tracker spike can't explode the chain
+
+/**
+ * LAG acceleration for hair/cloth chains caused by head motion. When the head
+ * accelerates, attached hair/cloth should lag BEHIND it — the returned
+ * acceleration points OPPOSITE the head's angular acceleration (plus a
+ * velocity-proportional drag term so constant-rate turns still sway, and a
+ * small eye-dart kick so quick glances flick the front hair). `d` fields are
+ * all angular: velY/alphaY (yaw, swings hair sideways), velP/alphaP (pitch,
+ * swings it forward/back), eyeVX/eyeVY (eye angular velocity). Returns world
+ * axes: ax from yaw+eyeX, az from pitch+eyeY (ay stays gravity's job).
+ * Null/absent drive -> zero accel (chain just hangs).
+ */
+export function headDriveAccel(d) {
+  const r = HEAD_PIVOT_RADIUS;
+  const lim = (v) => clamp(Number(v) || 0, -SWING_MAX_ACCEL, SWING_MAX_ACCEL);
+  if (!d) return { ax: 0, ay: 0, az: 0 };
+  const ax = -lim(r * (HEAD_SWING_GAIN * (d.alphaY || 0) + HEAD_VEL_DAMP * (d.velY || 0) + EYE_KICK_GAIN * (d.eyeVX || 0)));
+  const az = -lim(r * (HEAD_SWING_GAIN * (d.alphaP || 0) + HEAD_VEL_DAMP * (d.velP || 0) + EYE_KICK_GAIN * (d.eyeVY || 0)));
+  return { ax, ay: 0, az };
+}
+
 // Advance one chain: root pinned to the (moving) attach point `ax,ay,az`;
 // gravity = 9.8 * strength (model units ~ meters). `dt` clamped by the caller.
-export function stepSpringChain(chain, ax, ay, az, dt, strength, swayX = 0) {
+export function stepSpringChain(chain, ax, ay, az, dt, strength, swayX = 0, drive = null) {
   const pts = chain.pts, n = pts.length;
   if (!chain.init) {
     chain.init = true;
@@ -479,14 +508,18 @@ export function stepSpringChain(chain, ax, ay, az, dt, strength, swayX = 0) {
     return;
   }
   const g = 9.8 * strength;
+  // Head-motion lag (see headDriveAccel): acceleration applied to every free
+  // point alongside gravity, so fast head turns whip the hair and eye darts
+  // flick it. Zero when no drive is supplied (rest behavior unchanged).
+  const drv = headDriveAccel(drive);
   for (let i = 1; i < n; i++) {
     const p = pts[i];
     // verlet integrate: next = pos + (pos - prev) * drag + a*dt^2
     const vx = (p.x - p.px) * 0.985, vy = (p.y - p.py) * 0.985, vz = (p.z - p.pz) * 0.985;
     p.px = p.x; p.py = p.y; p.pz = p.z;
-    p.x += vx + swayX * dt * dt;
-    p.y += vy - g * dt * dt;
-    p.z += vz;
+    p.x += vx + (swayX + drv.ax) * dt * dt;
+    p.y += vy - g * dt * dt + drv.ay * dt * dt;
+    p.z += vz + drv.az * dt * dt;
   }
   pts[0].x = ax; pts[0].y = ay; pts[0].z = az;
   // Distance constraints — plain position relax (PBD style). The position-only
