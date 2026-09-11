@@ -81,9 +81,15 @@ export function createAudioRelayReceiver() {
     dest = ctx.createMediaStreamDestination();
   } catch { /* decode impossible — caller falls back to silence */ }
 
-  async function absorb(b64) {
+  async function absorb(b64, { first = false } = {}) {
     if (stopped || !ctx) return;
     let bytes = new Uint8Array(base64ToBuffer(b64));
+    // Re-seed when a receiver joins after the sender has already started.
+    if (first) {
+      header = bytes;
+      playAt = 0;
+      return;
+    }
     if (!header) {
       // The very first chunk must carry the container header; if we joined
       // mid-stream, skip until a fresh sender restarts (new call/mic burst).

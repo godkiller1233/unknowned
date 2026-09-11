@@ -585,6 +585,7 @@ function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClo
   const peerCtx = useRef(null);
   const peerAnalyser = useRef(null);
   const peerStream = useRef(null);
+  const relayTimerRef = useRef(0);
 
   // Start/stop the socket-relayed audio path. Idempotent; safe to call twice.
   function startAudioRelay() {
@@ -646,7 +647,7 @@ function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClo
     const onChunk = d => {
       if (!isThisCall(d)) return;
       const rx = relayReceiverRef.current;
-      if (rx && d?.data) rx.absorb(d.data).catch(() => {});
+      if (rx && d?.data) rx.absorb(d.data, { first: d.first === true }).catch(() => {});
     };
     const onMute    = d => { if (!isThisCall(d) || (d.from && d.from !== targetUser?.id)) return; setRemoteMuted(d.muted === true); };
     const onCam     = d => {
@@ -710,18 +711,37 @@ function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClo
       stream.getTracks().forEach(t => pc.addTrack(t, stream));
 
       // If the direct link is not connectable, degrade to the phone-call path
-      // instead of leaving both sides staring at "connecting…" forever.
-      const relayTimer = setTimeout(() => {
-        if (pcRef.current === pc && pc.connectionState !== 'connected' && !audioRelay) startAudioRelay();
-      }, 12000);
-      pc.addEventListener('connectionstatechange', () => {
-        clearTimeout(relayTimer);
-        if (pc.connectionState === 'connected') {
+      // instead of leaving both sides staring at "connecting…" forever. Do not
+      // cancel this watchdog on the normal `new → connecting` transition: the
+      // old implementation did that, so a peer that stayed stuck in `checking`
+      // never entered relay mode at all.
+      const scheduleRelayFallback = (delay = 12000) => {
+        clearTimeout(relayTimerRef.current);
+        relayTimerRef.current = setTimeout(() => {
+          relayTimerRef.current = 0;
+          if (pcRef.current === pc && pc.connectionState !== 'connected' && !relaySenderRef.current) startAudioRelay();
+        }, delay);
+      };
+      scheduleRelayFallback();
+      const onTransportState = () => {
+        const state = pc.connectionState;
+        const ice = pc.iceConnectionState;
+        if (state === 'connected' || ice === 'connected' || ice === 'completed') {
+          clearTimeout(relayTimerRef.current);
+          relayTimerRef.current = 0;
           stopAudioRelay(); // real link came up (or recovered) — P2P wins
-        } else if (pc.connectionState === 'failed') {
+        } else if (state === 'failed' || ice === 'failed') {
+          clearTimeout(relayTimerRef.current);
+          relayTimerRef.current = 0;
           startAudioRelay();
+        } else if (state === 'disconnected' || ice === 'disconnected') {
+          // A brief disconnect can recover, but don't wait forever when the
+          // browser never emits `failed` (common on mobile/cellular networks).
+          scheduleRelayFallback(3000);
         }
-      });
+      };
+      pc.addEventListener('connectionstatechange', onTransportState);
+      pc.addEventListener('iceconnectionstatechange', onTransportState);
 
       pc.ontrack = e => {
         if (remoteRef.current) remoteRef.current.srcObject = e.streams[0];
@@ -850,6 +870,8 @@ function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClo
     camStreamRef.current?.getTracks().forEach(t => t.stop());
     camStreamRef.current = null;
     streamRef.current?.getTracks().forEach(t => t.stop());
+    clearTimeout(relayTimerRef.current);
+    relayTimerRef.current = 0;
     pcRef.current?.close();
     pcRef.current = null;
   }
@@ -6256,7 +6278,10 @@ function App() {
   const [newGroupModal, setNewGroupModal] = useState(false);
   const [createGroupName, setCreateGroupName] = useState('');
   const [createGroupMembers, setCreateGroupMembers] = useState([]);
-  const socket = useMemo(() => io({ autoConnect: false, transports: ['websocket'] }), []);
+  // Prefer WebSocket, but allow Socket.IO polling to establish the signaling
+  // connection when a restrictive network blocks upgrades. Calls cannot work
+  // if the authenticated signaling socket never connects.
+  const socket = useMemo(() => io({ autoConnect: false, transports: ['websocket', 'polling'], upgrade: true }), []);
 
   useEffect(() => { applyTheme(theme); localStorage.theme = theme; }, [theme]);
 

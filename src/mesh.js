@@ -59,6 +59,17 @@ export function createVoiceMesh({ socket, channelId, me, onRoster, onRemoteStrea
     for (const rx of relayReceivers.values()) rx.stop();
     relayReceivers.clear();
   }
+
+  // Keep the shared relay alive while any group peer still needs it.
+  function stopRelayIfEveryoneIsDirect() {
+    if (!relaySender) return;
+    const needsRelay = [...peers.values()].some(entry => {
+      const state = entry.pc.connectionState;
+      const ice = entry.pc.iceConnectionState;
+      return !entry.live && state !== 'connected' && state !== 'completed' && ice !== 'connected' && ice !== 'completed';
+    });
+    if (!needsRelay) stopRelay();
+  }
   function peerRelayReceiver(socketId) {
     let rx = relayReceivers.get(socketId);
     if (!rx) {
@@ -158,8 +169,13 @@ export function createVoiceMesh({ socket, channelId, me, onRoster, onRemoteStrea
         const rx = relayReceivers.get(entry.socketId);
         if (rx) { rx.stop(); relayReceivers.delete(entry.socketId); }
         if (!entry.live) { entry.live = true; onRemoteStream?.(entry.socketId); }
+        stopRelayIfEveryoneIsDirect();
         publish();
       } else if ((state === 'failed' || state === 'closed') && !entry.live) {
+        // Definite ICE failure should enter phone-call mode immediately; the
+        // watchdog below still covers browsers stuck in `checking`.
+        startRelay();
+        peerRelayReceiver(entry.socketId);
         // Transient ICE failure — retry the pair a couple of times, then give
         // up until a roster refresh (someone joins/leaves) restarts it.
         if (entry.failedTimer || entry.retries >= MAX_OFFER_RETRIES) return;
@@ -334,7 +350,7 @@ export function createVoiceMesh({ socket, channelId, me, onRoster, onRemoteStrea
   socket.on('voice_camera', onCameraEv);
   const onChunk = d => {
     if (!isOurs(d) || isSelf(d.fromSocketId) || !d?.data) return;
-    peerRelayReceiver(d.fromSocketId).absorb(d.data).catch(() => {});
+    peerRelayReceiver(d.fromSocketId).absorb(d.data, { first: d.first === true }).catch(() => {});
   };
   socket.on('voice_rtc_offer', onOfferEv);
   socket.on('voice_rtc_answer', onAnswerEv);
