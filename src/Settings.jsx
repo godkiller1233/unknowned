@@ -624,17 +624,31 @@ export default function Settings({ me, boot, onClose, onSave, currentTheme, onTh
   const camPreviewRef = useRef(null);
   const micRafRef = useRef(null);
   const micCtxRef = useRef(null);
+  const micRecorderRef = useRef(null);
+  const micChunksRef = useRef([]);
+  const micPlaybackRef = useRef(null);
   const [micTesting, setMicTesting] = useState(false);
   const [camOn, setCamOn] = useState(false);
 
-  function stopMicTestStream() {
-    micStreamRef.current?.getTracks().forEach(t => t.stop());
+  function clearMicCapture() {
+    micStreamRef.current?.getTracks().forEach(t => { try { t.stop(); } catch {} });
     micStreamRef.current = null;
+    micRecorderRef.current = null;
+    micChunksRef.current = [];
     setMicTesting(false);
     if (micRafRef.current) { cancelAnimationFrame(micRafRef.current); micRafRef.current = null; }
     if (micLevelRef.current) micLevelRef.current.style.width = '0%';
     try { micCtxRef.current?.close(); } catch {}
     micCtxRef.current = null;
+  }
+
+  function stopMicTestStream() {
+    const recorder = micRecorderRef.current;
+    if (recorder && recorder.state !== 'inactive') {
+      try { recorder.stop(); } catch {}
+      return;
+    }
+    clearMicCapture();
   }
 
   function stopCamPreview() {
@@ -689,15 +703,55 @@ export default function Settings({ me, boot, onClose, onSave, currentTheme, onTh
     notify('Saved on this device');
   }
 
-  // Show a live input-level bar through the chosen microphone for ~4s.
+  // Record a short clip, send it through the authenticated server loopback,
+  // then play the returned bytes through the selected speaker. This tests the
+  // complete path rather than only proving that the browser can see a meter.
   async function testMic() {
     if (micStreamRef.current) { stopMicTestStream(); return; }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: mediaPrefs.mic ? { deviceId: { exact: mediaPrefs.mic } } : true,
       });
+      const mime = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/mp4']
+        .find(m => typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(m)) || '';
+      const recorder = new MediaRecorder(stream, mime ? { mimeType: mime, audioBitsPerSecond: 64000 } : undefined);
       micStreamRef.current = stream;
+      micRecorderRef.current = recorder;
+      micChunksRef.current = [];
       setMicTesting(true);
+      recorder.ondataavailable = e => { if (e.data?.size) micChunksRef.current.push(e.data); };
+      recorder.onstop = async () => {
+        const chunks = micChunksRef.current.slice();
+        const blob = new Blob(chunks, { type: recorder.mimeType || mime || 'audio/webm' });
+        clearMicCapture();
+        if (!blob.size) { notify('The microphone returned an empty recording', true); return; }
+        setMediaStatus('Sending your recording through the server…');
+        try {
+          const token = sessionStorage.token || localStorage.rememberToken || '';
+          const contentType = String(blob.type || 'audio/webm').split(';')[0];
+          const response = await fetch('/api/me/mic-test', {
+            method: 'POST',
+            headers: { 'Content-Type': contentType, Authorization: 'Bearer ' + token },
+            body: await blob.arrayBuffer(),
+          });
+          if (!response.ok) {
+            const detail = await response.json().catch(() => ({}));
+            throw new Error(detail.error || 'Server loopback failed');
+          }
+          const returned = await response.blob();
+          const url = URL.createObjectURL(returned);
+          const audio = new Audio(url);
+          micPlaybackRef.current = audio;
+          if (mediaPrefs.speaker && typeof audio.setSinkId === 'function') await audio.setSinkId(mediaPrefs.speaker).catch(() => {});
+          audio.onended = () => { URL.revokeObjectURL(url); if (micPlaybackRef.current === audio) micPlaybackRef.current = null; };
+          await audio.play();
+          setMediaStatus('✅ Server returned your recording — listen for your voice now.');
+          notify('Your mic recording came back from the server and is playing.');
+        } catch (err) {
+          setMediaStatus('');
+          notify(err?.message || 'Could not complete the server microphone test', true);
+        }
+      };
       const Ctx = window.AudioContext || window.webkitAudioContext;
       const ctx = new Ctx();
       micCtxRef.current = ctx;
@@ -709,18 +763,17 @@ export default function Settings({ me, boot, onClose, onSave, currentTheme, onTh
         if (!micStreamRef.current) return;
         analyser.getByteTimeDomainData(data);
         let peak = 0;
-        for (let i = 0; i < data.length; i++) {
-          const v = Math.abs(data[i] - 128) / 128;
-          if (v > peak) peak = v;
-        }
+        for (let i = 0; i < data.length; i++) peak = Math.max(peak, Math.abs(data[i] - 128) / 128);
         if (micLevelRef.current) micLevelRef.current.style.width = Math.min(100, Math.round(peak * 320)) + '%';
         micRafRef.current = requestAnimationFrame(tick);
       };
       micRafRef.current = requestAnimationFrame(tick);
-      setTimeout(stopMicTestStream, 4000);
-      notify('Speak now — watch the meter', false);
-    } catch {
-      notify('Could not start that microphone', true);
+      recorder.start();
+      setTimeout(() => { if (micRecorderRef.current === recorder && recorder.state !== 'inactive') recorder.stop(); }, 4000);
+      notify('Speak for up to 4 seconds — your recording will return from the server.', false);
+    } catch (err) {
+      clearMicCapture();
+      notify(String(err?.name || '').includes('NotAllowed') ? 'Microphone permission is blocked. Allow it, then try again.' : 'Could not start that microphone', true);
     }
   }
 
@@ -1387,10 +1440,11 @@ export default function Settings({ me, boot, onClose, onSave, currentTheme, onTh
               <hr className="settings-hr" />
               <h3>Test your setup</h3>
               <div className="settings-toggle-row" style={{ flexWrap: 'wrap', gap: '.5rem' }}>
-                <button onClick={testMic}>{micTesting ? '⏹ Stop test' : '🎤 Test microphone'}</button>
+                <button onClick={testMic}>{micTesting ? '⏹ Finish mic test' : '🎤 Record → server → replay'}</button>
                 <button onClick={testSpeaker}>🔊 Test speaker</button>
                 <button onClick={toggleCameraPreview}>{camOn ? '⏹ Stop camera' : '📷 Preview camera'}</button>
               </div>
+              <p className="muted-text" style={{ fontSize: '.8rem', margin: '.45rem 0 0' }}>This records up to 4 seconds, sends it to the server, receives it back, and plays it through the selected speaker. Nothing is saved.</p>
               <div className="mic-level-track" style={{ height: 10, borderRadius: 5, background: 'var(--bg)', border: '1px solid var(--border)', overflow: 'hidden', marginTop: '.6rem' }}>
                 <div ref={micLevelRef} className="mic-level-fill" style={{ width: '0%', height: '100%', background: micTesting ? 'var(--brand, #5865f2)' : 'var(--border)', transition: 'width 60ms linear' }} />
               </div>

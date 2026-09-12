@@ -9,8 +9,11 @@ import { mediaConstraints, applySpeakerSink, loadMediaPrefs, isVirtualCamLabel, 
 import { loadAvatarConfig, getAvatarFile, loadCalibration, onCalibrationChanged, canUseVrmAvatar, isVrmAssetName } from './avatar-store.js';
 import { createAvatarEngine } from './avatar-engine.js';
 import { createVoiceMesh } from './mesh.js';
+import { applyRtcConfig } from './rtc.js';
 import { createCallNegotiator } from './call-negotiation.js';
 import { createAudioRelaySender, createAudioRelayReceiver } from './audio-relay.js';
+import MultiplayerGame from './MultiplayerGame.jsx';
+import InviteCard from './InviteCard.jsx';
 
 // ── Avatar virtual camera (one live session at a time) ───────────────────────
 // When avatar mode is on, video surfaces send this engine's canvas stream — a
@@ -331,6 +334,14 @@ function Attachment({ url, name, mime }) {
 // External images (attachments or pasted links) render through the server's
 // img-proxy: the CSP only allows 'self' images, and proxying keeps rendering
 // working even when the source host blocks hotlinking or dies.
+function inviteCodeFromUrl(value) {
+  try {
+    const u = new URL(value, location.origin);
+    const path = u.pathname.match(/^\/invite\/([^/]+)\/?$/i);
+    return path ? decodeURIComponent(path[1]) : (u.searchParams.get('invite') || '');
+  } catch { return ''; }
+}
+
 function proxiedImgSrc(url) {
   try {
     const u = new URL(url, location.origin);
@@ -362,7 +373,7 @@ function ProbableImage({ url, link }) {
 }
 
 // ── MsgBody (ping highlights + easter egg) ────────────────────────────────────
-function MsgBody({ text, me }) {
+function MsgBody({ text, me, onInvite }) {
   const [revealed, setRevealed] = useState(() => new Set());
   if (!text) return null;
   const tokens = text.split(/(```[\s\S]*?```|\|\|[\s\S]*?\|\||https?:\/\/[^\s]+|:[a-z0-9_]{2,24}:|@[\w-]+)/g);
@@ -370,6 +381,8 @@ function MsgBody({ text, me }) {
     if (p.startsWith('```')) return <code key={i} className="code-block">{p.slice(3,-3).replace(/^\w+\n/,'')}</code>;
     if (p.startsWith('||') && p.endsWith('||')) return <button key={i} type="button" className={`spoiler${revealed.has(i) ? ' revealed' : ''}`} title={revealed.has(i) ? 'Hide spoiler' : 'Reveal spoiler'} aria-label={revealed.has(i) ? 'Hide spoiler' : 'Reveal spoiler'} onClick={() => setRevealed(prev => { const next = new Set(prev); next.has(i) ? next.delete(i) : next.add(i); return next; })}>{p.slice(2,-2)}</button>;
     if (/^https?:\/\//.test(p)) {
+      const inviteCode = inviteCodeFromUrl(p);
+      if (inviteCode) return <InviteCard key={i} invite={{ code: inviteCode }} onJoin={onInvite} />;
       const link = <a key={i} href={p} target="_blank" rel="noopener noreferrer" className="message-link">{p}</a>;
       // Same-origin upload links and image URLs on other hosts both render as
       // images automatically (external ones through /api/img-proxy — the CSP
@@ -538,7 +551,13 @@ let rtcServers = [{ urls: ['stun:stun.l.google.com:19302'] }];
 function rememberRtcServers(boot) {
   const servers = boot && boot.rtc && Array.isArray(boot.rtc.iceServers) && boot.rtc.iceServers.length
     ? boot.rtc.iceServers : null;
-  if (servers) rtcServers = servers;
+  if (servers) {
+    rtcServers = servers;
+    // Keep the shared mesh engine on the same ICE configuration as DM calls.
+    // Without this, group voice/video silently fell back to STUN-only even
+    // though the DM negotiator had the operator's TURN relay.
+    applyRtcConfig(boot);
+  }
   return rtcServers;
 }
 function rtcIceServers() { return rtcServers; }
@@ -557,25 +576,16 @@ function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClo
   const [peerMic, setPeerMic] = useState('idle');
   // True when the other participant signaled they muted their mic (call_mute).
   const [remoteMuted, setRemoteMuted] = useState(false);
-  // Camera: am I sending video, and is a video track actually flowing back?
-  const [camOn, setCamOn] = useState(false);
-  const [camBusy, setCamBusy] = useState(false);
-  const [camWarn, setCamWarn] = useState('');
-  // null (never told) | true | false — peer's signaled camera state (call_camera).
-  const [remoteCam, setRemoteCam] = useState(null);
+  // Kept only for cleanup compatibility; video chat is intentionally disabled.
   // Phone-call fallback: when the direct WebRTC link fails (strict NAT), audio
   // rides the socket connection through the server instead. Video stays P2P-only.
   const [audioRelay, setAudioRelay] = useState(false);
+  const [needsAudioGesture, setNeedsAudioGesture] = useState(false);
   const relaySenderRef = useRef(null);
   const relayReceiverRef = useRef(null);
   const relaySeqRef = useRef(0);
-  const [remoteVid, setRemoteVid] = useState(false);
-  // True when the avatar canvas (not the real camera) is what we send.
-  const [avatarLive, setAvatarLive] = useState(false);
   const localRef  = useRef(null);
   const remoteRef = useRef(null);
-  const localVidRef  = useRef(null);
-  const remoteVidRef = useRef(null);
   const streamRef = useRef(null);
   const camStreamRef = useRef(null);
   const pcRef     = useRef(null);
@@ -603,6 +613,7 @@ function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClo
     relayReceiverRef.current = createAudioRelayReceiver();
     if (relayReceiverRef.current.stream && remoteRef.current && !remoteRef.current.srcObject) {
       remoteRef.current.srcObject = relayReceiverRef.current.stream;
+      remoteRef.current.play().catch(() => setNeedsAudioGesture(true));
       startPeerMonitor(relayReceiverRef.current.stream);
     }
     setAudioRelay(true);
@@ -650,12 +661,6 @@ function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClo
       if (rx && d?.data) rx.absorb(d.data, { first: d.first === true }).catch(() => {});
     };
     const onMute    = d => { if (!isThisCall(d) || (d.from && d.from !== targetUser?.id)) return; setRemoteMuted(d.muted === true); };
-    const onCam     = d => {
-      if (!isThisCall(d) || (d.from && d.from !== targetUser?.id)) return;
-      if (d.on === true) setRemoteCam(true);
-      else { setRemoteCam(false); setRemoteVid(false); }
-    };
-
     socket.on('call_accept',  onAccept);
     socket.on('call_decline', onDecline);
     socket.on('call_end',     onEnd);
@@ -663,7 +668,6 @@ function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClo
     socket.on('rtc_answer',   onAnswer);
     socket.on('rtc_ice',      onIce);
     socket.on('call_mute',    onMute);
-    socket.on('call_camera',  onCam);
     socket.on('audio_chunk',  onChunk);
 
     if (!incoming) startCall(true);
@@ -676,7 +680,6 @@ function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClo
       socket.off('rtc_answer', onAnswer);
       socket.off('rtc_ice', onIce);
       socket.off('call_mute', onMute);
-      socket.off('call_camera', onCam);
       socket.off('audio_chunk', onChunk);
       stopAudioRelay();
       cleanup();
@@ -744,13 +747,11 @@ function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClo
       pc.addEventListener('iceconnectionstatechange', onTransportState);
 
       pc.ontrack = e => {
-        if (remoteRef.current) remoteRef.current.srcObject = e.streams[0];
-        startPeerMonitor(e.streams[0]);
-        const vt = e.streams[0]?.getVideoTracks?.();
-        if (vt && vt.length) {
-          setRemoteVid(true);
-          vt.forEach(t => { try { t.addEventListener('ended', () => setRemoteVid(false), { once: true }); } catch {} });
+        if (remoteRef.current) {
+          remoteRef.current.srcObject = e.streams[0];
+          remoteRef.current.play().catch(() => setNeedsAudioGesture(true));
         }
+        startPeerMonitor(e.streams[0]);
       };
 
       // Perfect-negotiation state machine: serializes camera (and ICE-restart)
@@ -782,15 +783,26 @@ function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClo
 
   // Route the caller's audio to the speaker the user picked in Settings, and
   // start watching their mic if a stream is already attached when we connect.
+  async function unlockCallAudio() {
+    const audio = remoteRef.current;
+    if (!audio) return;
+    try {
+      await audio.play();
+      setNeedsAudioGesture(false);
+    } catch {
+      setNeedsAudioGesture(true);
+    }
+  }
+
   useEffect(() => {
     if (status === 'connected' || audioRelay) {
       const s = remoteRef.current?.srcObject;
       if (s) startPeerMonitor(s);
+      unlockCallAudio();
     } else if (status === 'micblocked') {
       stopPeerMonitor();
     }
     if (remoteRef.current) applySpeakerSink(remoteRef.current, loadMediaPrefs().speaker);
-    if (remoteVidRef.current) applySpeakerSink(remoteVidRef.current, loadMediaPrefs().speaker);
   }, [status, audioRelay]);
 
   // Watch the remote audio track and flip the indicator when they actually speak.
@@ -837,8 +849,12 @@ function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClo
   }
 
   function accept() {
+    // On iOS/Android, accepting is the required user gesture that unlocks
+    // remote audio playback. Keep the call audio-only and retry playback after
+    // the remote stream is attached.
+    setNeedsAudioGesture(false);
     setStatus('connecting');
-    startCall(false, initialOffer);
+    startCall(false, initialOffer).then(unlockCallAudio).catch(() => {});
   }
 
   function decline() {
@@ -893,149 +909,14 @@ function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClo
     return () => socket.off('connect', resend);
   }, [socket, muted, targetUser?.id, dmId]);
 
-  // Camera on/off mid-call. We use the saved camera device (Settings → Voice &
-  // Video), swap the video sender's track, and let the perfect-negotiation
-  // machine push the renegotiation. The peer learns our state via call_camera.
-  async function enableCam() {
-    setCamWarn('');
-    // External app mode: transmit the chosen app's virtual camera (VTube
-    // Studio / OBS / Snap…) directly instead of our avatar engine.
-    if (loadAvatarConfig().mode === 'external') {
-      const ext = await externalVideoStream();
-      if (!ext || !ext.getVideoTracks().length) {
-        setCamWarn('🧪 No external app camera feed found. Start VTube Studio / OBS / Snap Camera with its virtual camera on, pick that device in Settings → Voice & Video → External app, then try again.');
-        return;
-      }
-      try {
-        const local = streamRef.current;
-        const vtrackE = ext.getVideoTracks()[0];
-        if (local && !local.getVideoTracks().includes(vtrackE)) { try { local.addTrack(vtrackE); } catch {} }
-        camStreamRef.current = ext;
-        const pc = pcRef.current;
-        if (pc) {
-          const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
-          if (sender) await sender.replaceTrack(vtrackE);
-          else pc.addTrack(vtrackE, local || ext);
-        }
-        if (localVidRef.current) localVidRef.current.srcObject = local || ext;
-        setCamOn(true);
-        setAvatarLive(false);
-        negotiatorRef.current?.markDirty();
-        if (socket.connected) socket.emit('call_camera', { toUserId: targetUser?.id, dmId, on: true });
-        return;
-      } catch {
-        ext.getTracks().forEach(t => t.stop());
-        camStreamRef.current = null;
-        setCamWarn('🧪 Could not start the external app camera. Try again.');
-        return;
-      }
-    }
-    // Avatar mode first: the canvas track of the avatar engine replaces the
-    // real camera. The webcam is only ever used locally for tracking.
-    let vtrack = null;
-    try { vtrack = await openAvatarTrack({ micStream: streamRef.current }); }
-    catch { /* avatar startup failed — fall through to the real camera */ }
-    if (vtrack) {
-      try {
-        const pc = pcRef.current;
-        if (pc) {
-          const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
-          if (sender) await sender.replaceTrack(vtrack);
-          else pc.addTrack(vtrack, streamRef.current || liveAvatarStream());
-        }
-        if (localVidRef.current) localVidRef.current.srcObject = liveAvatarStream();
-        setCamOn(true);
-        setAvatarLive(true);
-        negotiatorRef.current?.markDirty();
-        if (socket.connected) socket.emit('call_camera', { toUserId: targetUser?.id, dmId, on: true });
-        return;
-      } catch {
-        closeAvatarTrack();
-        setAvatarLive(false);
-        setCamWarn('🤖 Could not start your avatar. Try again.');
-        return;
-      }
-    }
-    let stream;
-    try {
-      stream = await navigator.mediaDevices.getUserMedia(mediaConstraints('camera'));
-    } catch (err) {
-      const name = err?.name || '';
-      setCamWarn(name === 'NotAllowedError' || name === 'PermissionDeniedError' || name === 'SecurityError'
-        ? '📷 Camera permission is blocked. Allow camera access for this site, then try again.'
-        : (name === 'NotFoundError' || name === 'OverconstrainedError' || name === 'DevicesNotFoundError')
-          ? '📷 No camera found. Pick one in Settings → Voice & Video.'
-          : '📷 Could not start your camera. Try again.');
-      return;
-    }
-    const vtrack2 = stream.getVideoTracks()[0];
-    if (!vtrack2) {
-      stream.getTracks().forEach(t => t.stop());
-      setCamWarn('📷 No camera found. Pick one in Settings → Voice & Video.');
-      return;
-    }
-    try {
-      const local = streamRef.current;
-      if (local && !local.getVideoTracks().includes(vtrack2)) { try { local.addTrack(vtrack2); } catch {} }
-      camStreamRef.current = stream;
-      const pc = pcRef.current;
-      if (pc) {
-        const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
-        if (sender) await sender.replaceTrack(vtrack2);
-        else pc.addTrack(vtrack2, local || stream);
-      }
-      if (localVidRef.current) localVidRef.current.srcObject = local || stream;
-      setCamOn(true);
-      setAvatarLive(false);
-      negotiatorRef.current?.markDirty();
-      if (socket.connected) socket.emit('call_camera', { toUserId: targetUser?.id, dmId, on: true });
-    } catch {
-      stream.getTracks().forEach(t => t.stop());
-      camStreamRef.current = null;
-      setCamWarn('📷 Could not turn the camera on. Try again.');
-    }
-  }
-
-  async function disableCam() {
-    setCamOn(false);
-    setCamWarn('');
-    setAvatarLive(false);
-    closeAvatarTrack();
-    if (localVidRef.current) localVidRef.current.srcObject = null;
-    try {
-      const pc = pcRef.current;
-      const sender = pc?.getSenders().find(s => s.track && s.track.kind === 'video');
-      if (sender) await sender.replaceTrack(null);
-      negotiatorRef.current?.markDirty();
-    } catch {}
-    const local = streamRef.current;
-    if (local) local.getVideoTracks().forEach(t => { try { local.removeTrack(t); } catch {} });
-    camStreamRef.current?.getTracks().forEach(t => t.stop());
-    camStreamRef.current = null;
-    if (socket.connected) socket.emit('call_camera', { toUserId: targetUser?.id, dmId, on: false });
-  }
-
-  async function toggleCam() {
-    if (camBusy) return;
-    setCamBusy(true);
-    try { if (camOn) await disableCam(); else await enableCam(); }
-    finally { setCamBusy(false); }
-  }
-
-  // If the socket dropped mid-negotiation, recover the media path with an
-  // ICE restart once we're back, and re-announce our camera state.
+  // If the socket dropped mid-negotiation, recover the audio path with an ICE
+  // restart once we're back.
   useEffect(() => {
     if (!socket) return undefined;
-    const resend = () => {
-      if (!pcRef.current || !negotiatorRef.current) return;
-      if (socket.connected) {
-        negotiatorRef.current.restart();
-        if (camOn) socket.emit('call_camera', { toUserId: targetUser?.id, dmId, on: true });
-      }
-    };
+    const resend = () => { if (pcRef.current && negotiatorRef.current && socket.connected) negotiatorRef.current.restart(); };
     socket.on('connect', resend);
     return () => socket.off('connect', resend);
-  }, [socket, camOn, targetUser?.id, dmId]);
+  }, [socket]);
 
   const micWarn = micIssue
     ? micIssue === 'denied' ? 'Microphone permission is blocked, so the call can’t start. Allow mic access for this site (address-bar icon or OS privacy settings), then retry.'
@@ -1092,16 +973,12 @@ function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClo
           </div>
         )}
         <audio ref={localRef}  autoPlay muted style={{display:'none'}} />
-        <audio ref={remoteRef} autoPlay       style={{display:'none'}} />
-        {status === 'connected' && (camOn || remoteVid || remoteCam === false) && (
-          <div className="call-video-stage">
-            <video ref={remoteVidRef} autoPlay playsInline className={`call-vid-remote${remoteVid ? ' on' : ''}`} />
-            {remoteCam === false && <span className="call-vid-off-chip">📷 Camera off</span>}
-            {camOn && <video ref={localVidRef} autoPlay muted playsInline className={`call-vid-local${remoteVid ? ' pip' : ' main'}`} />}
-            {camOn && avatarLive && <span className="call-av-note" role="note">📷 camera used for avatar tracking only — face never sent</span>}
-          </div>
+        <audio ref={remoteRef} autoPlay playsInline onLoadedMetadata={() => remoteRef.current?.play().catch(() => setNeedsAudioGesture(true))} style={{display:'none'}} />
+        {needsAudioGesture && status === 'connected' && (
+          <button className="call-audio-unlock" onClick={unlockCallAudio} type="button">
+            🔊 Tap to enable call audio
+          </button>
         )}
-        {camWarn && <p className="call-cam-warn" role="alert">{camWarn}</p>}
         <div className="call-controls">
           {status === 'incoming' && !micWarn ? (
             <>
@@ -1113,12 +990,6 @@ function CallModal({ socket, me, targetUser, dmId, incoming, initialOffer, onClo
               {status === 'connected' && (
                 <button className={`call-btn mute${muted?' active':''}`} onClick={toggleMute}>
                   {muted ? '🔇' : '🎤'}
-                </button>
-              )}
-              {status === 'connected' && (
-                <button className={`call-btn cam${camOn?' active':''}`} onClick={toggleCam} disabled={camBusy}
-                  title={camOn ? 'Turn ' + (loadAvatarConfig().mode === 'camera' ? 'camera' : 'avatar') + ' off' : (loadAvatarConfig().mode === 'camera' ? 'Turn camera on' : 'Send your avatar')}>
-                  {camOn ? (loadAvatarConfig().mode === 'camera' ? '📷' : '🤖') : '🎥'}
                 </button>
               )}
               <button className="call-btn end" onClick={endCall}>End</button>
@@ -2282,7 +2153,7 @@ function BotBuilderModal({ me, boot, server, onClose, notify, onDone, editBot, c
                     <Avatar src={null} name={name||'Bot'} size="sm" anonMask={emoji || '🤖'} anonColor={botColor || '#5865f2'} />
                     <div className="bb-msg-body">
                       <span className="bb-msg-author">{name || 'Your Bot'}<small> BOT</small></span>
-                      <span className="bb-msg-text"><MsgBody text={previewFor(c)} me={me} /></span>
+                      <span className="bb-msg-text"><MsgBody text={previewFor(c)} me={me} onInvite={onInvite} /></span>
                     </div>
                     {c.response.includes('||') && <button type="button" className="icon-btn bb-roll" title="Roll another random pick" onClick={()=>setRandTick(t=>t+1)}>🎲</button>}
                   </div>
@@ -3138,7 +3009,7 @@ function ReminderMenu({ msg, pos, onClose, notify }) {
 }
 
 // ── Message component ─────────────────────────────────────────────────────────
-function Message({ msg, prev, me, isAdmin, onReply, onReplyAnon, onThread, bookmarked, onBookmark, onViewProfile, onReact, showEmoji, onToggleEmoji, onAdminDelete, notify, onRefresh, onRemind, highlight }) {
+function Message({ msg, prev, me, isAdmin, onReply, onReplyAnon, onThread, bookmarked, onBookmark, onViewProfile, onReact, showEmoji, onToggleEmoji, onAdminDelete, notify, onRefresh, onRemind, onInvite, highlight }) {
   const [editing, setEditing] = useState(false);
   const [editBody, setEditBody] = useState(msg.body);
   const [enableDone, setEnableDone] = useState(false);
@@ -3209,7 +3080,7 @@ function Message({ msg, prev, me, isAdmin, onReply, onReplyAnon, onThread, bookm
           </form>
         ) : (
           msg._poll ? <PollRenderer poll={msg._poll} messageId={msg.id} me={me} />
-          : <p className="msg-text"><MsgBody text={bodyText} me={me} /></p>
+          : <p className="msg-text"><MsgBody text={bodyText} me={me} onInvite={onInvite} /></p>
         )}
         {action && action.type === 'enable_bot' && !enableDone && (
           <button className="hint-enable-btn" onClick={enableBot}>✅ Enable this bot in the server</button>
@@ -3367,7 +3238,7 @@ async function handleSlashCommand(raw, ctx) {
 }
 
 // ── Channel Chat ──────────────────────────────────────────────────────────────
-function ChannelChat({ me, channel, comm, socket, notify, onViewProfile, boot, onPollCreate, jumpToMessageId, onJumpDone }) {
+function ChannelChat({ me, channel, comm, socket, notify, onViewProfile, onInvite, boot, onPollCreate, jumpToMessageId, onJumpDone }) {
   const [messages, setMessages]   = useState([]);
   const [highlightId, setHighlightId] = useState(null);
   const [body, setBody]           = useState('');
@@ -3655,6 +3526,7 @@ function ChannelChat({ me, channel, comm, socket, notify, onViewProfile, boot, o
             bookmarked={bmIds.has(m.id)}
             onBookmark={() => toggleBookmark(m)}
             onRemind={pos => setReminder({ msg:m, ...pos })}
+            onInvite={onInvite}
             onViewProfile={() => onViewProfile(boot?.users?.find(u=>u.id===m.sender_id)||{id:m.sender_id,username:m.username,tag:m.tag,avatar:m.avatar,nickname:m.nickname,badge:m.badge})}
             onReact={emoji => api(`/api/messages/${m.id}/reactions`,{method:'POST',body:JSON.stringify({emoji})})}
             showEmoji={emojiFor===m.id}
@@ -3774,7 +3646,7 @@ function ChannelChat({ me, channel, comm, socket, notify, onViewProfile, boot, o
 }
 
 // ── DM Chat ───────────────────────────────────────────────────────────────────
-function DmChat({ me, dm, socket, notify, onViewProfile, onCall, jumpToMessageId, onJumpDone }) {
+function DmChat({ me, dm, socket, notify, onViewProfile, onCall, onInvite, jumpToMessageId, onJumpDone }) {
   const [messages, setMessages] = useState([]);
   const [highlightId, setHighlightId] = useState(null);
   const { ids: bmIds } = useBookmarks();
@@ -3904,7 +3776,7 @@ function DmChat({ me, dm, socket, notify, onViewProfile, onCall, jumpToMessageId
           <h2>{other.name}</h2>
         </div>
         <div style={{display:'flex',gap:4}}>
-          {other.id !== me?.id && <button className="icon-btn" title="Call" onClick={()=>onCall(other)}>📞</button>}
+          {other.id !== me?.id && <button className="icon-btn dm-call-btn" title="Start audio call" aria-label={`Call ${other.name}`} onClick={()=>onCall(other)}>📞</button>}
           <button className="icon-btn" title="Nickname" onClick={()=>setShowNick(v=>!v)}>✏️</button>
           <button className="icon-btn" title="Report" onClick={()=>api('/api/reports',{method:'POST',body:JSON.stringify({targetType:'dm',targetId:dm.id,reason:'DM report',category:'other'})}).then(()=>notify('Report submitted.'))}>🚩</button>
           <button className="icon-btn" title="Block user" onClick={async()=>{ if(!confirm(`Block ${other.name}? You won't see their messages.`)) return; await api('/api/blocks',{method:'POST',body:JSON.stringify({userId:other.id})}); notify(`${other.name} blocked`,'ok'); }}>🚫</button>
@@ -3928,6 +3800,7 @@ function DmChat({ me, dm, socket, notify, onViewProfile, onCall, jumpToMessageId
             bookmarked={bmIds.has(m.id)}
             onBookmark={() => toggleBookmark(m)}
             onRemind={pos => setReminder({ msg:m, ...pos })}
+            onInvite={onInvite}
             onViewProfile={() => onViewProfile({id:m.sender_id,username:m.username,tag:m.tag,avatar:m.avatar,nickname:m.nickname,badge:m.badge})}
             onReact={emoji=>api(`/api/messages/${m.id}/reactions`,{method:'POST',body:JSON.stringify({emoji})})}
             showEmoji={emojiFor===m.id}
@@ -4016,7 +3889,7 @@ function DmChat({ me, dm, socket, notify, onViewProfile, onCall, jumpToMessageId
 }
 
 // ── Group Chat ────────────────────────────────────────────────────────────────
-function GroupChat({ me, group, socket, notify, onViewProfile, jumpToMessageId, onJumpDone }) {
+function GroupChat({ me, group, socket, notify, onViewProfile, onInvite, jumpToMessageId, onJumpDone }) {
   const [messages, setMessages] = useState([]);
   const [highlightId, setHighlightId] = useState(null);
   const { ids: bmIds } = useBookmarks();
@@ -4123,6 +3996,7 @@ function GroupChat({ me, group, socket, notify, onViewProfile, jumpToMessageId, 
             bookmarked={bmIds.has(m.id)}
             onBookmark={() => toggleBookmark(m)}
             onRemind={pos => setReminder({ msg:m, ...pos })}
+            onInvite={onInvite}
             onViewProfile={()=>onViewProfile({id:m.sender_id,username:m.username,tag:m.tag,avatar:m.avatar,nickname:m.nickname,badge:m.badge})}
             onReact={emoji=>api(`/api/messages/${m.id}/reactions`,{method:'POST',body:JSON.stringify({emoji})})}
             showEmoji={false} onToggleEmoji={()=>{}}
@@ -4200,7 +4074,7 @@ function VoiceChannel({ channel, me, socket, notify }) {
   // One mesh per channel mount; it stays silent until join() is called.
   useEffect(() => {
     const mesh = createVoiceMesh({
-      socket, channelId: channel.id, me,
+      socket, channelId: channel.id, me, iceServers: rtcIceServers(),
       onRoster: setRoster,
       onRemoteStream: () => setStreamTick(t => t + 1),
       onRemoteEnd: () => setStreamTick(t => t + 1),
@@ -4220,6 +4094,7 @@ function VoiceChannel({ channel, me, socket, notify }) {
       const s = mesh.streamFor(u.socketId);
       if (el) {
         if (s && el.srcObject !== s) el.srcObject = s;
+        if (s) el.play?.().catch(() => {});
         applySpeakerSink(el, speaker);
       }
     });
@@ -4314,7 +4189,6 @@ function VoiceChannel({ channel, me, socket, notify }) {
 const ROOM_META = {
   chat:    { icon:'💬', label:'Chat' },
   voice:   { icon:'🎙️', label:'Voice' },
-  video:   { icon:'🎥', label:'Video' },
   game:    { icon:'🎮', label:'Game' },
   drawing: { icon:'🎨', label:'Drawing' },
   poll:    { icon:'📋', label:'Poll' },
@@ -4360,8 +4234,8 @@ function CreateRoomModal({ communityId, onClose, onCreated, notify }) {
             </select>
           </label>
           {duration==='custom' && <label>Minutes<input type="number" min="1" max="1440" value={customMin} onChange={e=>setCustomMin(e.target.value)} placeholder="90" /></label>}
-          <label className="check-row"><input type="checkbox" checked={waiting} onChange={e=>setWaiting(e.target.checked)} /> Waiting room (owner admits people)</label>
-          {(type==='voice'||type==='video') && <label className="check-row"><input type="checkbox" checked={ptt} onChange={e=>setPtt(e.target.checked)} /> Push-to-talk</label>}
+          <label className="check-row"><input type="checkbox" checked={waiting} onChange={e=>setWaiting(e.target.checked)} /> Waiting room (owner admits people)</label>              {type==='voice' && <label className="check-row"><input type="checkbox" checked={ptt} onChange={e=>setPtt(e.target.checked)} /> Push-to-talk</label>}
+
           <div style={{display:'flex',gap:4}}><button>Create room</button><button type="button" className="ghost" onClick={onClose}>Cancel</button></div>
         </form>
       </div>
@@ -4393,14 +4267,13 @@ function RoomView({ roomId, me, socket, notify, onLaunchGame }) {
   const collabFocused = useRef(false);
   const videoRef = useRef(null);
   const [raises, setRaises] = useState([]);
+  const [roomGame, setRoomGame] = useState(null);
+  const [gameBusy, setGameBusy] = useState(false);
   const [voiceRoster, setVoiceRoster] = useState([]);   // peers actually live in voice (mesh)
   // Server refused the voice_join (this account is already in a call elsewhere).
   const [streamTick, setStreamTick] = useState(0);
-  const [cameraOn, setCameraOn] = useState(true);       // local camera state (video rooms)
   const meshRef = useRef(null);
   const remoteRefs = useRef({});
-  const camExtraRef = useRef(null);
-  const [avatarSending, setAvatarSending] = useState(false);
 
   const meta = ROOM_META[room?.type] || ROOM_META.chat;
 
@@ -4424,6 +4297,7 @@ function RoomView({ roomId, me, socket, notify, onLaunchGame }) {
     const onCollab = d => { if (d.roomId===roomId && !collabFocused.current) { setCollab(d.text||''); setCollabSync(d.text||''); } };
     const onRaise = d => { if (d.roomId===roomId && d.userId!==me?.id) setRaises(r=>[...new Set([...r, d.userId])]); };
     const onAdmitted = d => { if (d.roomId===roomId) { setWaiting(false); setJoined(true); notify(`Admitted to ${d.roomName||'the room'}!`,'ok'); } };
+    const onGameUpdate = d => { if (d.roomId === roomId) setRoomGame(d.game || null); };
     socket.on('room_message', onMsg);
     socket.on('room_presence', onPresence);
     socket.on('room_poll', onPoll);
@@ -4433,10 +4307,11 @@ function RoomView({ roomId, me, socket, notify, onLaunchGame }) {
     socket.on('room_collab', onCollab);
     socket.on('room_raise', onRaise);
     socket.on('room_admitted', onAdmitted);
+    socket.on('room_game_update', onGameUpdate);
     return () => {
       socket.off('room_message', onMsg); socket.off('room_presence', onPresence); socket.off('room_poll', onPoll);
       socket.off('room_poll_votes', onPollVotes); socket.off('room_draw', onDraw); socket.off('room_watch', onWatch);
-      socket.off('room_collab', onCollab); socket.off('room_raise', onRaise); socket.off('room_admitted', onAdmitted);
+      socket.off('room_collab', onCollab); socket.off('room_raise', onRaise); socket.off('room_admitted', onAdmitted); socket.off('room_game_update', onGameUpdate);
     };
   }, [socket, roomId, me?.id]);
 
@@ -4459,11 +4334,16 @@ function RoomView({ roomId, me, socket, notify, onLaunchGame }) {
     api(`/api/rooms/${roomId}/polls`).then(d => { if (!d.error) setPolls(d); }).catch(()=>{});
   }, [roomId, room?.type]);
 
+  useEffect(() => {
+    if (room?.type !== 'game') return;
+    api(`/api/rooms/${roomId}/game`).then(d => { if (!d.error) setRoomGame(d.game || null); }).catch(() => {});
+  }, [roomId, room?.type]);
+
   // Voice/video rooms run a real WebRTC mesh over the room's socket room.
   useEffect(() => {
-    if (room?.type !== 'voice' && room?.type !== 'video') return undefined;
+    if (room?.type !== 'voice') return undefined;
     const mesh = createVoiceMesh({
-      socket, channelId: roomId, me,
+      socket, channelId: roomId, me, iceServers: rtcIceServers(),
       onRoster: setVoiceRoster,
       onRemoteStream: () => setStreamTick(t => t + 1),
       onRemoteEnd: () => setStreamTick(t => t + 1),
@@ -4496,17 +4376,30 @@ function RoomView({ roomId, me, socket, notify, onLaunchGame }) {
 
   function leaveRoom() {
     api(`/api/rooms/${roomId}/leave`, { method:'POST' }).catch(()=>{});
-    closeAvatarTrack();
-    camExtraRef.current?.getTracks().forEach(t=>t.stop());
-    camExtraRef.current = null;
     streamRef.current?.getTracks().forEach(t=>t.stop());
     meshRef.current?.leave();
-    setAvatarSending(false);
     setJoined(false); setInCall(false); setWaiting(false); setMessages([]);
   }
 
   async function admitUser(uid) {
     await api(`/api/rooms/${roomId}/admit`, { method:'POST', body: JSON.stringify({ userId:uid }) });
+  }
+
+  async function startRoomGame(gameType) {
+    setGameBusy(true);
+    const d = await api(`/api/rooms/${roomId}/game`, { method:'POST', body:JSON.stringify({ gameType }) });
+    setGameBusy(false);
+    if (d.error) notify(d.error, 'err');
+    else setRoomGame(d.game || null);
+  }
+
+  async function roomGameAction(action) {
+    setGameBusy(true);
+    const d = await api(`/api/rooms/${roomId}/game/action`, { method:'POST', body:JSON.stringify(action) });
+    setGameBusy(false);
+    if (d.error) { notify(d.error, 'err'); return d; }
+    setRoomGame(d.game || null);
+    return d;
   }
 
   async function sendMsg(e) {
@@ -4528,71 +4421,21 @@ function RoomView({ roomId, me, socket, notify, onLaunchGame }) {
     await api(`/api/rooms/${roomId}/polls/${pollId}/vote`, { method:'POST', body: JSON.stringify({ optionIndex:idx }) });
   }
 
-  // ── Voice/video: real peer media via the mesh ──
+  // ── Voice: audio-only rooms ──
   async function joinVoice() {
     try {
-      const wantsVideo = room?.type==='video';
-      const cfg = loadAvatarConfig();
-      const avatarKind = (cfg.mode === '2d' || cfg.mode === '3d' || cfg.mode === 'external') ? cfg.mode : null;
-      let stream;
-      if (wantsVideo && avatarKind) {
-        if (avatarKind === 'external') {
-          // External app video room: mic audio + the app's virtual camera
-          // stream (VTube Studio / OBS / Snap…) — no built-in tracking.
-          stream = await navigator.mediaDevices.getUserMedia(mediaConstraints('mic'));
-          const es = await externalVideoStream();
-          if (!es || !es.getVideoTracks().length) {
-            stream.getTracks().forEach(t => t.stop());
-            notify('External camera app not found — start VTube Studio / OBS / Snap Camera, then pick its virtual camera in Settings → Voice & Video → External app.', 'err');
-            return;
-          }
-          es.getVideoTracks().forEach(t => stream.addTrack(t));
-          camExtraRef.current = es;
-          setAvatarSending(false);
-        } else {
-          // Avatar video room: mic audio + the avatar engine's canvas track. A
-          // tracking webcam (if granted) never leaves this machine.
-          stream = await navigator.mediaDevices.getUserMedia(mediaConstraints('mic'));
-          const vtrack = await openAvatarTrack({ micStream: stream });
-          if (vtrack) {
-            stream.addTrack(vtrack);
-            setAvatarSending(true);
-          } else {
-            setAvatarSending(false);
-            const cs = await navigator.mediaDevices.getUserMedia(mediaConstraints('camera'));
-            cs.getVideoTracks().forEach(t => stream.addTrack(t));
-            camExtraRef.current = cs;
-          }
-        }
-      } else {
-        stream = await navigator.mediaDevices.getUserMedia(mediaConstraints(wantsVideo ? 'mic+camera' : 'mic'));
-        setAvatarSending(false);
-      }
+      const stream = await navigator.mediaDevices.getUserMedia(mediaConstraints('mic'));
       streamRef.current = stream;
-      setCameraOn(true);
       meshRef.current?.join(stream);
       setInCall(true);
-    } catch { notify('Could not access ' + (room?.type==='video'?'camera/microphone':'microphone'), 'err'); }
+    } catch { notify('Could not access microphone', 'err'); }
   }
 
   function leaveVoice() {
-    closeAvatarTrack();
-    camExtraRef.current?.getTracks().forEach(t=>t.stop());
-    camExtraRef.current = null;
     streamRef.current?.getTracks().forEach(t=>t.stop());
     meshRef.current?.leave();
     remoteRefs.current = {};
-    setAvatarSending(false);
-    setInCall(false); setMuted(false); setPttDown(false); setCameraOn(true);
-  }
-
-  // Turn the local camera off/on: the mesh disables the video track (peers
-  // stop receiving video) and broadcasts the state so everyone swaps the
-  // frozen frame for a “camera off” tile. Mic audio keeps flowing.
-  function toggleCamera() {
-    const next = !cameraOn;
-    meshRef.current?.setCamera(next);
-    setCameraOn(next);
+    setInCall(false); setMuted(false); setPttDown(false);
   }
 
   function toggleMute() {
@@ -4699,47 +4542,21 @@ function RoomView({ roomId, me, socket, notify, onLaunchGame }) {
         </div>
       )}
 
-      {!waiting && (room.type==='voice'||room.type==='video') && (
+      {!waiting && room.type==='voice' && (
         <div className="room-voice">
           <div className="room-voice-body">
             {inCall ? (
               <>
                 <div className="room-self-tile">
-                  {room.type==='video' && cameraOn
-                    ? (avatarSending
-                        ? <video ref={el=>{ if(el) el.srcObject = liveAvatarStream(); }} autoPlay muted playsInline style={{width:'100%',borderRadius:10,aspectRatio:'16/9',background:'#0b0b12'}} />
-                        : <video ref={el=>{ if(el) el.srcObject = streamRef.current; }} autoPlay muted playsInline style={{width:'100%',borderRadius:10,aspectRatio:'16/9',background:'#000'}} />)
-                    : <>
-                        <Avatar src={me?.avatar} name={me?.nickname||me?.username} size="lg" badge={me?.badge} />
-                        {room.type==='video' && !cameraOn && <span className="cam-off-label">📷 camera off</span>}
-                      </>}
-                  <span>{me?.nickname||me?.username} {avatarSending && <em className="avatar-send-chip">🤖 avatar</em>} {muted && '🔇'}</span>
-                  {room.type==='video' && avatarSending && cameraOn && <span className="avatar-cam-note" role="note">📷 camera used for avatar tracking only — face never sent</span>}
+                  <Avatar src={me?.avatar} name={me?.nickname||me?.username} size="lg" badge={me?.badge} />
+                  <span>{me?.nickname||me?.username} {muted && '🔇'}</span>
                 </div>
                 {voiceRoster.map(u => {
                   const hasMedia = Boolean(meshRef.current?.streamFor(u.socketId));
-                  const peerCamOn = u.camera !== false;
                   const peerName = u.nickname || u.username || 'Unknown';
-                  return room.type==='video' ? (
-                    <div key={u.socketId} className={`room-peer-tile${hasMedia?' live':' connecting'}${peerCamOn?'':' cam-off'}`}>
-                      {/* The video element stays mounted even when the peer's camera
-                          is off — it quietly carries their audio while hidden. */}
-                      <video ref={el => { remoteRefs.current[u.socketId] = el; }} className={peerCamOn?'':'room-cam-off-video'} autoPlay playsInline style={{width:'100%',borderRadius:10,aspectRatio:'16/9',background:'#000',objectFit:'cover'}} />
-                      {!peerCamOn && (
-                        <div className="room-cam-placeholder">
-                          <Avatar src={u.avatar} name={u.nickname || u.username} size="md" badge={u.badge} />
-                          <span className="cam-off-label">📷 camera off</span>
-                        </div>
-                      )}
-                      <span className="room-peer-name">{peerName}
-                        {!peerCamOn ? <em className="voice-connecting">no video</em>
-                          : hasMedia ? <em className="voice-live-dot" title="Video live" />
-                          : <em className="voice-connecting">connecting…</em>}
-                      </span>
-                    </div>
-                  ) : (
+                  return (
                     <div key={u.socketId} className={`room-peer-tile${hasMedia?' live':' connecting'}`}>
-                      <Avatar src={u.avatar} name={u.nickname || u.username} size="lg" badge={u.badge} />
+                      <Avatar src={u.avatar} name={peerName} size="lg" badge={u.badge} />
                       <audio ref={el => { remoteRefs.current[u.socketId] = el; }} autoPlay playsInline style={{display:'none'}} />
                       <span>{peerName}</span>
                       {hasMedia ? <span className="voice-live-dot" title="Audio live" /> : <span className="voice-connecting">connecting…</span>}
@@ -4762,11 +4579,6 @@ function RoomView({ roomId, me, socket, notify, onLaunchGame }) {
                 ) : (
                   <button className={`voice-ctrl-btn${muted?' active':''}`} onClick={toggleMute}>{muted?'🔇 Unmute':'🎤 Mute'}</button>
                 )}
-                {room.type==='video' && (
-                  <button className={`voice-ctrl-btn${!cameraOn?' active':''}`} onClick={toggleCamera} title={cameraOn ? 'Turn your camera off' : 'Turn your camera back on'}>
-                    {cameraOn ? '🎥 Camera' : '📷 Camera Off'}
-                  </button>
-                )}
                 <button className="voice-ctrl-btn leave" onClick={leaveVoice}>Leave</button>
               </>
             )}
@@ -4775,16 +4587,7 @@ function RoomView({ roomId, me, socket, notify, onLaunchGame }) {
       )}
 
       {!waiting && room.type==='game' && (
-        <div className="room-game">
-          <div className="room-idle"><span className="room-icon">🎮</span><p>Pick a game — everyone in the room can play along</p></div>
-          <div className="room-game-grid">
-            <button onClick={()=>onLaunchGame?.('guess')}>🎯 Guess the Number</button>
-            <button onClick={()=>onLaunchGame?.('wyr')}>🤔 Would You Rather</button>
-            <button onClick={()=>onLaunchGame?.('truth')}>🔥 Truth or Dare</button>
-            <button onClick={()=>onLaunchGame?.('trivia')}>🧠 Trivia</button>
-            <button onClick={()=>onLaunchGame?.('scramble')}>🔤 Word Scramble</button>
-          </div>
-        </div>
+        <MultiplayerGame game={roomGame} me={me} busy={gameBusy} onStart={startRoomGame} onAction={roomGameAction} />
       )}
 
       {!waiting && room.type==='drawing' && (
@@ -6271,6 +6074,7 @@ function App() {
   const [rooms, setRooms] = useState([]);
   const [activeRoomId, setActiveRoomId] = useState(null);
   const [showCreateRoom, setShowCreateRoom] = useState(false);
+  const inviteHandled = useRef(false);
   const [ftdGlitch, setFtdGlitch] = useState(false);
   const [showArg, setShowArg] = useState(false);
   const [screenshotWarn, setScreenshotWarn] = useState(false);
@@ -6309,6 +6113,12 @@ function App() {
       setMe(d.me);
       setBoot(d);
       setAccountRank(d.me && d.me.rank);
+      const inviteCode = inviteCodeFromUrl(location.href);
+      if (inviteCode && !inviteHandled.current) {
+        inviteHandled.current = true;
+        history.replaceState({}, '', '/');
+        setTimeout(() => acceptInvite(inviteCode), 0);
+      }
       rememberRtcServers(d);
       // Only auto-open a community the user actually belongs to; otherwise land on
       // the guided start state (Discover / create / friends) instead of a denied server.
@@ -6551,6 +6361,18 @@ function App() {
     socket.on('room_update', onRoomUpdate);
     return () => socket.off('room_update', onRoomUpdate);
   }, [socket, communityId]);
+
+  async function acceptInvite(code) {
+    const d = await api('/api/communities/join', { method:'POST', body:JSON.stringify({ inviteCode:code }) });
+    if (d.error) return notify(d.error, 'err');
+    const b = await api('/api/bootstrap');
+    if (!b.error) setBoot(b);
+    const joined = (b.communities || []).find(c => c.id === d.communityId);
+    setCommunityId(d.communityId); setView('server'); setActiveRoomId(null);
+    const first = (b.channels || []).find(c => c.community_id === d.communityId && c.type !== 'voice');
+    if (first) setChannelId(first.id);
+    notify(`Joined ${joined?.name || 'server'}!`, 'ok');
+  }
 
   function chooseDm(id) { setDmId(id); setActiveRoomId(null); setView('dm'); setShowMobileChannels(false); socket.emit('join_dm',id); setUnread(u=>{const n={...u};delete n[`dm:${id}`];return n;}); }
   function chooseGroup(id) { setGroupId(id); setActiveRoomId(null); setView('group'); setShowMobileChannels(false); }
@@ -6880,17 +6702,17 @@ function App() {
         ) : view==='friends' ? (
           <FriendsView me={me} boot={boot} onBootRefresh={()=>api('/api/bootstrap').then(d=>{if(!d.error)setBoot(d);})} onOpenDm={openDm} onViewProfile={setViewingProfile} notify={notify} />
         ) : view==='dm' && activeDm ? (
-          <DmChat key={dmId} me={me} dm={activeDm} socket={socket} notify={notify} onViewProfile={setViewingProfile}
+          <DmChat key={dmId} me={me} dm={activeDm} socket={socket} notify={notify} onViewProfile={setViewingProfile} onInvite={acceptInvite}
             onCall={target=>setActiveCall({...target,dmId})} jumpToMessageId={jumpToMessageId} onJumpDone={() => setJumpToMessageId(null)} />
         ) : view==='group' && activeGroup ? (
-          <GroupChat key={groupId} me={me} group={activeGroup} socket={socket} notify={notify} onViewProfile={setViewingProfile} jumpToMessageId={jumpToMessageId} onJumpDone={() => setJumpToMessageId(null)} />
+          <GroupChat key={groupId} me={me} group={activeGroup} socket={socket} notify={notify} onViewProfile={setViewingProfile} onInvite={acceptInvite} jumpToMessageId={jumpToMessageId} onJumpDone={() => setJumpToMessageId(null)} />
         ) : view==='server' && activeRoomId ? (
           <RoomView key={activeRoomId} roomId={activeRoomId} me={me} socket={socket} notify={notify}
             onLaunchGame={g=>{ setGamePick(g); setShowGame(true); }} />
         ) : view==='server' && activeCh ? (
           activeCh.type==='voice'
             ? <VoiceChannel key={channelId} channel={activeCh} me={me} socket={socket} boot={boot} notify={notify} />
-            : <ChannelChat key={channelId} me={me} channel={activeCh} comm={comm} socket={socket} notify={notify} onViewProfile={setViewingProfile} boot={boot} jumpToMessageId={jumpToMessageId} onJumpDone={() => setJumpToMessageId(null)} />
+            : <ChannelChat key={channelId} me={me} channel={activeCh} comm={comm} socket={socket} notify={notify} onViewProfile={setViewingProfile} onInvite={acceptInvite} boot={boot} jumpToMessageId={jumpToMessageId} onJumpDone={() => setJumpToMessageId(null)} />
         ) : (
           <div className="empty-state">
             <Mascot size={90} mood="thinking" />
@@ -7029,7 +6851,7 @@ function ServerChannelList({ comm, boot, me, channelId, onChooseChannel, theme, 
           </div>
         ))}
       </div>
-      {comm && <div className="invite-bar"><button className="ghost invite-btn" onClick={async()=>{ const d=await api(`/api/communities/${comm.id}/invite`); if(d.inviteCode){navigator.clipboard?.writeText(d.inviteCode).catch(()=>{}); notify(`Invite code: ${d.inviteCode}`,'ok');} }}>📋 Copy invite</button></div>}
+      {comm && <div className="invite-bar"><button className="ghost invite-btn" onClick={async()=>{ const d=await api(`/api/communities/${comm.id}/invite`); if(d.inviteCode){navigator.clipboard?.writeText(`${location.origin}/invite/${encodeURIComponent(d.inviteCode)}`).catch(()=>{}); notify('Invite link copied','ok');} }}>🔗 Copy invite link</button></div>}
     </>
   );
 }
@@ -7044,6 +6866,9 @@ function ServerSettings({ comm, me, boot, onClose, onRefresh, notify }) {
   const [icon, setIcon]   = useState(comm.icon||'');
   const [banner, setBanner] = useState(comm.banner||'');
   const [invite, setInvite] = useState('');
+  const [inviteTitle, setInviteTitle] = useState(comm.invite_title || '');
+  const [inviteDescription, setInviteDescription] = useState(comm.invite_description || '');
+  const [inviteImage, setInviteImage] = useState(comm.invite_image || '');
   const [members, setMembers] = useState([]);
   const [channels, setChannels] = useState([]);
   const [editCh, setEditCh] = useState(null);
@@ -7070,9 +6895,9 @@ function ServerSettings({ comm, me, boot, onClose, onRefresh, notify }) {
     setChannels((boot?.channels||[]).filter(c=>c.community_id===comm.id));
   }, [comm.id]);
 
-  async function saveOverview(e){ e.preventDefault(); await api(`/api/communities/${comm.id}`,{method:'PATCH',body:JSON.stringify({name,description:desc,rules,visibility:vis,tags,icon,banner})}); notify('Server updated','ok'); onRefresh?.(); }
+  async function saveOverview(e){ e.preventDefault(); await api(`/api/communities/${comm.id}`,{method:'PATCH',body:JSON.stringify({name,description:desc,rules,visibility:vis,tags,icon,banner,invite_title:inviteTitle,invite_description:inviteDescription,invite_image:inviteImage})}); notify('Server updated','ok'); onRefresh?.(); }
   async function regenInvite(){ const d=await api(`/api/communities/${comm.id}/invite/regenerate`,{method:'POST'}); if(d.inviteCode){ setInvite(d.inviteCode); navigator.clipboard?.writeText(d.inviteCode).catch(()=>{}); notify(`New invite: ${d.inviteCode}`,'ok'); onRefresh?.(); } }
-  async function copyInvite(){ navigator.clipboard?.writeText(invite).then(()=>notify('Invite copied','ok')); }
+  async function copyInvite(){ navigator.clipboard?.writeText(`${location.origin}/invite/${encodeURIComponent(invite)}`).then(()=>notify('Invite link copied','ok')); }
   async function saveChannel(ch){ await api(`/api/channels/${ch.id}`,{method:'PATCH',body:JSON.stringify(chanEdits[ch.id]||{})}); notify('Channel updated','ok'); setEditCh(null); onRefresh?.(); }
   async function deleteChannel(ch){ if(!confirm(`Delete #${ch.name}?`)) return; await api(`/api/channels/${ch.id}`,{method:'DELETE'}); notify('Channel deleted','ok'); onRefresh?.(); }
   async function kickMember(m){ if(!confirm(`Kick ${m.user_nickname||m.username}?`)) return; const d=await api(`/api/communities/${comm.id}/members/${m.user_id}`,{method:'DELETE'}); if(d.error) return notify(d.error,'err'); notify('Member kicked','ok'); setMembers(members.filter(x=>x.user_id!==m.user_id)); onRefresh?.(); }
@@ -7108,6 +6933,11 @@ function ServerSettings({ comm, me, boot, onClose, onRefresh, notify }) {
           <label>Tags (comma separated)<input value={tags} onChange={e=>setTags(e.target.value)} placeholder="gaming,chill,art" /></label>
           <label>Icon URL<input value={icon} onChange={e=>setIcon(e.target.value)} placeholder="https://…" /></label>
           <label>Banner URL<input value={banner} onChange={e=>setBanner(e.target.value)} placeholder="https://…" /></label>
+          <fieldset className="invite-customize"><legend>Invite appearance</legend>
+            <label>Invite title<input value={inviteTitle} onChange={e=>setInviteTitle(e.target.value)} placeholder={`Join ${comm.name}`} /></label>
+            <label>Invite description<textarea value={inviteDescription} onChange={e=>setInviteDescription(e.target.value)} rows={2} placeholder="Tell people why they should join" /></label>
+            <label>Invite image URL<input value={inviteImage} onChange={e=>setInviteImage(e.target.value)} placeholder="https://…" /></label>
+          </fieldset>
           <label>Visibility
             <select value={vis} onChange={e=>setVis(e.target.value)}>
               <option value="public">Public</option>
@@ -7174,8 +7004,8 @@ function ServerSettings({ comm, me, boot, onClose, onRefresh, notify }) {
         <div className="invite-panel">
           <p className="muted-text">Share this invite code so people can join <b>{comm.name}</b>.</p>
           <div className="invite-code-box">
-            <code>{invite||'…'}</code>
-            <button type="button" onClick={copyInvite}>Copy</button>
+            <code>{invite ? `${location.origin}/invite/${encodeURIComponent(invite)}` : '…'}</code>
+            <button type="button" onClick={copyInvite}>Copy link</button>
             {isMod && <button type="button" className="ghost" onClick={regenInvite}>Regenerate</button>}
           </div>
         </div>

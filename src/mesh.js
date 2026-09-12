@@ -1,5 +1,5 @@
-// Group voice/video mesh engine. Members of a community voice channel or a
-// temporary voice/video room connect peer-to-peer (full WebRTC mesh) over the
+// Group voice mesh engine. Members of a community voice channel or a
+// temporary voice room connect peer-to-peer (full WebRTC mesh) over the
 // app's existing authenticated Socket.IO link — no server media relay.
 //
 // Peers are keyed by SESSION (socket id), not by user id. The same account
@@ -31,23 +31,27 @@ export function createVoiceMesh({ socket, channelId, me, onRoster, onRemoteStrea
   const pendingIce = new Map();       // socketId -> [candidate]
   let localStream = null;
   let joined = false;
-  let roster = [];                    // [{ userId, socketId, username, nickname, avatar, badge, camera }]
+  let roster = [];                    // [{ userId, socketId, username, nickname, avatar, badge }]
   let destroyed = false;
-  let myCameraOn = true;
   // Phone-call fallback: when a direct link to a peer can't connect, audio
   // flows through the server instead. One sender (our mic → everyone) and one
   // receiver per peer session.
   let relaySender = null;
+  let relayHeader = null;            // first MediaRecorder chunk for late joiners
   const relayReceivers = new Map();  // socketId -> receiver
   let relaySeq = 0;
 
   function startRelay() {
     if (relaySender || !localStream) return;
+    relayHeader = null;
+    relaySeq = 0;
     relaySender = createAudioRelaySender({
       stream: localStream,
       emit: data => {
         if (!socket.connected) return;
-        socket.emit('audio_chunk', { channelId, seq: ++relaySeq, first: relaySeq === 1, data });
+        const first = relaySeq === 0;
+        if (first) relayHeader = data;
+        socket.emit('audio_chunk', { channelId, seq: ++relaySeq, first, data });
       },
     });
     // Every currently-known peer session gets a relay receiver immediately.
@@ -56,6 +60,8 @@ export function createVoiceMesh({ socket, channelId, me, onRoster, onRemoteStrea
   }
   function stopRelay() {
     relaySender?.stop(); relaySender = null;
+    relayHeader = null;
+    relaySeq = 0;
     for (const rx of relayReceivers.values()) rx.stop();
     relayReceivers.clear();
   }
@@ -76,6 +82,10 @@ export function createVoiceMesh({ socket, channelId, me, onRoster, onRemoteStrea
       rx = createAudioRelayReceiver();
       if (rx.stream) onRemoteStream?.(socketId); // tile can go live
       relayReceivers.set(socketId, rx);
+      // A receiver that joins after the sender's first MediaRecorder chunk
+      // cannot decode later headerless clusters. Ask every current sender for
+      // its cached header; the server targets the response to this session.
+      if (socket.connected) socket.emit('voice_audio_request', { channelId });
     }
     return rx;
   }
@@ -219,7 +229,7 @@ export function createVoiceMesh({ socket, channelId, me, onRoster, onRemoteStrea
       // so an offer is authoritative even when that peer's roster event has not
       // landed yet (cross-node event ordering). Add a placeholder row — the
       // profile arrives with voice_user_joined / the next roster snapshot.
-      u = { userId: d.fromUserId, socketId: d.fromSocketId, username: '', nickname: '', avatar: '', badge: '', camera: true };
+      u = { userId: d.fromUserId, socketId: d.fromSocketId, username: '', nickname: '', avatar: '', badge: '' };
       roster.push(u);
       publish();
     }
@@ -282,9 +292,7 @@ export function createVoiceMesh({ socket, channelId, me, onRoster, onRemoteStrea
 
   const onRosterEv = d => {
     if (!isOurs(d)) return;
-    roster = (d.users || [])
-      .filter(u => u.userId && u.socketId && !isSelf(u.socketId))
-      .map(u => ({ ...u, camera: u.camera !== false }));
+    roster = (d.users || []).filter(u => u.userId && u.socketId && !isSelf(u.socketId));
     publish();
     roster.forEach(u => ensurePeer(u));
   };
@@ -293,7 +301,6 @@ export function createVoiceMesh({ socket, channelId, me, onRoster, onRemoteStrea
     const u = {
       userId: d.userId, socketId: d.socketId,
       username: d.username || '', nickname: d.nickname || '', avatar: d.avatar || '', badge: d.badge || '',
-      camera: d.camera !== false,
     };
     const i = roster.findIndex(x => x.socketId === u.socketId);
     if (i >= 0) roster[i] = u; else roster.push(u);
@@ -301,16 +308,6 @@ export function createVoiceMesh({ socket, channelId, me, onRoster, onRemoteStrea
     ensurePeer(u);
     // If the room already fell back to relay mode, serve the new session too.
     if (relaySender) peerRelayReceiver(u.socketId);
-    // A fresh joiner has no idea our camera is off (the server roster has no
-    // per-client state) — tell them right away.
-    if (!myCameraOn && socket.connected) socket.emit('voice_camera', { channelId, on: false });
-  };
-  const onCamera = d => {
-    if (!isOurs(d) || isSelf(d.socketId)) return;
-    const i = roster.findIndex(x => (d.socketId ? x.socketId === d.socketId : x.userId === d.userId));
-    if (i < 0) return;
-    roster[i] = { ...roster[i], camera: d.on !== false };
-    publish();
   };
   const onLeft = d => {
     if (!isOurs(d)) return;
@@ -329,13 +326,11 @@ export function createVoiceMesh({ socket, channelId, me, onRoster, onRemoteStrea
   const onOfferEv = d => { if (isOurs(d)) onOffer(d); };
   const onAnswerEv = d => { if (isOurs(d)) onAnswer(d); };
   const onIceEv = d => { if (isOurs(d)) onIce(d); };
-  const onCameraEv = d => { if (isOurs(d)) onCamera(d); };
   // Reconnect: socket rooms (and this socket id) are gone — re-announce so the
   // server pushes a fresh roster and peers replace the stale session for us.
   const onReconnect = () => {
     if (joined && localStream && !destroyed && socket.connected) {
       socket.emit('voice_join', { channelId });
-      if (!myCameraOn) socket.emit('voice_camera', { channelId, on: false });
       if (relaySender) {
         // The socket id changed and receivers re-anchor on a fresh header.
         stopRelay();
@@ -347,15 +342,21 @@ export function createVoiceMesh({ socket, channelId, me, onRoster, onRemoteStrea
   socket.on('voice_roster', onRosterEv);
   socket.on('voice_user_joined', onJoined);
   socket.on('voice_user_left', onLeft);
-  socket.on('voice_camera', onCameraEv);
   const onChunk = d => {
     if (!isOurs(d) || isSelf(d.fromSocketId) || !d?.data) return;
     peerRelayReceiver(d.fromSocketId).absorb(d.data, { first: d.first === true }).catch(() => {});
+  };
+  const onAudioRequest = d => {
+    if (!isOurs(d) || !d.fromSocketId || isSelf(d.fromSocketId) || !relayHeader || !socket.connected) return;
+    // Return only the cached container header to the late joiner. The server
+    // verifies both sockets are in this voice room before targeted delivery.
+    socket.emit('audio_chunk', { channelId, toSocketId: d.fromSocketId, seq: 0, first: true, data: relayHeader });
   };
   socket.on('voice_rtc_offer', onOfferEv);
   socket.on('voice_rtc_answer', onAnswerEv);
   socket.on('voice_rtc_ice', onIceEv);
   socket.on('audio_chunk', onChunk);
+  socket.on('voice_audio_request', onAudioRequest);
   socket.on('connect', onReconnect);
 
   return {
@@ -389,21 +390,6 @@ export function createVoiceMesh({ socket, channelId, me, onRoster, onRemoteStrea
     relayActive() {
       return relayReceivers.size > 0;
     },
-    /** Turn the local camera on/off: disables the video track (stops sending)
-     *  and tells every peer so they swap the frozen video for a placeholder. */
-    setCamera(on) {
-      myCameraOn = !!on;
-      const videoTracks = localStream?.getVideoTracks?.() || [];
-      videoTracks.forEach(t => { try { t.enabled = myCameraOn; } catch {} });
-      if (joined && socket.connected) {
-        socket.emit('voice_camera', { channelId, on: myCameraOn });
-      }
-      return myCameraOn;
-    },
-    /** Whether this client currently has the camera on. */
-    cameraOn() {
-      return myCameraOn;
-    },
     /** Remove socket listeners + leave. Safe to call twice. */
     destroy() {
       if (destroyed) return;
@@ -412,11 +398,11 @@ export function createVoiceMesh({ socket, channelId, me, onRoster, onRemoteStrea
       socket.off('voice_roster', onRosterEv);
       socket.off('voice_user_joined', onJoined);
       socket.off('voice_user_left', onLeft);
-      socket.off('voice_camera', onCameraEv);
       socket.off('voice_rtc_offer', onOfferEv);
       socket.off('voice_rtc_answer', onAnswerEv);
       socket.off('voice_rtc_ice', onIceEv);
       socket.off('audio_chunk', onChunk);
+      socket.off('voice_audio_request', onAudioRequest);
       socket.off('connect', onReconnect);
     },
   };

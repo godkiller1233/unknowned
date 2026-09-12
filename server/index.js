@@ -16,8 +16,9 @@ import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import net from 'net';
-import { randomBytes } from 'crypto';
+import { randomBytes, createHash } from 'crypto';
 import { generateSecret, verifyCode, otpauthUri, generateRecoveryCodes, hashRecoveryCode } from './totp.js';
+import { createChessGame, createUnoGame, addChessPlayer, addUnoPlayer, applyChessAction, applyUnoAction } from '../src/multiplayer-game.js';
 import dgram from 'dgram';
 import dns from 'dns/promises';
 
@@ -434,6 +435,20 @@ async function initializeDb() {
       community_id TEXT, bot_id TEXT, channel_id TEXT, command TEXT,
       PRIMARY KEY (community_id, bot_id, channel_id, command)
     );
+    CREATE TABLE IF NOT EXISTS bot_tokens (
+      id TEXT PRIMARY KEY, bot_id TEXT NOT NULL, token_hash TEXT UNIQUE NOT NULL,
+      token_prefix TEXT NOT NULL, name TEXT DEFAULT 'default',
+      scopes TEXT DEFAULT '["read_messages","send_messages"]',
+      created_by TEXT, created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+      last_used_at TIMESTAMPTZ, revoked_at TIMESTAMPTZ
+    );
+    CREATE INDEX IF NOT EXISTS bot_tokens_bot_idx ON bot_tokens(bot_id);
+    CREATE TABLE IF NOT EXISTS bot_events (
+      id BIGSERIAL PRIMARY KEY, bot_id TEXT NOT NULL, community_id TEXT,
+      event_type TEXT NOT NULL, payload TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS bot_events_cursor_idx ON bot_events(bot_id, id);
     CREATE TABLE IF NOT EXISTS marketplace_bots (
       id TEXT PRIMARY KEY, name TEXT, emoji TEXT DEFAULT '🤖',
       category TEXT DEFAULT 'Custom', description TEXT,
@@ -486,6 +501,11 @@ async function initializeDb() {
     CREATE TABLE IF NOT EXISTS room_poll_votes (
       poll_id TEXT, user_id TEXT, option_index INTEGER,
       PRIMARY KEY (poll_id, user_id)
+    );
+    CREATE TABLE IF NOT EXISTS multiplayer_games (
+      room_id TEXT PRIMARY KEY, game_type TEXT NOT NULL,
+      state TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 0,
+      updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
     );
     CREATE TABLE IF NOT EXISTS arg_completions (
       user_id TEXT PRIMARY KEY, completed_at TEXT DEFAULT CURRENT_TIMESTAMP
@@ -678,6 +698,9 @@ async function runMigrations() {
     ['users','anon_name_color','TEXT DEFAULT \'\''],
     ['communities','pinned_mask','TEXT DEFAULT \'\''],
     ['communities','is_default','INTEGER DEFAULT 0'],
+    ['communities','invite_title','TEXT DEFAULT \'\''],
+    ['communities','invite_description','TEXT DEFAULT \'\''],
+    ['communities','invite_image','TEXT DEFAULT \'\''],
     ['users','rank_granted_at','TIMESTAMPTZ'],
     ['users','rank_granted_by','TEXT'],
     // quest_logs earnedToday/cap queries SUM(reward); the column was missing on
@@ -688,6 +711,7 @@ async function runMigrations() {
     ['users','recovery_codes','TEXT DEFAULT \'[]\''],
     ['auth_sessions','device','TEXT DEFAULT \'\''],
     ['auth_sessions','last_seen','TIMESTAMPTZ'],
+    ['bot_events','community_id','TEXT'],
   ];
   // seed starter credits for existing users
   try {
@@ -729,6 +753,7 @@ function startCleanup() {
         await store.run('DELETE FROM room_members WHERE room_id=$1', r.id);
         await store.run('DELETE FROM room_messages WHERE room_id=$1', r.id);
         await store.run('DELETE FROM room_polls WHERE room_id=$1', r.id);
+        await store.run('DELETE FROM multiplayer_games WHERE room_id=$1', r.id);
         await store.run('DELETE FROM temp_rooms WHERE id=$1', r.id);
         io.to(r.community_id).emit('room_update', { action:'deleted', id:r.id });
       }
@@ -821,6 +846,7 @@ app.use(cors({
   credentials: false,
 }));
 app.use(express.json({ limit: '8mb' }));
+
 app.use('/uploads', express.static(uploadDir, {
   dotfiles: 'deny',
   setHeaders: (res) => {
@@ -1007,20 +1033,72 @@ async function resolveRequestUser(req) {
   try {
     return await sessions.resolve(rawToken);
   } catch {
-    const botToken = req.headers['x-bot-token'];
-    if (!botToken) throw new Error('Authentication required');
-    const bot = await store.get('SELECT * FROM users WHERE bot_token=$1 AND is_bot=1', botToken);
-    if (!bot || Number(bot.banned)) throw new Error('Invalid bot token');
-    return publicUser(bot);
+    const botToken = String(req.headers['x-bot-token'] || '');
+    if (!botToken || botToken.length < 20 || botToken.length > 200) throw new Error('Authentication required');
+    const tokenRow = BOT_TOKEN_RE.test(botToken)
+      ? await store.get('SELECT * FROM bot_tokens WHERE token_hash=$1 AND revoked_at IS NULL', hashBotToken(botToken))
+      : null;
+    if (tokenRow) {
+      const bot = await store.get('SELECT * FROM users WHERE id=$1 AND is_bot=1', tokenRow.bot_id);
+      if (!bot || Number(bot.banned)) throw new Error('Invalid bot token');
+      let scopes = [];
+      try { scopes = JSON.parse(tokenRow.scopes || '[]'); } catch {}
+      req.botAuth = { tokenId: tokenRow.id, botId: tokenRow.bot_id, scopes: requestedBotScopes(scopes) };
+      store.run('UPDATE bot_tokens SET last_used_at=CURRENT_TIMESTAMP WHERE id=$1', tokenRow.id).catch(() => {});
+      return publicUser(bot);
+    }
+    // Legacy installed bots remain usable only through their existing secret;
+    // new integrations should always use a scoped bot_tokens record.
+    const legacy = await store.get('SELECT * FROM users WHERE bot_token=$1 AND is_bot=1', botToken);
+    if (!legacy || Number(legacy.banned)) throw new Error('Invalid bot token');
+    req.botAuth = { tokenId: null, botId: legacy.id, scopes: BOT_SCOPES.slice() };
+    return publicUser(legacy);
   }
 }
 
 function auth(req, res, next) {
   resolveRequestUser(req)
-    .then(user => { req.user = user; next(); })
+    .then(user => {
+      req.user = user;
+      // A bot token is deliberately confined to the bot API. This prevents a
+      // leaked integration token from reaching account deletion, profile,
+      // moderation, or human-only routes protected by the shared auth middleware.
+      if (req.botAuth && !req.path.startsWith('/api/bot/')) return res.status(403).json({ error:'Bot tokens may only use the bot API' });
+      next();
+    })
     .catch(error => res.status(401).json({ error: error.message === 'Invalid bot token' ? error.message : 'Authentication required' }));
 }
 function adminOnly(req,res,next){ if(req.user?.is_admin) return next(); res.status(403).json({error:'Admin only'}); }
+
+const BOT_SCOPES = ['read_messages', 'send_messages'];
+const BOT_TOKEN_RE = /^ubt_[A-Za-z0-9_-]{32,}$/;
+function hashBotToken(token) {
+  return createHash('sha256').update(String(token)).digest('hex');
+}
+function requestedBotScopes(value) {
+  const list = Array.isArray(value) ? value : BOT_SCOPES;
+  return [...new Set(list.map(String).filter(scope => BOT_SCOPES.includes(scope)))];
+}
+function botScope(req, scope) {
+  return req.user?.is_bot && req.botAuth && req.botAuth.scopes.includes(scope);
+}
+async function botServerMembership(botId, communityId) {
+  return store.get('SELECT m.*, c.name AS community_name FROM memberships m JOIN communities c ON c.id=m.community_id WHERE m.community_id=$1 AND m.user_id=$2', communityId, botId);
+}
+async function issueBotToken(botId, createdBy, name, scopes) {
+  const token = `ubt_${randomBytes(24).toString('base64url')}`;
+  const id = nanoid();
+  const cleanName = String(name || 'default').trim().slice(0, 50) || 'default';
+  const cleanScopes = requestedBotScopes(scopes);
+  await store.run('INSERT INTO bot_tokens (id,bot_id,token_hash,token_prefix,name,scopes,created_by) VALUES (?,?,?,?,?,?,?)',
+    id, botId, hashBotToken(token), token.slice(0, 12), cleanName, JSON.stringify(cleanScopes), createdBy);
+  return { id, token, name: cleanName, scopes: cleanScopes };
+}
+function botTokenMeta(row) {
+  let scopes = [];
+  try { scopes = JSON.parse(row.scopes || '[]'); } catch {}
+  return { id: row.id, name: row.name, prefix: row.token_prefix, scopes, createdAt: row.created_at, lastUsedAt: row.last_used_at || null, revokedAt: row.revoked_at || null };
+}
 
 const ROLE_PERMISSIONS = ['view_channel','read_messages','send_messages','attach_files','add_reactions','connect_voice','speak_voice','share_screen','manage_messages','timeout_members','kick_members','ban_members','manage_channels','manage_roles','manage_server'];
 const STAFF_ROLE_LEVELS = { Mod: 10, 'Sr. Mod': 20, 'Jr. admin': 30, admin: 40, Dev: 50, 'Head Mod': 60, 'Head admin': 70, Manager: 80, Administrator: 90, Owner: 100, Founder: 110 };
@@ -1066,6 +1144,26 @@ function requirePermission(permission) { return route(async (req,res,next) => {
   req.access = access; next();
 }); }
 const route = fn => (req,res,next) => Promise.resolve(fn(req,res,next)).catch(next);
+
+// Mic setup loopback: deliberately do not persist the recording. The browser
+// sends a short authenticated clip and receives the same bytes back, proving
+// microphone capture, the deployed server path, and speaker playback without
+// leaking a test recording into uploads or messages.
+const MIC_TEST_TYPES = new Set(['audio/webm', 'audio/ogg', 'audio/wav', 'audio/mp4', 'audio/mpeg']);
+app.post('/api/me/mic-test', auth, express.raw({
+  type: value => MIC_TEST_TYPES.has(String(value || '').split(';')[0].trim().toLowerCase()),
+  limit: '3mb',
+}), route(async (req, res) => {
+  const contentType = String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+  if (!MIC_TEST_TYPES.has(contentType)) return res.status(415).json({ error: 'Unsupported microphone recording format' });
+  if (!Buffer.isBuffer(req.body) || req.body.length === 0) return res.status(400).json({ error: 'Microphone recording was empty' });
+  res.setHeader('Content-Type', contentType);
+  res.setHeader('Content-Disposition', 'inline');
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Mic-Test-Server', 'loopback');
+  res.end(req.body);
+}));
 
 async function canAccessResource(user, { channelId, dmId, groupId }) {
   const targets = [channelId, dmId, groupId].filter(Boolean);
@@ -1718,6 +1816,7 @@ async function deleteUserAccount(userId, ownedFiles) {
         await q('DELETE FROM room_poll_votes WHERE poll_id IN (SELECT id FROM room_polls WHERE room_id=$1)', row.id);
         await q('DELETE FROM room_polls WHERE room_id=$1', row.id);
         await q('DELETE FROM room_messages WHERE room_id=$1', row.id);
+        await q('DELETE FROM multiplayer_games WHERE room_id=$1', row.id);
         await q('DELETE FROM room_members WHERE room_id=$1', row.id);
         await q('DELETE FROM temp_rooms WHERE id=$1', row.id);
       }
@@ -1761,6 +1860,7 @@ async function deleteUserAccount(userId, ownedFiles) {
           await q('DELETE FROM room_poll_votes WHERE poll_id IN (SELECT id FROM room_polls WHERE room_id=$1)', r2.id);
           await q('DELETE FROM room_polls WHERE room_id=$1', r2.id);
           await q('DELETE FROM room_messages WHERE room_id=$1', r2.id);
+          await q('DELETE FROM multiplayer_games WHERE room_id=$1', r2.id);
           await q('DELETE FROM room_members WHERE room_id=$1', r2.id);
         }
         await q('DELETE FROM temp_rooms WHERE community_id=$1', row.id);
@@ -2204,9 +2304,10 @@ app.patch('/api/communities/:id', auth, route(async (req,res) => {
   if (!comm) return res.status(404).json({error:'Not found'});
   const mem = await store.get('SELECT * FROM memberships WHERE community_id=$1 AND user_id=$2', req.params.id, req.user.id);
   if (!req.user.is_admin && (!mem || (mem.role !== 'owner' && mem.role !== 'admin'))) return res.status(403).json({error:'Forbidden'});
-  const {name,description,rules,icon,banner,visibility,tags,locked} = req.body;
-  await store.run('UPDATE communities SET name=$1,description=$2,rules=$3,icon=$4,banner=$5,visibility=$6,tags=$7,locked=$8 WHERE id=$9',
-    name||comm.name,description??comm.description,rules??comm.rules,icon??comm.icon,banner??comm.banner,visibility||comm.visibility,tags??comm.tags,locked??comm.locked,req.params.id);
+  const {name,description,rules,icon,banner,visibility,tags,locked,invite_title,invite_description,invite_image} = req.body;
+  await store.run('UPDATE communities SET name=$1,description=$2,rules=$3,icon=$4,banner=$5,visibility=$6,tags=$7,locked=$8,invite_title=$9,invite_description=$10,invite_image=$11 WHERE id=$12',
+    name||comm.name,description??comm.description,rules??comm.rules,icon??comm.icon,banner??comm.banner,visibility||comm.visibility,tags??comm.tags,locked??comm.locked,
+    invite_title??comm.invite_title,invite_description??comm.invite_description,invite_image??comm.invite_image,req.params.id);
   if (locked !== undefined) io.to(req.params.id).emit('community_locked',{communityId:req.params.id,locked});
   res.json({ok:true});
 }));
@@ -2245,15 +2346,46 @@ app.post('/api/admin/communities/:id/nuke', auth, adminOnly, route(async (req,re
 }));
 
 app.post('/api/communities/join', auth, route(async (req,res) => {
-  const comm = await store.get('SELECT * FROM communities WHERE invite_code=$1', req.body.inviteCode);
-  if (!comm) return res.status(404).json({error:'Invalid invite code'});
+  const inviteCode = String(req.body.inviteCode || '').trim();
+  const comm = await store.get('SELECT * FROM communities WHERE invite_code=$1', inviteCode);
+  if (!comm) return res.status(404).json({error:'Invalid invite link'});
   await store.run('INSERT INTO memberships VALUES (?,?,?,?,0) ON CONFLICT DO NOTHING', comm.id, req.user.id, 'member', null);
   res.json({communityId:comm.id, community:comm});
 }));
 
 app.get('/api/communities/:id/invite', auth, route(async (req,res) => {
-  const c = await store.get('SELECT invite_code FROM communities WHERE id=$1', req.params.id);
-  res.json({inviteCode:c?.invite_code});
+  const c = await store.get('SELECT id,name,description,icon,banner,invite_code,invite_title,invite_description,invite_image FROM communities WHERE id=$1', req.params.id);
+  if (!c) return res.status(404).json({error:'Community not found'});
+  res.json({ inviteCode:c.invite_code, invite:c });
+}));
+
+app.get('/invite/:code', async (req,res,next) => {
+  // Keep the URL shareable in browsers and desktop clients. The React app reads
+  // the code from the path, while crawlers receive useful Open Graph metadata.
+  const code = String(req.params.code || '').trim();
+  const c = await store.get('SELECT name,description,icon,banner,invite_title,invite_description,invite_image FROM communities WHERE invite_code=$1', code).catch(() => null);
+  if (!c) return next();
+  const title = c.invite_title || `Join ${c.name}`;
+  const description = c.invite_description || c.description || 'Join this community on Unknown.';
+  const image = c.invite_image || c.banner || c.icon || '';
+  const safe = value => String(value).replace(/[&<>\"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[ch]));
+  const origin = `${req.protocol}://${req.get('host')}`;
+  res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><title>${safe(title)}</title><meta name="description" content="${safe(description)}"><meta property="og:title" content="${safe(title)}"><meta property="og:description" content="${safe(description)}">${image ? `<meta property="og:image" content="${safe(image)}">` : ''}</head><body><p>${safe(title)}</p><script>location.replace(${JSON.stringify(`${origin}/?invite=${code}`)})</script></body></html>`);
+});
+
+app.get('/api/invites/:code', route(async (req,res) => {
+  const code = String(req.params.code || '').trim();
+  const c = await store.get('SELECT id,name,description,icon,banner,visibility,invite_code,invite_title,invite_description,invite_image FROM communities WHERE invite_code=$1', code);
+  if (!c) return res.status(404).json({error:'Invite not found'});
+  res.json({ invite: {
+    code: c.invite_code,
+    communityId: c.id,
+    name: c.name,
+    description: c.invite_description || c.description || '',
+    title: c.invite_title || `Join ${c.name}`,
+    image: c.invite_image || c.banner || c.icon || '',
+    visibility: c.visibility,
+  }});
 }));
 
 app.post('/api/communities/:id/leave', auth, route(async (req,res) => {
@@ -2497,8 +2629,10 @@ app.delete('/api/channels/:id', auth, route(async (req,res) => {
 }));
 
 // ── Temporary Rooms ───────────────────────────────────────────────────────────
-// Flexible rooms (chat/voice/video/game/drawing/poll/watch/collab) that expire.
-const ROOM_TYPES = ['chat','voice','video','game','drawing','poll','watch','collab'];
+// Flexible rooms (chat/voice/game/drawing/poll/watch/collab) that expire.
+// Video chat was removed; legacy video rooms are normalized to voice below so
+// existing links keep working without opening a camera.
+const ROOM_TYPES = ['chat','voice','game','drawing','poll','watch','collab'];
 
 function roomDurationMs(expiresIn) {
   if (/^\d+m$/.test(String(expiresIn))) return Number(expiresIn.slice(0,-1)) * 60 * 1000;
@@ -2514,6 +2648,7 @@ app.get('/api/rooms', auth, route(async (req,res) => {
   const rooms = await store.all('SELECT * FROM temp_rooms WHERE community_id=$1 ORDER BY created_at DESC', communityId);
   const out = [];
   for (const r of rooms) {
+    if (r.type === 'video') r.type = 'voice';
     const members = await store.all('SELECT rm.user_id,rm.waiting,u.username,u.nickname,u.avatar,u.badge FROM room_members rm JOIN users u ON u.id=rm.user_id WHERE rm.room_id=$1', r.id);
     const count = members.filter(m=>!Number(m.waiting)).length;
     const waiting = members.filter(m=>Number(m.waiting)).map(m=>({ user_id:m.user_id, username:m.username, nickname:m.nickname, avatar:m.avatar, badge:m.badge }));
@@ -2543,6 +2678,7 @@ app.get('/api/rooms/:id', auth, route(async (req,res) => {
   const r = access.room;
   if (!r) return res.status(404).json({error:'Room not found'});
   if (!access.allowed) return res.status(403).json({error:'Forbidden'});
+  if (r.type === 'video') r.type = 'voice';
   const members = await store.all('SELECT rm.user_id,rm.waiting,u.username,u.nickname,u.avatar,u.badge FROM room_members rm JOIN users u ON u.id=rm.user_id WHERE rm.room_id=$1 ORDER BY rm.joined_at', r.id);
   res.json({ ...r, waiting_room:Number(r.waiting_room), ptt:Number(r.ptt),
     members: members.map(m=>({ user_id:m.user_id, username:m.username, nickname:m.nickname, avatar:m.avatar, badge:m.badge, waiting:Number(m.waiting) })),
@@ -2555,6 +2691,7 @@ app.post('/api/rooms/:id/join', auth, route(async (req,res) => {
   const r = access.room;
   if (!r) return res.status(404).json({error:'Room not found'});
   if (!access.allowed) return res.status(403).json({error:'Forbidden'});
+  if (r.type === 'video') r.type = 'voice';
   const existing = await store.get('SELECT * FROM room_members WHERE room_id=$1 AND user_id=$2', r.id, req.user.id);
   const isOwner = r.owner_id === req.user.id || req.user.is_admin;
   if (existing) {
@@ -2604,9 +2741,90 @@ app.delete('/api/rooms/:id', auth, route(async (req,res) => {
   await store.run('DELETE FROM room_members WHERE room_id=$1', r.id);
   await store.run('DELETE FROM room_messages WHERE room_id=$1', r.id);
   await store.run('DELETE FROM room_polls WHERE room_id=$1', r.id);
+  await store.run('DELETE FROM multiplayer_games WHERE room_id=$1', r.id);
   await store.run('DELETE FROM temp_rooms WHERE id=$1', r.id);
   io.to(r.community_id).emit('room_update', { action:'deleted', id:r.id });
   res.json({ok:true});
+}));
+
+// ── Multiplayer room games ───────────────────────────────────────────────────
+// Game state is authoritative and persisted in PostgreSQL so a reconnect or a
+// second app instance sees the same board/deck. UNO hands are redacted per
+// recipient before they leave the server.
+function gameView(state, userId) {
+  if (!state || state.gameType !== 'uno') return state;
+  return { ...state, deck: undefined, players: state.players.map(p => ({
+    ...p,
+    hand: p.userId === userId ? p.hand : undefined,
+    handCount: p.hand.length,
+  })) };
+}
+
+async function roomGameForUser(roomId, userId) {
+  const row = await store.get('SELECT * FROM multiplayer_games WHERE room_id=$1', roomId);
+  if (!row) return null;
+  let state;
+  try { state = JSON.parse(row.state); } catch { return null; }
+  return { ...gameView(state, userId), version: Number(row.version) || 0 };
+}
+
+async function broadcastRoomGame(roomId, state, version) {
+  const sockets = await io.in(`room:${roomId}`).fetchSockets().catch(() => []);
+  for (const peer of sockets) {
+    peer.emit('room_game_update', {
+      roomId,
+      game: { ...gameView(state, peer.data?.user?.id), version },
+      version,
+    });
+  }
+}
+
+app.get('/api/rooms/:id/game', auth, route(async (req,res) => {
+  const access = await canAccessRoom(req.user, req.params.id, true);
+  if (!access.room) return res.status(404).json({error:'Room not found'});
+  if (!access.allowed) return res.status(403).json({error:'Join the room first'});
+  res.json({ game: await roomGameForUser(req.params.id, req.user.id) });
+}));
+
+app.post('/api/rooms/:id/game', auth, route(async (req,res) => {
+  const access = await canAccessRoom(req.user, req.params.id, true);
+  if (!access.room) return res.status(404).json({error:'Room not found'});
+  if (!access.allowed) return res.status(403).json({error:'Join the room first'});
+  if (access.room.type !== 'game') return res.status(400).json({error:'Multiplayer games only run in game rooms'});
+  const gameType = String(req.body.gameType || '').toLowerCase();
+  if (!['chess','uno'].includes(gameType)) return res.status(400).json({error:'Choose chess or uno'});
+  const existing = await store.get('SELECT room_id FROM multiplayer_games WHERE room_id=$1', req.params.id);
+  if (existing) return res.status(409).json({error:'A game is already running in this room'});
+  const user = { userId:req.user.id, name:req.user.nickname || req.user.username };
+  const state = gameType === 'chess' ? createChessGame(user) : createUnoGame(user);
+  await store.run('INSERT INTO multiplayer_games (room_id,game_type,state,version) VALUES (?,?,?,0)', req.params.id, gameType, JSON.stringify(state));
+  const game = gameView(state, req.user.id);
+  await broadcastRoomGame(req.params.id, state, 0);
+  res.status(201).json({ game, version:0 });
+}));
+
+app.post('/api/rooms/:id/game/action', auth, route(async (req,res) => {
+  const access = await canAccessRoom(req.user, req.params.id, true);
+  if (!access.room) return res.status(404).json({error:'Room not found'});
+  if (!access.allowed) return res.status(403).json({error:'Join the room first'});
+  if (access.room.type !== 'game') return res.status(400).json({error:'Multiplayer games only run in game rooms'});
+  const row = await store.get('SELECT * FROM multiplayer_games WHERE room_id=$1', req.params.id);
+  if (!row) return res.status(404).json({error:'Start a game first'});
+  let state;
+  try { state = JSON.parse(row.state); } catch { return res.status(500).json({error:'Game state is invalid'}); }
+  const action = req.body || {};
+  const result = state.gameType === 'chess'
+    ? (action.type === 'join' ? addChessPlayer(state, { userId:req.user.id, name:req.user.nickname || req.user.username }) : applyChessAction(state, req.user.id, action.from, action.to))
+    : (action.type === 'join' ? addUnoPlayer(state, { userId:req.user.id, name:req.user.nickname || req.user.username }) : applyUnoAction(state, req.user.id, action));
+  if (result.error) return res.status(400).json({error:result.error});
+  const next = result.state;
+  const oldVersion = Number(row.version) || 0;
+  const updated = await store.get('UPDATE multiplayer_games SET state=$1,version=version+1,updated_at=CURRENT_TIMESTAMP WHERE room_id=$2 AND version=$3 RETURNING version', JSON.stringify(next), req.params.id, oldVersion);
+  if (!updated) return res.status(409).json({error:'Game changed — refresh and try again'});
+  const version = Number(updated.version);
+  const game = gameView(next, req.user.id);
+  await broadcastRoomGame(req.params.id, next, version);
+  res.json({game, version});
 }));
 
 // Room chat messages
@@ -3041,6 +3259,16 @@ async function resolveBotCommand(commandName, argText, channelId, replyToId, use
   return true;
 }
 
+async function appendBotEvent(botId, eventType, payload, communityId = null) {
+  await store.run('INSERT INTO bot_events (bot_id,community_id,event_type,payload) VALUES (?,?,?,?)', botId, communityId, eventType, JSON.stringify(payload || {}));
+}
+
+async function notifyInstalledBots(eventType, payload, communityId) {
+  if (!communityId) return;
+  const bots = await store.all('SELECT m.user_id AS bot_id FROM memberships m JOIN users u ON u.id=m.user_id JOIN bot_settings bs ON bs.community_id=m.community_id AND bs.bot_id=m.user_id WHERE m.community_id=$1 AND u.is_bot=1 AND bs.enabled=1', communityId).catch(() => []);
+  for (const bot of bots) appendBotEvent(bot.bot_id, eventType, payload, communityId).catch(() => {});
+}
+
 async function runBotCommand(body, channelId, replyToId, user) {
   if (!body || !body.trim() || user?.is_bot) return;
   const trimmed = body.trim();
@@ -3066,6 +3294,86 @@ function trackRate(channelId) {
   channelMsgRate.set(channelId, recent);
   return recent.length;
 }
+
+// ── External bot API ─────────────────────────────────────────────────────────
+// Discord-style bot integrations authenticate with a one-time token returned
+// when an administrator creates it. Tokens are SHA-256 hashed at rest, scoped,
+// revocable, and never returned by list endpoints.
+app.post('/api/servers/:communityId/bots/:botId/tokens', auth, route(async (req,res) => {
+  if (!(await canManageServer(req, req.params.communityId))) return res.status(403).json({ error:'Server admins only' });
+  const bot = await store.get('SELECT id FROM users WHERE id=$1 AND is_bot=1', req.params.botId);
+  if (!bot || !(await botServerMembership(req.params.botId, req.params.communityId))) return res.status(404).json({ error:'Bot is not installed in this server' });
+  const issued = await issueBotToken(req.params.botId, req.user.id, req.body.name, req.body.scopes);
+  res.status(201).json({ ok:true, botId:issued.botId || req.params.botId, token:issued.token, tokenId:issued.id, name:issued.name, scopes:issued.scopes, warning:'Copy this token now. It will not be shown again.' });
+}));
+
+app.get('/api/servers/:communityId/bots/:botId/tokens', auth, route(async (req,res) => {
+  if (!(await canManageServer(req, req.params.communityId))) return res.status(403).json({ error:'Server admins only' });
+  const bot = await store.get('SELECT id FROM users WHERE id=$1 AND is_bot=1', req.params.botId);
+  if (!bot || !(await botServerMembership(req.params.botId, req.params.communityId))) return res.status(404).json({ error:'Bot is not installed in this server' });
+  const rows = await store.all('SELECT * FROM bot_tokens WHERE bot_id=$1 ORDER BY created_at DESC', req.params.botId);
+  res.json({ tokens: rows.map(botTokenMeta) });
+}));
+
+app.delete('/api/servers/:communityId/bots/:botId/tokens/:tokenId', auth, route(async (req,res) => {
+  if (!(await canManageServer(req, req.params.communityId))) return res.status(403).json({ error:'Server admins only' });
+  const bot = await store.get('SELECT id FROM users WHERE id=$1 AND is_bot=1', req.params.botId);
+  if (!bot || !(await botServerMembership(req.params.botId, req.params.communityId))) return res.status(404).json({ error:'Bot is not installed in this server' });
+  const result = await store.run('UPDATE bot_tokens SET revoked_at=CURRENT_TIMESTAMP WHERE id=$1 AND bot_id=$2 AND revoked_at IS NULL', req.params.tokenId, req.params.botId);
+  if (!result.rowCount) return res.status(404).json({ error:'Token not found or already revoked' });
+  res.json({ ok:true, revoked:true });
+}));
+
+app.get('/api/bot/me', auth, route(async (req,res) => {
+  if (!botScope(req, 'read_messages')) return res.status(403).json({ error:'Bot token required' });
+  const user = await store.get('SELECT id,username,nickname,avatar,badge,is_bot FROM users WHERE id=$1', req.user.id);
+  const installs = await store.all('SELECT m.community_id,c.name FROM memberships m JOIN communities c ON c.id=m.community_id WHERE m.user_id=$1', req.user.id);
+  res.json({ user:publicUser(user), scopes:req.botAuth.scopes, installations:installs });
+}));
+
+app.get('/api/bot/servers/:communityId/channels', auth, route(async (req,res) => {
+  if (!botScope(req, 'read_messages')) return res.status(403).json({ error:'Missing bot scope: read_messages' });
+  if (!(await botServerMembership(req.user.id, req.params.communityId))) return res.status(403).json({ error:'Bot is not installed in this server' });
+  const channels = await store.all("SELECT id,name,type,topic,position,category FROM channels WHERE community_id=$1 AND type!='voice' ORDER BY position,created_at", req.params.communityId);
+  res.json({ channels });
+}));
+
+app.get('/api/bot/servers/:communityId/channels/:channelId/messages', auth, route(async (req,res) => {
+  if (!botScope(req, 'read_messages')) return res.status(403).json({ error:'Missing bot scope: read_messages' });
+  if (!(await botServerMembership(req.user.id, req.params.communityId))) return res.status(403).json({ error:'Bot is not installed in this server' });
+  const ch = await store.get("SELECT id FROM channels WHERE id=$1 AND community_id=$2 AND type!='voice'", req.params.channelId, req.params.communityId);
+  if (!ch) return res.status(404).json({ error:'Channel not found' });
+  const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 100);
+  const messages = await store.all(`SELECT m.*,u.username,u.nickname,u.avatar,u.badge,u.is_bot FROM messages m JOIN users u ON u.id=m.sender_id WHERE m.channel_id=$1 AND m.deleted_at IS NULL ORDER BY m.created_at DESC LIMIT $2`, req.params.channelId, limit);
+  messages.reverse();
+  res.json({ messages });
+}));
+
+app.post('/api/bot/servers/:communityId/channels/:channelId/messages', auth, route(async (req,res) => {
+  if (!botScope(req, 'send_messages')) return res.status(403).json({ error:'Missing bot scope: send_messages' });
+  if (!(await botServerMembership(req.user.id, req.params.communityId))) return res.status(403).json({ error:'Bot is not installed in this server' });
+  const body = String(req.body.body || '').trim().slice(0, 4000);
+  if (!body) return res.status(400).json({ error:'Message body required' });
+  if (/^!/.test(body)) return res.status(400).json({ error:'Bot API messages cannot invoke commands' });
+  const ch = await store.get("SELECT id FROM channels WHERE id=$1 AND community_id=$2 AND type!='voice'", req.params.channelId, req.params.communityId);
+  if (!ch) return res.status(404).json({ error:'Channel not found' });
+  const id = nanoid();
+  await store.run('INSERT INTO messages (id,channel_id,sender_id,body,reply_to) VALUES (?,?,?,?,?)', id, ch.id, req.user.id, body, req.body.replyTo || null);
+  const msg = await store.get(`SELECT m.*,u.username,u.tag,u.avatar,u.nickname,u.badge,u.is_bot,u.bot_emoji,u.bot_color FROM messages m JOIN users u ON u.id=m.sender_id WHERE m.id=$1`, id);
+  io.to(ch.id).emit('message', msg);
+  io.to(ch.id).emit('channel_activity', { channelId:ch.id, messageId:id });
+  await appendBotEvent(req.user.id, 'message_sent', { message:msg, communityId:req.params.communityId }, req.params.communityId);
+  res.status(201).json({ message:msg });
+}));
+
+app.get('/api/bot/servers/:communityId/events', auth, route(async (req,res) => {
+  if (!botScope(req, 'read_messages')) return res.status(403).json({ error:'Missing bot scope: read_messages' });
+  if (!(await botServerMembership(req.user.id, req.params.communityId))) return res.status(403).json({ error:'Bot is not installed in this server' });
+  const after = Math.max(Number(req.query.after) || 0, 0);
+  const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 100);
+  const events = await store.all(`SELECT id,event_type,payload,created_at FROM bot_events WHERE bot_id=$1 AND community_id=$2 AND id>$3 ORDER BY id ASC LIMIT $4`, req.user.id, req.params.communityId, after, limit);
+  res.json({ events:events.map(e => ({ ...e, payload:safeParse(e.payload, {}) })) });
+}));
 
 app.get('/api/channels/:id/messages', auth, route(async (req,res) => {
   if (!(await canAccessResource(req.user, { channelId:req.params.id }))) return res.status(403).json({error:'Forbidden'});
@@ -3185,6 +3493,8 @@ app.post('/api/messages', auth, route(async (req,res) => {
   }
 
   if (channelId) {
+    const channelInfo = await store.get('SELECT community_id FROM channels WHERE id=$1', channelId);
+    await notifyInstalledBots('message_created', { message:msg }, channelInfo?.community_id);
     io.to(channelId).emit('message', msg);
     io.to(channelId).emit('channel_activity',{channelId,messageId:id});
     // Raid detection
@@ -5464,9 +5774,11 @@ const server = http.createServer(app);
 const socketOrigins = corsOrigin;
 const io = new Server(server, {
   cors: { origin: socketOrigins },
-  // WebSocket-only transport avoids requiring sticky sessions when several
-  // instances sit behind Render's load balancer.
-  transports: ['websocket'],
+  // Prefer WebSocket, but keep polling available for restrictive networks and
+  // proxies that block upgrades. This matters for group calls because their
+  // roster and per-peer ICE signaling must stay alive across every participant.
+  transports: ['websocket', 'polling'],
+  allowUpgrades: true,
 });
 io.adapter(createAdapter(pool, {
   errorHandler: error => console.error('Socket.IO PostgreSQL adapter error:', error),
@@ -5617,14 +5929,6 @@ io.on('connection', socket => {
     io.to(roomName).emit('voice_state', { channelId, userId, joined: false });
   });
 
-  // Camera on/off state for video rooms. Members just broadcast their own
-  // state; peers hide the frozen video and show a placeholder instead.
-  socket.on('voice_camera', data => {
-    const channelId = data?.channelId;
-    if (typeof channelId !== 'string' || channelId.length > 128 || !socket.rooms.has(`voice:${channelId}`)) return;
-    socket.to(`voice:${channelId}`).emit('voice_camera', { channelId, userId, socketId: socket.id, on: data.on === true });
-  });
-
   // Mesh signaling. The sender must currently be a member of that voice room;
   // the target socket id comes from the roster this server handed out, so a
   // client can only ever talk to sockets it was told are in the same room.
@@ -5646,13 +5950,30 @@ io.on('connection', socket => {
   };
   // Audio relay fallback for voice channels / temp rooms (same "phone call"
   // mode as DM calls): chunks go to everyone else in the voice room.
-  socket.on('audio_chunk', d => {
+  socket.on('audio_chunk', async d => {
     const channelId = d?.channelId;
     if (typeof channelId !== 'string' || channelId.length > 128 || !socket.rooms.has(`voice:${channelId}`)) return;
     if (typeof d.data !== 'string' || d.data.length > 16384) return;
-    socket.to(`voice:${channelId}`).emit('audio_chunk', {
+    const payload = {
       channelId, fromUserId: userId, fromSocketId: socket.id,
       seq: d.seq, first: d.first === true, data: d.data,
+    };
+    if (typeof d.toSocketId === 'string' && d.toSocketId.length <= 64 && d.toSocketId !== socket.id) {
+      // Late-join header recovery is targeted to the requesting session. The
+      // adapter-aware room lookup works even when that session is on another
+      // app instance; never turn this into a cross-room relay.
+      const members = await io.in(`voice:${channelId}`).fetchSockets().catch(() => []);
+      if (!members.some(s => s.id === d.toSocketId)) return;
+      io.to(d.toSocketId).emit('audio_chunk', payload);
+      return;
+    }
+    socket.to(`voice:${channelId}`).emit('audio_chunk', payload);
+  });
+  socket.on('voice_audio_request', d => {
+    const channelId = d?.channelId;
+    if (typeof channelId !== 'string' || channelId.length > 128 || !socket.rooms.has(`voice:${channelId}`)) return;
+    socket.to(`voice:${channelId}`).emit('voice_audio_request', {
+      channelId, fromUserId: userId, fromSocketId: socket.id,
     });
   });
   socket.on('voice_rtc_offer',  d => relayVoiceSignal('voice_rtc_offer', d));
@@ -5734,10 +6055,6 @@ io.on('connection', socket => {
   // of guessing from silence. Same DM-auth + user-room routing as the other
   // call signals, so it works across app instances.
   socket.on('call_mute',   d => relayToUser('call_mute', d));
-  // Camera on/off state for DM calls — lets the peer swap the video for a
-  // “camera off” placeholder instead of a frozen last frame. Same DM-auth +
-  // user-room routing as the other call signals.
-  socket.on('call_camera', d => relayToUser('call_camera', d));
 
   // Screen share is restricted to an authenticated voice room membership.
   const relayScreenShare = (event, data) => {
